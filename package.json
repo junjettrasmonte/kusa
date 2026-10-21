@@ -1,0 +1,90 @@
+{
+  "name": "kusa",
+  "version": "0.1.7",
+  "description": "Kusă — harness-agnostic session counters, live dashboard, and optional MCP server for Copilot, Cursor, and VS Code Local",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "preferGlobal": true,
+  "bin": {
+    "kusa": "./src/cli/kusa.mjs"
+  },
+  "exports": {
+    ".": "./src/lib.mjs",
+    "./lib": "./src/lib.mjs",
+    "./hook": "./src/hook.mjs",
+    "./open": "./src/open.mjs",
+    "./serve": "./src/serve.mjs",
+    "./sdk-listener": "./src/sdk-listener.mjs",
+    "./sdk-normalize": "./src/sdk-normalize.mjs",
+    "./skills": "./src/skills/index.mjs",
+    "./mcp": "./src/mcp/index.mjs",
+    "./agent": "./src/agent/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "CHECKLIST.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node src/demo.mjs",
+    "serve": "node src/serve.mjs",
+    "build": "vite build --config src/vite.config.mjs",
+    "dev": "vite --config src/vite.config.mjs",
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "prepublishOnly": "npm run build && npm test",
+    "kusa:serve": "kusa serve"
+  },
+  "keywords": [
+    "agent",
+    "copilot",
+    "cursor",
+    "hooks",
+    "observability",
+    "kusa"
+  ],
+  "author": "Junjet Trasmonte",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.19.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.11",
+    "@vitejs/plugin-react": "^4.4.1",
+    "tailwindcss": "^4.1.11",
+    "vite": "^6.3.5"
+  },
+  "peerDependencies": {
+    "@github/copilot-sdk": ">=1.0.0",
+    "opencode": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@github/copilot-sdk": {
+      "optional": true
+    },
+    "opencode": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/junjettrasmonte/kusa.git"
+  },
+  "bugs": {
+    "url": "https://github.com/junjettrasmonte/kusa/issues"
+  },
+  "homepage": "https://github.com/junjettrasmonte/kusa#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@opencode-ai/plugin": "^1.19.3"
+  }
+}

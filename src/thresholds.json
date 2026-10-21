@@ -1,0 +1,9 @@
+{
+  "toolDurationWarnMs": 60000,
+  "repeatWindowMs": 15000,
+  "repeatCount": 6,
+  "promptToolCountWarn": 40,
+  "promptElapsedWarnMs": 300000,
+  "sessionElapsedWarnMs": 1800000,
+  "maxEvents": 400
+}

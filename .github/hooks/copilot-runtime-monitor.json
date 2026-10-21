@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook sessionStart; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook sessionStart } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook sessionStart; else printf '{}\\n'; fi"
+      },
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa open; else exit 0; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa open } else { exit 0 }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa open; else exit 0; fi"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook sessionEnd; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook sessionEnd } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook sessionEnd; else printf '{}\\n'; fi"
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook userPromptSubmitted; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook userPromptSubmitted } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook userPromptSubmitted; else printf '{}\\n'; fi"
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook preToolUse; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook preToolUse } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook preToolUse; else printf '{}\\n'; fi"
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook postToolUse; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook postToolUse } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook postToolUse; else printf '{}\\n'; fi"
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook postToolUseFailure; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook postToolUseFailure } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook postToolUseFailure; else printf '{}\\n'; fi"
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook agentStop; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook agentStop } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook agentStop; else printf '{}\\n'; fi"
+      }
+    ],
+    "subagentStart": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook subagentStart; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook subagentStart } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook subagentStart; else printf '{}\\n'; fi"
+      }
+    ],
+    "subagentStop": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook subagentStop; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook subagentStop } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook subagentStop; else printf '{}\\n'; fi"
+      }
+    ],
+    "errorOccurred": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook errorOccurred; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook errorOccurred } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook errorOccurred; else printf '{}\\n'; fi"
+      }
+    ],
+    "permissionRequest": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook permissionRequest; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook permissionRequest } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook permissionRequest; else printf '{}\\n'; fi"
+      }
+    ],
+    "notification": [
+      {
+        "type": "command",
+        "bash": "if command -v kusa >/dev/null 2>&1; then kusa hook notification; else printf '{}\\n'; fi",
+        "powershell": "if (Get-Command kusa -ErrorAction SilentlyContinue) { kusa hook notification } else { Write-Output '{}' }",
+        "command": "if command -v kusa >/dev/null 2>&1; then kusa hook notification; else printf '{}\\n'; fi"
+      }
+    ]
+  }
+}

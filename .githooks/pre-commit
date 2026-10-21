@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Bump package.json patch before each commit so the bump lands in that commit.
+# Skip: SKIP_VERSION_BUMP=1, merge commits, or missing package.json.
+set -euo pipefail
+
+if [[ -n "${SKIP_VERSION_BUMP:-}" ]]; then
+  exit 0
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+if [[ -f "${git_dir}/MERGE_HEAD" ]]; then
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if [[ ! -f package.json ]]; then
+  exit 0
+fi
+
+prev="$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")"
+npm version patch --no-git-tag-version >/dev/null
+next="$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")"
+
+git add package.json
+if [[ -f package-lock.json ]]; then
+  git add package-lock.json
+fi
+
+echo "kusa: version ${prev} → ${next}"

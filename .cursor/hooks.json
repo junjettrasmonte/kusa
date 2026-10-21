@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs sessionStart",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs sessionEnd",
+        "timeout": 10
+      },
+      {
+        "command": "node .cursor/hooks/trail-hooks.cjs cursor-session-end"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs beforeSubmitPrompt",
+        "timeout": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs preToolUse",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs postToolUse",
+        "timeout": 10
+      },
+      {
+        "matcher": "Read|Grep|Glob|Search|Shell",
+        "command": "node .cursor/hooks/trail-hooks.cjs cursor-post-tool"
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs postToolUseFailure",
+        "timeout": 10
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs subagentStart",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs subagentStop",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs stop",
+        "timeout": 10
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "node .cursor/hooks/kusa.cjs afterAgentResponse",
+        "timeout": 10
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "node .cursor/hooks/trail-hooks.cjs cursor-mcp"
+      }
+    ]
+  }
+}

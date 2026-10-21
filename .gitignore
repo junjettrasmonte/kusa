@@ -1,0 +1,10 @@
+node_modules/
+.build/
+src/data/*
+!src/data/README.md
+/.kusa/
+*.log
+.DS_Store
+*.tgz
+
+# Trail graph cache is ignored via .trail/.gitignore (run `trail build`).
