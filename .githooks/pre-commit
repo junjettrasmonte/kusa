@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# Bump package.json patch before each commit so the bump lands in that commit.
-# Skip: SKIP_VERSION_BUMP=1, merge commits, or missing package.json.
+# 1) Reject Cursor / GitHub Copilot as commit author or committer.
+# 2) Bump package.json patch before each commit so the bump lands in that commit.
+# Skip version bump: SKIP_VERSION_BUMP=1, merge commits, or missing package.json.
+# Skip identity check: SKIP_AGENT_ATTRIBUTION_CHECK=1.
 set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# Run before the version bump so a blocked identity never leaves a dirty bump.
+if [[ -f scripts/agent-commit-attribution.mjs ]]; then
+  node scripts/agent-commit-attribution.mjs check-identity
+fi
 
 if [[ -n "${SKIP_VERSION_BUMP:-}" ]]; then
   exit 0
@@ -11,9 +21,6 @@ git_dir="$(git rev-parse --git-dir)"
 if [[ -f "${git_dir}/MERGE_HEAD" ]]; then
   exit 0
 fi
-
-root="$(git rev-parse --show-toplevel)"
-cd "$root"
 
 if [[ ! -f package.json ]]; then
   exit 0

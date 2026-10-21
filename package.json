@@ -1,6 +1,6 @@
 {
   "name": "kusa",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Kusă — harness-agnostic session counters, live dashboard, and optional MCP server for Copilot, Cursor, and VS Code Local",
   "type": "module",
   "engines": {

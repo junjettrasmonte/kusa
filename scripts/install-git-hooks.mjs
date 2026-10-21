@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * Copy committed hooks from .githooks/ into .git/hooks/ (no git config needed).
- * Runs from npm prepare so clones get the patch-bump pre-commit hook.
+ * Runs from npm prepare so clones get:
+ *   - pre-commit  — agent identity check + package.json patch bump
+ *   - commit-msg  — strip Cursor / GitHub Copilot Co-authored-by trailers
  */
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';

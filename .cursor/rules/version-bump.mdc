@@ -7,7 +7,10 @@ alwaysApply: true
 
 Every commit must include a patch bump of `package.json` (and `package-lock.json`).
 
-- A git `pre-commit` hook (`.githooks/pre-commit`) runs `npm version patch --no-git-tag-version` and stages the result. Do not bypass it (`--no-verify` is banned).
-- Before `git commit` / `git push`, rely on that hook — do not manually bump unless the hook is missing; if missing, run `node scripts/install-git-hooks.mjs` then commit again.
+- A git `pre-commit` hook (`.githooks/pre-commit`) rejects Cursor / GitHub Copilot as author/committer, then runs `npm version patch --no-git-tag-version` and stages the result. Do not bypass it (`--no-verify` is banned).
+- A git `commit-msg` hook (`.githooks/commit-msg`) strips Cursor / GitHub Copilot `Co-authored-by:` trailers (and `Made-with: Cursor`) while keeping human co-authors.
+- Before `git commit` / `git push`, rely on those hooks — do not manually bump unless the hook is missing; if missing, run `node scripts/install-git-hooks.mjs` then commit again.
 - To skip a bump for a rare exception: `SKIP_VERSION_BUMP=1 git commit ...` (only if the user explicitly asks).
+- To skip the agent identity check only: `SKIP_AGENT_ATTRIBUTION_CHECK=1 git commit ...` (only if the user explicitly asks).
 - Do not create git tags for these patch bumps unless the user asks.
+- Do not add Cursor / Copilot `Co-authored-by` trailers or set `GIT_AUTHOR_*` / `GIT_COMMITTER_*` to agent identities.

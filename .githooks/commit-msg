@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Strip Cursor / GitHub Copilot Co-authored-by (and related) trailers before the
+# commit is finalized. Fail-safe: never abort the commit; leave the message
+# unchanged if filtering fails.
+set -u
+
+msg_file="${1:-}"
+if [[ -z "${msg_file}" || ! -f "${msg_file}" ]]; then
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+script="${root}/scripts/agent-commit-attribution.mjs"
+if [[ ! -f "${script}" ]]; then
+  exit 0
+fi
+
+# Do not let a filter error block the commit.
+node "${script}" filter "${msg_file}" >/dev/null 2>&1 || true
+exit 0
