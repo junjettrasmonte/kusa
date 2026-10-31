@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
-import { createMonitorServer } from '../src/serve.mjs';
+import { createMonitorServer } from '#app/console/serve.mjs';
 import {
   addLearning,
   advertisedTools,
@@ -16,8 +16,8 @@ import {
   saveMcpState,
   setMcpEnabled,
   workspaceMcpSlug,
-} from '../src/mcp/index.mjs';
-import { ensureSkillsInitialized } from '../src/skills/index.mjs';
+} from '#features/mcp/index.mjs';
+import { ensureSkillsInitialized } from '#features/skills/index.mjs';
 
 function tempRoot(prefix = 'kusa-mcp-') {
   return mkdtempSync(join(tmpdir(), prefix));

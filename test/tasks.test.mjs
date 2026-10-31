@@ -10,9 +10,9 @@ import {
   agentToolGroups,
   createKusaHookEmitter,
   createTrailAwareTools,
-} from '../src/agent/index.mjs';
-import { extractPlanTodo, runHook } from '../src/lib.mjs';
-import { loadTasks, saveTasks, tasksFilePath } from '../src/task-store.mjs';
+} from '#features/agent/index.mjs';
+import { extractPlanTodo, runHook } from '#features/monitor/lib.mjs';
+import { loadTasks, saveTasks, tasksFilePath } from '#features/chat/data/task-store.mjs';
 
 const dirs = [];
 
@@ -61,7 +61,7 @@ describe('kusa agent task tools', () => {
 
     const listed = tasks.list();
     assert.equal(listed.total, 2);
-    assert.equal(listed.summary, '2 tasks · 2 pending');
+    assert.equal(listed.summary, '2 tasks · 0/2 done · 2 pending');
     assert.equal(listed.persisted, true);
   });
 
@@ -75,7 +75,7 @@ describe('kusa agent task tools', () => {
     assert.equal(done.ok, true);
     assert.deepEqual(done.updated, ['Ship the parser']);
     assert.equal(done.tasks[0].status, 'completed');
-    assert.equal(done.summary, '1 task · 1 done');
+    assert.equal(done.summary, '1 task · 1/1 done');
 
     // The model retried the step: already done, so nothing changes and nothing
     // fails — the row is reported unchanged instead of duplicated.
@@ -203,7 +203,7 @@ describe('kusa agent task tools', () => {
     assert.equal(added.ok, true);
     const done = tasks.update({ tasks: [{ id: 'No monitor here', status: 'completed' }] });
     assert.equal(done.tasks[0].status, 'completed');
-    assert.equal(done.summary, '1 task · 1 done');
+    assert.equal(done.summary, '1 task · 1/1 done');
   });
 
   it('asks start-fresh or merge when a batch meets an existing list', async () => {

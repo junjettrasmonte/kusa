@@ -66,14 +66,15 @@ Kusă is the practical response to that mess: one localhost console, one gitigno
 | --- | --- |
 | **Fragmented workflows** across Cursor, Copilot, Local, and custom agents | Hook adapters write the same `.kusa/` layout; the console shows harnesses side by side. First-party **Kusă Chat** is available when you want an in-console agent. |
 | **Lost context and knowledge** across sessions | **Harness → Knowledgebase** browses and adds Trail learnings (`.trail/learnings/`). MCP can list/add the same notes when the server is on. |
-| **Inconsistent team conventions** | Canonical **skills** live in `.kusa/skills/` and can be published into agent skill directories. Starter skills ship for common coding workflows. |
+| **Team standards hard to enforce** across agents and machines | Canonical **skills**, workspace settings, and conventions live under `.kusa/` (and related project files) so they can be **versioned in a private git repo** and shared with the team — publish skills into agent skill directories so standards and compliance travel with the codebase, not tribal chat memory. |
 | **Limited customization** | OpenAI-compatible agent endpoint (local or remote), native tool loop or **OpenCode SDK**, custom MCP tools (`.kusa/custom-tools.json`), and per-project MCP HTTP endpoint. |
-| **Weak guardrails** | Composer **Ask / Plan / Agent** modes, approval rules for terminal/browser tools, Trail/Git detect + enforce settings, sandboxed file tools. |
+| **Prompt rules and skills are not enough for risky ops** | Soft advice (system prompts, skills) can be ignored. Hosted agents also rarely let you override their **built-in tools**, so you cannot put real gates there. Kusă’s answer is a first-party harness with **its own tools** and **deterministic gates** inside them: Composer **Ask / Plan / Agent** modes, approval rules for terminal/browser, Trail/Git detect + enforce, sandboxed file tools. |
+| **Negative or unintended changes** | Read-only **Ask / Plan** modes for exploration; approval-gated side effects in Agent mode; sandboxed writes; optional Trail consultation before writes when enforce is on — so risky or off-scope edits do not land unchecked. |
 | **Poor observability** | Live counters, events, warnings, tool-call statistics, prompt history, plans/todos, optional Copilot CLI SDK listener. |
 | **Model / agent fragmentation** | One console for hooked IDE agents **and** the Kusă harness pointed at any `/v1` endpoint (Ollama, OpenAI, gateway, etc.). |
 | **Locked to one laptop** | Per-repo install on a local machine or remote **dev server**; localhost web portal via `kusa serve`; optional **Tailscale** / **Cloudflare Tunnel** for remote browsers (see [Portability](#portability-and-remote-access)). |
 
-*Planned / partial items are called out in [Roadmap](#roadmap) — not sold as finished product. Sidebar Explorer / Search / Extensions icons currently show placeholder “coming soon” panes.*
+*Planned / partial items are called out in [Roadmap](#roadmap) — not sold as finished product. The Sidebar Explorer and **File names** icons are live panes (bounded workspace tree + file/folder-name search over `GET /search`); the Extensions icon still shows a placeholder pane. There is no **File contents** pane — text-inside-files search is the agent's `kusa_grep` tool, not the sidebar.*
 
 ---
 
@@ -510,7 +511,7 @@ Prefer `KUSA_*` (legacy `COPILOT_MONITOR_*` still accepted where noted in code):
 | `KUSA_PROMPT_TOOL_WARN` / `KUSA_PROMPT_WARN_MS` / `KUSA_SESSION_WARN_MS` | Prompt/session warnings |
 | `KUSA_MAX_EVENTS` | Cap event history (default 400) |
 
-Threshold defaults can also be copied from `src/thresholds.json` → `.kusa/thresholds.json`.
+Threshold defaults can also be copied from `src/features/monitor/thresholds.json` → `.kusa/thresholds.json`.
 
 ### Important files under `.kusa/`
 
@@ -543,6 +544,7 @@ Hooks print `{}` and do not allow, deny, or follow up. Monitoring must never blo
 
 ```text
 kusa serve [--port <n>]   Start dashboard (default http://127.0.0.1:1424/dashboard.html)
+kusa serve --live         Hot reload: rebuild UI on save, restart server on src/ edits
 kusa init [dir]           Detect Cursor / Copilot, write hooks, add npm scripts
 kusa hook <event>         Harness hook entry (stdin JSON)
 kusa open                 Open Markdown preview / browser once per session
@@ -553,6 +555,13 @@ kusa test                 Run package tests
 kusa version              Show installed version
 kusa help                 Show help
 ```
+
+`--live` (aliases `--hmr`, `--live-reload`; `--no-live` opts out) is for editing this project itself:
+
+- **UI** — a `vite build --watch` child republishes `src/app/console/dashboard.{html,js,css}` on every save from the sources under `src/app/console/ui/`. `kusa serve` re-reads those files per request with `no-store`, so the next refresh in the browser gets the new bundle — no manual `npm run build`.
+- **Server** — Node has no module reload, so this half is a **restart**, not a patch: the supervisor watches the transitive `.mjs` import closure of the entry it started and re-spawns it (debounced, so a burst of saves costs one restart) on the same port.
+
+In-flight turns, pending approvals and open SSE streams are lost on a server edit; everything under `.kusa/` (sessions, settings, skills, learnings) is re-read by the next child and survives. Without `vite` installed the UI half degrades to a warning and the server half still works.
 
 Package scripts (from this repo): `npm test`, `npm run serve`, `npm run build`, `npm run dev` (Vite HMR on `:1237`, proxying data from serve on `:1424`), `npm run demo`.
 
@@ -577,10 +586,11 @@ Derived from the current codebase and [`CHECKLIST.md`](CHECKLIST.md) — not a m
 - SDK listener for **VS Code Copilot Chat**, **Local**, and **Cursor** — no public `joinSession()` API; hooks-only
 - Token / reasoning detail richness varies by harness and model
 - Plan/todo extraction depends on agent tools and transcript layout
-- Sidebar Explorer / Search / Extensions views are present in the shell; treat non-Agents views as evolving UI, not a complete IDE file tree product
+- Sidebar Explorer walks a bounded tree (depth/entry caps, folders over 50 entries come back as counted stubs you click to expand). Search is **one pane, names only**: File names matches **names only** (case-insensitive substring of the entry name, or of the path when the query spans folders) over `GET /search`; there is **no content-search pane** — no text-inside-files search in the UI at all, no IDE-grade ignore rules beyond the built-in skips (the agent's `kusa_grep` tool covers that workspace). Extensions is still a placeholder pane. Treat these as evolving UI, not a complete IDE file-tree product
 
 ### Planned improvements
 
+- Sidebar search: add a **File contents** pane (text inside files, with match lines and a per-file grouping) as its own view id and backend, separate from the names backend — it is not in the sidebar today, so it must not reuse `search-names`
 - Broader harness adapters beyond Cursor / Copilot / Local
 - Richer cross-agent shared memory beyond Trail learnings + skills publish
 - Deeper loop detection UX (warnings exist; automatic intervention does not)
@@ -595,11 +605,14 @@ git clone https://github.com/junjettrasmonte/kusa.git
 cd kusa
 npm install
 npm test
-npm run build          # regenerates src/dashboard.{html,js,css}
+npm run build          # regenerates src/app/console/dashboard.{html,js,css}
 npm run serve          # or: kusa serve after npm link
+kusa serve --live      # both halves above, rebuilt on save instead of by hand
 ```
 
-UI source lives under `src/ui/` (Vite + React + Tailwind). Hook/monitor/agent logic is plain Node under `src/`. After UI edits, run `npm run build` and commit the regenerated dashboard bundle.
+This repo is organised **feature-first**: read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before moving files. The top-level folders under `src/features/` are the functional requirements a user can complete, and each one carries its own layers inside it (`data/`, `agent/`, `ui/`, `api/`). Code more than one feature needs lives once in `src/shared/`; the console shell (Vite entry, localhost server, build) is infrastructure under `src/app/console/`. Imports never walk up with `../../`: anything leaving its own folder uses the `#`-prefixed aliases declared in `package.json` (`#features/…`, `#shared/…`, `#app/…`, `#ui/…`) — see the alias table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+UI source lives under `src/app/console/ui/` (Vite + React + Tailwind); the built bundle is committed beside the shell at `src/app/console/dashboard.{html,js,css}`. After UI edits, run `npm run build` and commit the regenerated dashboard bundle — or keep `kusa serve --live` running and let it republish those files on every save; commit the bundle before you push, since the watcher only writes it to disk.
 
 ---
 

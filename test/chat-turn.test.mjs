@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createChatSession, readChatSession, writeChatSession } from '../src/chat-store.mjs';
+import { createChatSession, readChatSession, readSessionConfig, writeChatSession } from '#features/chat/data/chat-store.mjs';
 import {
   createTurnJob,
   ingestTurnEvent,
@@ -11,7 +11,7 @@ import {
   persistTurnPrompt,
   sessionsWithActiveTurns,
   subscribeTurn,
-} from '../src/chat-turn.mjs';
+} from '#features/chat/data/chat-turn.mjs';
 
 describe('chat-turn', () => {
   it('overlays busy live onto listed sessions', () => {
@@ -57,6 +57,46 @@ describe('chat-turn', () => {
       assert.equal(assistants.length, 1);
       assert.equal(assistants[0].text, 'reply');
       assert.equal(assistants[0].turnId, job.turnId);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps per-session composer options through a turn rewrite', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kusa-options-'));
+    try {
+      const session = createChatSession(dir, { id: 'sess3', workspaceRoot: dir });
+      writeChatSession(dir, {
+        ...session,
+        options: {
+          mode: 'PLAN',
+          rules: 'allow',
+          model: ' gpt-4o ',
+          bogus: 1,
+        },
+      });
+
+      const job = createTurnJob({ queueKey: 'kusa:sess3', sessionId: 'sess3', prompt: 'hi' });
+      ingestTurnEvent(job, { type: 'content', text: 'reply' });
+      persistTurnCompletion(dir, job, { type: 'done', text: 'reply', turnId: job.turnId });
+
+      const saved = readChatSession(dir, 'sess3');
+      // The pickers survive the server's own rewrite, normalised to ids the
+      // agent actually implements.
+      assert.equal(saved.options.mode, 'plan');
+      assert.equal(saved.options.rules, 'allow');
+      // Allow is sticky: the rule lives in the session's settings sidecar, so
+      // the chat reopens on Allow and no expiry can revert it.
+      assert.strictEqual(saved.options.ruleExpiresAt, undefined);
+      assert.equal(saved.options.model, 'gpt-4o');
+      assert.strictEqual(saved.options.bogus, undefined);
+
+      // Unknown ids are dropped, never coerced into a working rule — and a
+      // junk pick cannot overwrite what the session already stored, so the
+      // chat falls back to its own settings rather than to something invented.
+      const junk = writeChatSession(dir, { ...saved, options: { mode: 'turbo', rules: 'nope' } });
+      assert.deepEqual(junk.options, { mode: 'plan', rules: 'allow', model: 'gpt-4o' });
+      assert.equal(readSessionConfig(dir, 'sess3').rules, 'allow');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

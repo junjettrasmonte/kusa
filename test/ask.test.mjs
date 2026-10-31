@@ -1,5 +1,5 @@
-import { createAskGate, ASK_TOOL_DEFS, ASK_TIMEOUT_MS, askToolSchemas, normalizeAskArgs } from '../src/agent/index.mjs';
-import { createTrailAwareTools, openaiToolSchemasWithTrail } from '../src/agent/index.mjs';
+import { createAskGate, ASK_TOOL_DEFS, ASK_TIMEOUT_MS, askToolSchemas, normalizeAskArgs } from '#features/agent/index.mjs';
+import { createTrailAwareTools, openaiToolSchemasWithTrail } from '#features/agent/index.mjs';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 

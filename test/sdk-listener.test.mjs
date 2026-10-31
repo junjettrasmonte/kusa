@@ -7,13 +7,13 @@ import {
   loadMonitorSettings,
   runHook,
   saveMonitorSettings,
-} from '../src/lib.mjs';
+} from '#features/monitor/lib.mjs';
 import {
   SessionListener,
   SimulatedSdkSession,
   normalizeSdkEvent,
   SDK_JOIN_TARGETS,
-} from '../src/sdk-listener.mjs';
+} from '#features/monitor/sdk-listener.mjs';
 
 const dirs = [];
 const quiet = {

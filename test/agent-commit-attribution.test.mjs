@@ -9,7 +9,7 @@ import {
   isAgentCoAuthorTrailer,
   isAgentIdentity,
   subjectLine,
-} from '../scripts/agent-commit-attribution.mjs';
+} from '#scripts/agent-commit-attribution.mjs';
 
 describe('agent commit attribution', () => {
   it('detects Cursor and Copilot identities case-insensitively', () => {

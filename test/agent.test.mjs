@@ -14,9 +14,15 @@ import {
   resolveTrailPolicy,
   trailNotReadyMessage,
   trailSystemPromptAddon,
-} from '../src/agent/index.mjs';
-import { laneKey, loadMonitorSettings, saveMonitorSettings } from '../src/lib.mjs';
-import { callTool } from '../src/mcp/tools.mjs';
+  // Rule → OpenCode permission mapping (the OpenCode backend has no gate of its
+  // own; the Rule IS its permission set).
+  resolveApprovalRule,
+  ruleClassOf,
+  permissionForRule,
+  agentToolFlags,
+} from '#features/agent/index.mjs';
+import { laneKey, loadMonitorSettings, saveMonitorSettings } from '#features/monitor/lib.mjs';
+import { callTool } from '#features/mcp/tools.mjs';
 
 const dirs = [];
 
@@ -287,5 +293,37 @@ describe('agent settings', () => {
     assert.equal(cfg.model, 'kusa-openai/demo');
     assert.equal(cfg.provider['kusa-openai'].options.baseURL, 'https://api.example.com/v1');
     assert.ok(Array.isArray(cfg.plugin) && cfg.plugin.length === 1);
+  });
+
+  it('the approval Rule maps onto OpenCode permissions, for every rule', () => {
+    const settings = {
+      agentBaseUrl: 'https://api.example.com/v1',
+      agentModel: 'demo',
+      agentAuthMode: 'none',
+    };
+    // ask-deny and ask-allow differ only in the timeout default the native gate
+    // owns, so they share one class — switching between them must not restart
+    // the cached OpenCode server, while allow/deny/ask must.
+    assert.equal(ruleClassOf('ask-deny'), ruleClassOf('ask-allow'));
+    assert.notEqual(ruleClassOf('allow'), ruleClassOf('deny'));
+    for (const rule of ['allow', 'deny', 'ask-deny', 'ask-allow']) {
+      const cfg = buildOpencodeConfig({ ...settings, agentApprovalMode: rule });
+      const expected = permissionForRule(rule);
+      assert.equal(cfg.permission.bash, expected);
+      assert.equal(cfg.permission.webfetch, expected);
+      assert.equal(cfg.agent.build.permission.bash, expected);
+      // Only 'deny' takes the tool off; every other rule leaves it callable.
+      assert.equal(cfg.agent.build.tools.bash, rule !== 'deny');
+      assert.equal(cfg.agent.build.tools.webfetch, rule !== 'deny');
+      // The same flags the prompt body re-sends per call, so a picker change
+      // applies without rebuilding the server.
+      assert.deepEqual(
+        agentToolFlags({ writable: true, rule }),
+        cfg.agent.build.tools,
+      );
+    }
+    // The composer picker wins over Settings for the run it starts.
+    assert.equal(resolveApprovalRule({ agentApprovalMode: 'deny' }, 'allow'), 'allow');
+    assert.equal(resolveApprovalRule({ agentApprovalMode: 'deny' }, ''), 'deny');
   });
 });

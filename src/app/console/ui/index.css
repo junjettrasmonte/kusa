@@ -1,0 +1,443 @@
+@import "tailwindcss";
+
+/*
+ * Kusă brand colour: #0038A8 — hsl(220 100% 33%), a deep navy that is far too
+ * dark to read as text on the console's near-black surfaces. So the accent is a
+ * ramp anchored on it: 600 *is* the brand colour (solid fills, white label on
+ * top), 400/500 are the lightened steps used for text, indicators and thin
+ * rules on dark, 800/900/950 the deepened steps used as tinted surfaces.
+ *
+ * Tailwind v4 compiles every emerald-* utility to a var(--color-emerald-*)
+ * reference, so re-declaring those tokens here re-skins all accents in the UI —
+ * brand chrome and status alike — without touching a class in the JSX. These
+ * rules are unlayered, so they beat the @layer theme block Tailwind emits.
+ */
+:root {
+  --color-brand-50: #e7effd;
+  --color-brand-100: #d9e5fc;
+  --color-brand-200: #bfd2f7;
+  --color-brand-300: #97b4ed;
+  --color-brand-400: #6a90dc;
+  --color-brand-500: #3e6dcc;
+  --color-brand-600: #0038a8; /* the brand colour itself */
+  --color-brand-700: #032d81;
+  --color-brand-800: #06225b;
+  --color-brand-900: #07183c;
+  --color-brand-950: #061023;
+
+  --color-emerald-50: var(--color-brand-50);
+  --color-emerald-100: var(--color-brand-100);
+  --color-emerald-200: var(--color-brand-200);
+  --color-emerald-300: var(--color-brand-300);
+  --color-emerald-400: var(--color-brand-400);
+  --color-emerald-500: var(--color-brand-500);
+  --color-emerald-600: var(--color-brand-600);
+  --color-emerald-700: var(--color-brand-700);
+  --color-emerald-800: var(--color-brand-800);
+  --color-emerald-900: var(--color-brand-900);
+  --color-emerald-950: var(--color-brand-950);
+
+  /*
+   * Indirection for the hand-written rules below (.btn-primary, .panel-list-item-active).
+   * Tailwind resolves its own theme tokens inside color-mix() at build time, so
+   * writing var(--color-emerald-500) there would be baked back to the default
+   * green; a name Tailwind does not own stays dynamic and follows the theme at
+   * runtime (the light-theme block above re-points the emerald tokens).
+   */
+  --kusa-accent: var(--color-emerald-500);
+  --kusa-accent-text: var(--color-emerald-400);
+}
+
+/* Collapsed sidebar: hide text labels, keep the icon column. */
+#sidebar[data-collapsed="true"] .sidebar-label {
+  display: none;
+}
+
+/*
+ * Light theme remaps the gray ramp (and a few accents) so the existing
+ * dark-oriented Tailwind classes (bg-gray-950, text-gray-100, …) read as a
+ * light UI without rewriting every class. The accent steps flip to the dark end
+ * of the brand ramp: on white, light blue text washes out, so 300/400/500
+ * resolve to the deep navy steps instead.
+ */
+html[data-theme="light"] {
+  color-scheme: light;
+  --color-gray-100: oklch(21% 0.034 264.665);
+  --color-gray-200: oklch(27.8% 0.033 256.848);
+  --color-gray-300: oklch(37.3% 0.034 259.733);
+  --color-gray-400: oklch(44.6% 0.03 256.802);
+  --color-gray-500: oklch(55.1% 0.027 264.364);
+  --color-gray-600: oklch(70.7% 0.022 261.325);
+  --color-gray-800: oklch(92.8% 0.006 264.531);
+  --color-gray-900: oklch(96.7% 0.003 264.542);
+  --color-gray-950: oklch(100% 0 0);
+  --color-sky-300: oklch(55% 0.14 232);
+  --color-amber-200: oklch(45% 0.1 85);
+  --color-amber-300: oklch(55% 0.14 85);
+  --color-amber-950: oklch(95% 0.04 95);
+  --color-rose-300: oklch(50% 0.18 15);
+  --color-emerald-300: var(--color-brand-800);
+  --color-emerald-400: var(--color-brand-700);
+  --color-emerald-500: var(--color-brand-600);
+  --color-emerald-600: var(--color-brand-700);
+}
+
+html[data-theme="dark"],
+html:not([data-theme]) {
+  color-scheme: dark;
+}
+
+/* Inline markdown in Kusă Chat (assistant replies). */
+.chat-md :first-child {
+  margin-top: 0;
+}
+.chat-md :last-child {
+  margin-bottom: 0;
+}
+.chat-md pre {
+  max-width: 100%;
+}
+
+/* VS Code–style shimmer for live thinking / working labels in Kusă chat. */
+@keyframes chat-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+.chat-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-gray-500, #6b7280) 0%,
+    var(--color-gray-200, #e5e7eb) 40%,
+    var(--color-gray-500, #6b7280) 80%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: chat-shimmer 1.6s linear infinite;
+}
+html[data-theme="light"] .chat-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-gray-500, #6b7280) 0%,
+    oklch(25% 0.03 260) 40%,
+    var(--color-gray-500, #6b7280) 80%
+  );
+}
+
+/*
+ * Clipped chat blocks (agent / thinking / tool): no nested scrollbar — content
+ * is height-capped with overflow hidden; decorative fades sit on top and bottom.
+ * Expand/collapse is a Show all / Show less control, not the vignette.
+ * Uses the themed gray-950 surface so the fade matches light/dark.
+ */
+.chat-clip-vignette {
+  pointer-events: none;
+  background: linear-gradient(
+    to top,
+    var(--color-gray-950, rgb(3 7 18)) 0%,
+    color-mix(in oklab, var(--color-gray-950, rgb(3 7 18)) 80%, transparent) 55%,
+    transparent 100%
+  );
+}
+.chat-clip-vignette[data-edge="top"] {
+  background: linear-gradient(
+    to bottom,
+    var(--color-gray-950, rgb(3 7 18)) 0%,
+    color-mix(in oklab, var(--color-gray-950, rgb(3 7 18)) 80%, transparent) 55%,
+    transparent 100%
+  );
+}
+
+/*
+ * Shared panel chrome for Skills / Tools editors.
+ * Uses remapped gray tokens so light theme keeps readable contrast
+ * (avoid hardcoded dark RGB and pale emerald-100 on light backgrounds).
+ */
+.panel-list-item {
+  color: var(--color-gray-200, inherit);
+}
+.panel-list-item-active {
+  background: color-mix(in oklab, var(--kusa-accent) 15%, transparent);
+  color: var(--color-gray-100, inherit);
+}
+.panel-list-item-active .text-gray-500,
+.panel-list-item-active .text-gray-600 {
+  color: var(--color-gray-500, inherit);
+}
+
+/*
+ * Right-rail context menus. Each rail icon's sub-views no longer sit as a
+ * horizontal strip in the pane topbar — they hang beside the icon that owns
+ * them and appear while that icon is hovered.
+ *
+ * The menu is a real element that is ALWAYS in the DOM: the screenshot scripts
+ * click `session-tab-chat` without a pointer over the rail, and a keyboard user
+ * can reach a sub-view before they can see it. `visibility: hidden` is what
+ * keeps a closed menu out of the accessibility tree and off hit-testing (the
+ * rail nav must not clip overflow, which is why it dropped `overflow-y-auto`);
+ * the opacity transition is what makes it read as a popup instead of a blink.
+ *
+ * Opening is instant. Closing delays the visibility flip until the fade has
+ * finished, so a menu never drops out of the tree while it is still partly
+ * visible.
+ */
+.rail-submenu {
+  visibility: hidden;
+  opacity: 0;
+  transition:
+    opacity 120ms cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 120ms;
+}
+.rail-submenu-group:hover .rail-submenu,
+.rail-submenu-group:focus-within .rail-submenu {
+  visibility: visible;
+  opacity: 1;
+  transition: opacity 120ms cubic-bezier(0.16, 1, 0.3, 1), visibility 0s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-submenu,
+  .rail-submenu-group:hover .rail-submenu,
+  .rail-submenu-group:focus-within .rail-submenu {
+    transition: none;
+  }
+}
+
+/*
+ * The composer paperclip's context menu — same hover mechanism as the rail
+ * submenus above, its own name because it belongs to the composer, not to a
+ * rail. It opens upward (`bottom-[100%]` in AttachmentPicker): the composer
+ * sits against the bottom of the panel, so a menu that grew down would always
+ * run past the viewport.
+ */
+.chat-attach-menu {
+  visibility: hidden;
+  opacity: 0;
+  transition:
+    opacity 120ms cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 120ms;
+}
+.chat-attach-group:hover .chat-attach-menu,
+.chat-attach-group:focus-within .chat-attach-menu {
+  visibility: visible;
+  opacity: 1;
+  transition: opacity 120ms cubic-bezier(0.16, 1, 0.3, 1), visibility 0s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-attach-menu,
+  .chat-attach-group:hover .chat-attach-menu,
+  .chat-attach-group:focus-within .chat-attach-menu {
+    transition: none;
+  }
+}
+
+.btn {
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-gray-800, rgb(55 65 81));
+  background: var(--color-gray-950, rgb(17 24 39));
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--color-gray-200, rgb(209 213 219));
+}
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.375rem;
+  line-height: 0;
+}
+.btn:hover:not(:disabled) {
+  background: var(--color-gray-900, rgb(31 41 55));
+}
+.btn:disabled {
+  opacity: 0.4;
+}
+/*
+ * Primary (kusa-blue) action button. Both themes come from the accent tokens
+ * above — html[data-theme="light"] already re-points emerald-400/500 at the
+ * deep end of the brand ramp — so no second rule set is needed here.
+ */
+.btn-primary {
+  border-radius: 0.375rem;
+  border: 1px solid color-mix(in oklab, var(--kusa-accent) 40%, transparent);
+  background: color-mix(in oklab, var(--kusa-accent) 15%, transparent);
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--kusa-accent-text);
+}
+.btn-primary:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--kusa-accent) 25%, transparent);
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+}
+.btn-danger {
+  border-radius: 0.375rem;
+  border: 1px solid color-mix(in oklab, oklch(65% 0.2 15) 35%, transparent);
+  background: color-mix(in oklab, oklch(65% 0.2 15) 10%, transparent);
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: oklch(65% 0.18 15);
+}
+.btn-danger:hover:not(:disabled) {
+  background: color-mix(in oklab, oklch(65% 0.2 15) 20%, transparent);
+}
+.btn-danger:disabled {
+  opacity: 0.4;
+}
+
+html[data-theme="light"] .btn-danger {
+  color: oklch(45% 0.18 15);
+}
+
+/*
+ * Scrollbars for in-app panels (chat transcript, expanded agent blocks, tool
+ * output, textarea, sidebars): a hairline, low-contrast bar so scrolling reads
+ * as part of the panel instead of competing with the browser's own scrollbar —
+ * VS Code Copilot style. The document root is excluded on purpose (html/body)
+ * so the page itself keeps its native scrollbar.
+ *
+ * Colours reuse the gray ramp, which html[data-theme="light"] already remaps,
+ * so both themes stay subtle without a second rule set.
+ *
+ * Standard properties first: Firefox supports only these, and Chromium 115+
+ * prefers them over the ::-webkit-scrollbar pseudo-elements below, which remain
+ * as the fallback for older WebKit.
+ */
+*:not(html):not(body) {
+  scrollbar-width: thin;
+  scrollbar-color:
+    color-mix(in oklab, var(--color-gray-400, #9ca3af) 55%, transparent)
+    transparent;
+}
+*:not(html):not(body)::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*:not(html):not(body)::-webkit-scrollbar-track,
+*:not(html):not(body)::-webkit-scrollbar-corner {
+  background: transparent;
+}
+*:not(html):not(body)::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--color-gray-400, #9ca3af) 55%, transparent);
+  /* Transparent border insets the bar so the visible thumb is ~3px, not 6px. */
+  border: 1.5px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+*:not(html):not(body)::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--color-gray-300, #d1d5db) 70%, transparent);
+}
+
+/*
+ * Queued prompts stack above the composer: each new prompt enters at the
+ * message box and slides up into the list, so the queue reads as something the
+ * composer produced rather than a block that pops into existence. The animation
+ * runs once per card because React creates the node only when the server adds
+ * that entry — later SSE frames reuse the same node and never replay it (and
+ * the collapsed/expanded variants keep the same key, so expanding does not
+ * replay it either).
+ */
+@keyframes chat-queue-in {
+  from {
+    transform: translateY(0.9rem);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.chat-queue-in {
+  animation: chat-queue-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-queue-in {
+    animation: none;
+  }
+}
+
+/*
+ * One beat on a toolbar badge whose counters just moved (the Task List chip
+ * carries the done/total the user follows). The beat is exactly one 2s pulse and
+ * then settles back, because it is a statement about a change that already
+ * happened — a looping pulse would read as "still changing" forever.
+ *
+ * The beat exists twice under two names. ChatHarness alternates between them on
+ * every change, and a CSS animation only restarts when its animation-NAME changes
+ * (re-applying the same class on the same node does nothing), so the alternation
+ * is what lets a status update land inside a beat that is still running.
+ */
+@keyframes chat-badge-pulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
+  40% { transform: scale(1.06); box-shadow: 0 0 0 4px color-mix(in oklab, currentColor 45%, transparent); }
+  100% { transform: scale(1); box-shadow: 0 0 0 8px transparent; }
+}
+@keyframes chat-badge-pulse-again {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
+  40% { transform: scale(1.06); box-shadow: 0 0 0 4px color-mix(in oklab, currentColor 45%, transparent); }
+  100% { transform: scale(1); box-shadow: 0 0 0 8px transparent; }
+}
+.chat-badge-pulse {
+  transform-origin: center;
+  animation: chat-badge-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) 1;
+}
+.chat-badge-pulse-again {
+  transform-origin: center;
+  animation: chat-badge-pulse-again 2s cubic-bezier(0.4, 0, 0.6, 1) 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-badge-pulse,
+  .chat-badge-pulse-again {
+    animation: none;
+  }
+}
+
+/*
+ * The same one-beat contract as .chat-badge-pulse, but a BOUNCE, for the Prompt
+ * Queue chip. A task status moving is progress swelling — the chip breathes.
+ * A prompt arriving in the queue or being handed to the chat is a discrete
+ * object MOVING, so the chip hops once and lands, which is what a bounce reads
+ * as. Same 2s, same two names: the owner alternates them so a change landing
+ * inside a running beat replays it instead of being swallowed.
+ *
+ * The hop is small (0.35rem) because this chip sits inline in a toolbar row — a
+ * full-height bounce would collide with the composer band below it. The squash
+ * on landing is what makes the hop read as weight rather than a float.
+ */
+@keyframes chat-badge-bounce {
+  0% { transform: translateY(0) scale(1); }
+  20% { transform: translateY(-0.35rem) scale(1, 1); }
+  40% { transform: translateY(0) scale(0.94, 1.06); }
+  55% { transform: translateY(-0.16rem) scale(1.04, 0.96); }
+  70% { transform: translateY(0) scale(0.98, 1.02); }
+  85% { transform: translateY(-0.05rem) scale(1, 1); }
+  100% { transform: translateY(0) scale(1); }
+}
+@keyframes chat-badge-bounce-again {
+  0% { transform: translateY(0) scale(1); }
+  20% { transform: translateY(-0.35rem) scale(1, 1); }
+  40% { transform: translateY(0) scale(0.94, 1.06); }
+  55% { transform: translateY(-0.16rem) scale(1.04, 0.96); }
+  70% { transform: translateY(0) scale(0.98, 1.02); }
+  85% { transform: translateY(-0.05rem) scale(1, 1); }
+  100% { transform: translateY(0) scale(1); }
+}
+.chat-badge-bounce {
+  transform-origin: center bottom;
+  animation: chat-badge-bounce 2s cubic-bezier(0.3, 0, 0.4, 1) 1;
+}
+.chat-badge-bounce-again {
+  transform-origin: center bottom;
+  animation: chat-badge-bounce-again 2s cubic-bezier(0.3, 0, 0.4, 1) 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-badge-bounce,
+  .chat-badge-bounce-again {
+    animation: none;
+  }
+}

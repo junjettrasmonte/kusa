@@ -479,10 +479,10 @@ async function main() {
 
     // 01 — Hero / chat: expanded thinking, tool calls, pending approval gate
     await assertLight();
-    await page.evaluate(() => {
-      localStorage.setItem('monitor.composerMode', 'agent');
-      localStorage.setItem('monitor.composerRule', 'ask-deny');
-    });
+    // Pickers are per session now (they live in the session record, not in
+    // localStorage), and this demo chat never picked any — it renders the
+    // Settings defaults, which are exactly Agent / ask-deny, so the shot stays
+    // deterministic without seeding anything.
     // Select the idle demo chat first, then overlay the live approval turn.
     await setRailTab(page, 'session');
     await setSessionSubTab(page, 'chat');

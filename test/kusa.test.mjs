@@ -32,21 +32,24 @@ import {
   saveMonitorSettings,
   sumTrailFooters,
   todosFromTranscriptText,
-} from '../src/lib.mjs';
+} from '#features/monitor/lib.mjs';
 import {
   chatFilePath,
   createChatSession,
   listChatSessions,
   migrateChatSessions,
+  sessionConfigPath,
   writeChatSession,
-} from '../src/chat-store.mjs';
-import { createMonitorServer, resolveServePort } from '../src/serve.mjs';
-import { loadQueues, queuesFilePath, saveQueues, WORKSPACE_QUEUE_KEY } from '../src/queue-store.mjs';
-import { loadTasks, tasksFilePath } from '../src/task-store.mjs';
+} from '#features/chat/data/chat-store.mjs';
+import { createMonitorServer, resolveServeOptions, resolveServePort } from '#app/console/serve.mjs';
+import { serverSourceClosure } from '#app/console/serve-live.mjs';
+import { loadQueues, queuesFilePath, saveQueues, WORKSPACE_QUEUE_KEY } from '#features/chat/data/queue-store.mjs';
+import { loadTasks, saveTasks, tasksFilePath } from '#features/chat/data/task-store.mjs';
+import { consoleAsset, entryPoint } from '#shared/lib/pkg.mjs';
 
 const root = join(import.meta.dirname, '..');
-const hookPath = join(root, 'src', 'hook.mjs');
-const cliPath = join(root, 'src', 'cli', 'kusa.mjs');
+const hookPath = entryPoint('hook');
+const cliPath = entryPoint('cli');
 const dirs = [];
 const quiet = {
   toolDurationWarnMs: 1e12,
@@ -649,6 +652,27 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.match(html, /id="monitor-bootstrap" type="application\/json">\{"origin":"hooks"/);
     assert.ok(readFileSync(join(dir, 'dashboard.css'), 'utf8').includes('animate-pulse'));
     assert.ok(readFileSync(join(dir, 'dashboard.js'), 'utf8').includes('kusaUpdate'));
+  });
+
+  it('keeps an id-less lane in the figures but never as a session row', () => {
+    const dir = tempDir();
+    // A hook that arrives before any session id is known has nowhere to land, so
+    // it goes to the id-less bucket. Its counts are real and stay reachable under
+    // its lane key — but it is not a session the user can open, rename, or
+    // delete, so it must not appear as an `unknown` row in either list.
+    feed(dir, 'preToolUse', { timestamp: 1_700_000_000_000, cwd: '/work', toolName: 'view' }, { wall: 1_700_000_000_000, mono: 0 });
+    feed(dir, 'sessionStart', session('sess-1'), { wall: 1_700_000_000_100, mono: 100 });
+    const view = bootstrap(dir);
+    const node = view.harnesses.find((h) => h.harness === 'github-copilot');
+    assert.deepEqual(node.sessions.map((s) => s.id), ['sess-1'], 'no unknown row in the sidebar tree');
+    const bucket = view.lanes['github-copilot:unknown'];
+    assert.ok(bucket, 'the id-less bucket keeps its figures');
+    assert.equal(bucket.summary.attempts, 1);
+    assert.equal(bucket.rows[0].name, 'view');
+    const md = readFileSync(join(dir, 'dashboard.md'), 'utf8');
+    const sessionsSection = md.split('\n## Sessions\n\n')[1].split('\n## ')[0];
+    assert.match(sessionsSection, /`sess-1`/);
+    assert.doesNotMatch(sessionsSection, /unknown/, 'the markdown list matches the sidebar tree');
   });
 
   it('keeps at most eight sessions per harness and drops the oldest finished ones', () => {
@@ -1397,6 +1421,65 @@ describe('delete sessions', () => {
     assert.equal(view.lanes['github-copilot:drop-me'], undefined);
     assert.equal(view.harnesses[0].sessions.map((s) => s.id).join(','), 'keep-me');
   });
+
+  it('drops a deleted session task rows and settings sidecar so nothing orphans', () => {
+    const dir = tempDir();
+    feed(dir, 'sessionStart', session('keep-me'), { wall: 1_700_000_000_000, mono: 0 });
+    feed(dir, 'sessionStart', session('drop-me'), { wall: 1_700_000_000_100, mono: 100 });
+    feed(dir, 'preToolUse', tool('TodoWrite', {
+      sessionId: 'keep-me',
+      timestamp: 1_700_000_000_200,
+      toolArgs: { merge: false, todos: [{ id: 'k1', content: 'Keep task', status: 'pending' }] },
+    }), { wall: 1_700_000_000_200, mono: 200 });
+    feed(dir, 'preToolUse', tool('TodoWrite', {
+      sessionId: 'drop-me',
+      timestamp: 1_700_000_000_250,
+      toolArgs: { merge: false, todos: [{ id: 'd1', content: 'Drop task', status: 'pending' }] },
+    }), { wall: 1_700_000_000_250, mono: 250 });
+
+    // A Kusă chat with a Rule pick: the pick lives in its own sidecar.
+    writeChatSession(dir, {
+      key: 'kusa:drop-chat',
+      id: 'drop-chat',
+      status: 'idle',
+      attempts: 0,
+      createdAt: 100,
+      messages: [{ id: 'm1', role: 'user', text: 'hi', at: 100 }],
+      options: { rules: 'allow' },
+    });
+    // Task rows the tools wrote straight to the sidecar (no lane behind them).
+    saveTasks(dir, {
+      ...loadTasks(dir),
+      'kusa:drop-chat': {
+        todos: [{ id: 's1', content: 'Sidecar task', status: 'pending' }],
+        updatedAtWall: 100,
+      },
+    });
+
+    assert.deepEqual(Object.keys(loadTasks(dir)).sort(), [
+      'github-copilot:drop-me',
+      'github-copilot:keep-me',
+      'kusa:drop-chat',
+    ]);
+    assert.equal(existsSync(sessionConfigPath(dir, 'drop-chat')), true);
+    assert.equal(existsSync(chatFilePath(dir, 'drop-chat')), true);
+
+    const result = deleteSessions(
+      dir,
+      ['github-copilot:drop-me', 'kusa:drop-chat', 'kusa:never-seen'],
+      { nowWall: 1_700_000_000_300 },
+    );
+    assert.deepEqual(result.deleted, ['github-copilot:drop-me', 'kusa:drop-chat']);
+    assert.deepEqual(result.missing, ['kusa:never-seen']);
+
+    // Only the surviving session keeps rows; the deleted ones are gone even
+    // though persist re-reads the sidecar and keeps entries for absent lanes.
+    const after = loadTasks(dir);
+    assert.deepEqual(Object.keys(after).sort(), ['github-copilot:keep-me']);
+    assert.equal(after['github-copilot:keep-me'].todos[0].content, 'Keep task');
+    assert.equal(existsSync(chatFilePath(dir, 'drop-chat')), false);
+    assert.equal(existsSync(sessionConfigPath(dir, 'drop-chat')), false);
+  });
 });
 
 describe('git working copy', () => {
@@ -1569,6 +1652,32 @@ describe('local http server', () => {
     assert.throws(() => resolveServePort(['--port'], {}), /requires a port number/);
     assert.throws(() => resolveServePort(['--port', '0'], {}), /invalid port/);
     assert.throws(() => resolveServePort(['--listen'], {}), /unknown serve option/);
+  });
+
+  it('accepts --live/--hmr without disturbing the port', () => {
+    assert.equal(resolveServeOptions(['--live'], {}).live, true);
+    assert.equal(resolveServeOptions(['--hmr'], {}).live, true);
+    assert.equal(resolveServeOptions(['--live-reload'], {}).live, true);
+    // The child serve.mjs is spawned with --no-live so it never re-enters watch mode.
+    assert.equal(resolveServeOptions(['--live', '--no-live'], {}).live, false);
+    assert.equal(resolveServeOptions(['--no-hmr'], {}).live, false);
+    assert.deepEqual(resolveServeOptions(['--live', '--port', '4103'], {}), { port: 4103, live: true });
+    assert.deepEqual(resolveServeOptions(['--live'], { KUSA_PORT: '4000' }), { port: 4000, live: true });
+    assert.equal(resolveServeOptions([], {}).live, false);
+  });
+
+  it('watches the server import closure, never the generated UI assets', () => {
+    const files = serverSourceClosure();
+    assert.ok(files.length > 10, 'the serve graph must not be empty');
+    assert.deepEqual(files.length, new Set(files).size, 'closure is deduped');
+    assert.deepEqual(files, [...files].sort(), 'closure is stable-sorted');
+    assert.ok(files.some((f) => f.endsWith('/serve.mjs')), 'entry is always watched');
+    assert.ok(files.some((f) => f.endsWith('/lib.mjs')), 'transitive imports are followed');
+    // Sibling .mjs the server does not import — editing it must not restart it.
+    assert.equal(files.some((f) => f.endsWith('/vite.config.mjs')), false);
+    // dashboard.* is rewritten by the vite watcher on every save; a restart here
+    // would loop forever.
+    assert.equal(files.some((f) => /dashboard\.(html|js|css)$/.test(f)), false);
   });
 
   it('serves the page and the data folder from one origin, no-cache, and deletes sessions', async () => {
@@ -2220,7 +2329,7 @@ describe('dashboard demonstration', () => {
     assert.equal(boot.rows[0].name, 'view');
     assert.equal(boot.rows[0].avg, 2400);
     assert.match(html, /"origin":"synthetic-demo"/);
-    assert.match(readFileSync(join(root, 'src', 'dashboard.js'), 'utf8'), /synthetic demo data/);
+    assert.match(readFileSync(consoleAsset('dashboard.js'), 'utf8'), /synthetic demo data/);
     assert.match(markdown, /Synthetic demonstration data/);
     assert.match(markdown, /\| view \| 1 \| 0 \| 1 \|/);
     assert.match(markdown, /## Git/);

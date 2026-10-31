@@ -18,7 +18,7 @@ import {
   BROWSER_TOOL_DEFS,
   createTrailAwareTools,
   openaiToolSchemasWithTrail,
-} from '../src/agent/index.mjs';
+} from '#features/agent/index.mjs';
 
 const dirs = [];
 
@@ -51,12 +51,14 @@ describe('approval gate', () => {
     assert.equal(gate.timeoutAllows, false);
   });
 
-  it('runs after the user approves, and remembers the answer', async () => {
+  it('an answer covers only the call it was asked for — the next call asks again', async () => {
     let asked = 0;
     const gate = createApprovalGate({
+      // Nothing is remembered from an answer, and no `remember` flag exists:
+      // the ask rule keeps asking until the Rule itself changes.
       onApprove: () => {
         asked += 1;
-        return { allowed: true, remember: asked === 1 };
+        return { allowed: true };
       },
     });
     const root = tempDir();
@@ -70,9 +72,9 @@ describe('approval gate', () => {
     const second = await terminal.call('kusa_terminal', { command: 'echo two' });
     assert.equal(second.ok, true);
     assert.match(second.stdout, /two/);
-    // Remembered allow: no second prompt.
-    assert.equal(asked, 1);
-    assert.equal(gate.remembered.get('kusa_terminal'), 'allow');
+    // The click settled the call before it; this one was asked on its own.
+    assert.equal(asked, 2);
+    assert.equal(gate.requests.filter((row) => row.status === 'pending').length, 2);
   });
 
   it('a denial never runs the command', async () => {
@@ -86,6 +88,33 @@ describe('approval gate', () => {
     assert.equal(result.denied, true);
     assert.match(result.error, /DENIED by the user/);
     assert.equal(existsSync(marker), false);
+  });
+
+  it('a later Rule change decides the calls that follow — no click is carried over', async () => {
+    let asked = 0;
+    const gate = createApprovalGate({
+      onApprove: () => {
+        asked += 1;
+        return false;
+      },
+    });
+    const root = tempDir();
+    const terminal = createTerminalTools(root, { approval: gate });
+
+    const denied = await terminal.call('kusa_terminal', { command: 'echo one' });
+    assert.equal(denied.ok, false);
+    assert.equal(denied.denied, true);
+    assert.equal(asked, 1);
+
+    // The user's newest word about the Rule wins: switching to Allow runs the
+    // next call outright, with no ask — nothing the earlier click settled for
+    // can still be blocking this tool.
+    gate.setMode('allow');
+    const ran = await terminal.call('kusa_terminal', { command: 'echo two' });
+    assert.equal(ran.ok, true);
+    assert.match(ran.stdout, /two/);
+    assert.equal(asked, 1);
+    assert.equal(gate.requests.at(-1).decision, 'mode-allow');
   });
 
   it('Composer Stop aborts a pending ask instead of waiting for the timeout', async () => {
@@ -140,12 +169,204 @@ describe('approval gate', () => {
     assert.equal(gate.timeoutAllows, true);
   });
 
+  it('a mid-turn Rule switch settles the asks that are already waiting', async () => {
+    const root = tempDir();
+    const emitted = [];
+    const gate = createApprovalGate({
+      mode: 'ask-deny',
+      timeoutMs: 60_000,
+      emit: (ask) => emitted.push(ask),
+      // serve's waitForApproval, exactly: it only resolves on POST /kusa/approval.
+      onApprove: () => new Promise(() => {}),
+    });
+    const terminal = createTerminalTools(root, { approval: gate });
+
+    // The ask opens and nobody answers it — the call is in flight, waiting.
+    const running = terminal.call('kusa_terminal', { command: 'printf hi > switched.txt' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].status, 'pending');
+
+    // Switching to Allow IS the decision about this call: no countdown, no
+    // second ask, the command runs.
+    assert.equal(gate.setMode('allow'), 'allow');
+    const ran = await running;
+    assert.equal(ran.ok, true);
+    assert.equal(existsSync(join(root, 'switched.txt')), true);
+    // The pending row is replaced, so no countdown stays stuck at zero.
+    assert.equal(emitted.length, 2);
+    assert.equal(emitted[1].status, 'allowed');
+    assert.equal(emitted[1].decision, 'allow-rule-change');
+    assert.equal(emitted[1].autoSettled, true);
+    assert.match(emitted[1].reason, /approval rule switched to allow/);
+
+    // Same in the other direction: Deny blocks the call that was waiting, and
+    // it never ran, so the model is told the Rule — not a timeout — moved.
+    const denyGate = createApprovalGate({
+      mode: 'ask-deny',
+      timeoutMs: 60_000,
+      onApprove: () => new Promise(() => {}),
+    });
+    const waiting = createTerminalTools(root, { approval: denyGate })
+      .call('kusa_terminal', { command: 'printf hi > blocked.txt' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    denyGate.setMode('deny');
+    const blocked = await waiting;
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.denied, true);
+    assert.equal(blocked.approval.decision, 'deny-rule-change');
+    assert.match(blocked.error, /approval rule switched to deny/);
+    assert.equal(existsSync(join(root, 'blocked.txt')), false);
+
+    // An ask-rule switch keeps the wait open: only the timeout default moves.
+    const askGate = createApprovalGate({
+      mode: 'ask-deny',
+      timeoutMs: 20,
+      onApprove: () => new Promise(() => {}),
+    });
+    const stillWaiting = askGate.request({ name: 'kusa_browse', args: { url: 'https://x.test' }, callId: 'c12' });
+    askGate.setMode('ask-allow');
+    assert.equal(askGate.timeoutAllows, true);
+    const settled = await stillWaiting;
+    assert.equal(settled.allowed, true);
+    assert.equal(settled.decision, 'ask-allow-default');
+  });
+
+  it('serve settling an open ask with the new Rule names the Rule that moved', async () => {
+    // The path the chat actually takes: while an ask waits, the loop is blocked
+    // inside the gated call, so it cannot reach gate.setMode. serve owns the
+    // wait, so POST /kusa/chat/options settles the open ask through that handle
+    // and hands the new Rule along with the decision.
+    const root = tempDir();
+    const emitted = [];
+    let decide = null;
+    const gate = createApprovalGate({
+      mode: 'ask-deny',
+      timeoutMs: 60_000,
+      emit: (ask) => emitted.push(ask),
+      onApprove: (ask) => new Promise((settle) => { decide = settle; }),
+    });
+    const terminal = createTerminalTools(root, { approval: gate });
+
+    const running = terminal.call('kusa_terminal', { command: 'printf hi > served.txt' });
+    await new Promise((resolve) => resolve());
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].status, 'pending');
+    // The gate itself still holds the OLD rule — the loop adopts the new one at
+    // its next boundary, so the settled row must not be labelled after it.
+    assert.equal(gate.mode, 'ask-deny');
+
+    decide({
+      ruleChanged: true,
+      allowed: true,
+      rule: 'allow',
+      reason: 'approval rule switched to allow',
+    });
+    const ran = await running;
+    assert.equal(ran.ok, true);
+    assert.equal(existsSync(join(root, 'served.txt')), true);
+    assert.equal(emitted.length, 2);
+    assert.equal(emitted[1].status, 'allowed');
+    assert.equal(emitted[1].decision, 'allow-rule-change');
+    assert.equal(emitted[1].autoSettled, true);
+    assert.match(emitted[1].reason, /approval rule switched to allow/);
+  });
+
   it('non-gated tools pass straight through', async () => {
     const gate = createApprovalGate();
     const verdict = await gate.request({ name: 'kusa_read_file', args: { path: 'a' } });
     assert.equal(verdict.allowed, true);
     assert.equal(verdict.decision, 'not-gated');
     assert.equal(APPROVAL_GATED_TOOLS.has('kusa_read_file'), false);
+  });
+
+  it('Allow is unconditional: no ask, no countdown — the row still names the Rule', async () => {
+    const emitted = [];
+    const root = tempDir();
+    const gate = createApprovalGate({
+      mode: 'allow',
+      emit: (ask) => emitted.push(ask),
+      // A resolver IS wired here — the chat always wires serve's waitForApproval
+      // — and Allow must still never call it: nothing is being asked. The row
+      // the gate ships is already resolved, so no timer starts and no buttons
+      // appear.
+      onApprove: (ask) => {
+        emitted.push({ marker: 'approver-was-called', ...ask });
+        return { allowed: false };
+      },
+    });
+    assert.equal(gate.mode, 'allow');
+    assert.equal(gate.timeoutAllows, false);
+
+    const verdict = await gate.request({ name: 'kusa_terminal', args: { command: 'ls' }, callId: 'c9' });
+    assert.equal(verdict.allowed, true);
+    assert.equal(verdict.decision, 'mode-allow');
+    // The call still gated, so the chat gets a row saying the RULE allowed it —
+    // shipped resolved, so it can never be read as a wait.
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].status, 'allowed');
+    assert.equal(emitted[0].decision, 'mode-allow');
+    assert.equal(emitted[0].autoSettled, false);
+    assert.equal(emitted[0].timeoutMs, null);
+    assert.equal(emitted[0].timeoutStartsAt, null);
+    assert.match(emitted[0].message, /ran without asking/);
+    assert.equal(gate.requests.length, 1);
+    // The approver was never consulted — a rule that decides outright does not
+    // wait for one.
+    assert.equal(emitted.filter((row) => row.marker === 'approver-was-called').length, 0);
+    // A rule that never waits still has no timeout contract to ship.
+    assert.equal(verdict.timeoutStartsAt, undefined);
+    assert.equal(verdict.timeoutMs, undefined);
+
+    const terminal = createTerminalTools(root, { approval: gate });
+    const ran = await terminal.call('kusa_terminal', { command: 'printf hi > ran.txt' });
+    assert.equal(ran.ok, true);
+    assert.equal(existsSync(join(root, 'ran.txt')), true);
+
+    // Switching TO Allow mid-turn behaves the same from the next call on: the
+    // ask rule above already surfaced its pair of rows, and the call under the
+    // new Rule adds its own resolved row.
+    const askEmitted = [];
+    const askGate = createApprovalGate({ mode: 'ask-deny', emit: (ask) => askEmitted.push(ask) });
+    const first = await askGate.request({ name: 'kusa_browse', args: { url: 'https://x.test' }, callId: 'c10' });
+    assert.equal(first.allowed, false);
+    assert.equal(askEmitted.length, 2);
+    askGate.setMode('allow');
+    const second = await askGate.request({ name: 'kusa_browse', args: { url: 'https://y.test' }, callId: 'c11' });
+    assert.equal(second.allowed, true);
+    assert.equal(second.decision, 'mode-allow');
+    assert.equal(askEmitted.length, 3);
+    assert.equal(askEmitted[2].status, 'allowed');
+    assert.equal(askEmitted[2].decision, 'mode-allow');
+  });
+
+  it('the Deny rule surfaces a resolved row naming the Rule', async () => {
+    const emitted = [];
+    const root = tempDir();
+    const gate = createApprovalGate({
+      mode: 'deny',
+      emit: (ask) => emitted.push(ask),
+      onApprove: () => ({ allowed: true }),
+    });
+    assert.equal(gate.mode, 'deny');
+
+    const verdict = await gate.request({ name: 'kusa_terminal', args: { command: 'ls' }, callId: 'c12' });
+    assert.equal(verdict.allowed, false);
+    assert.equal(verdict.decision, 'mode-deny');
+    // The chat must be able to say the Rule blocked it, not that the user did.
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].status, 'denied');
+    assert.equal(emitted[0].decision, 'mode-deny');
+    assert.equal(emitted[0].autoSettled, false);
+    assert.match(emitted[0].message, /did not run/);
+    assert.equal(emitted.filter((row) => row.marker === 'approver-was-called').length, 0);
+
+    const terminal = createTerminalTools(root, { approval: gate });
+    const blocked = await terminal.call('kusa_terminal', { command: 'printf no > denied.txt' });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.denied, true);
+    assert.match(blocked.error, /the approval Rule is Deny/);
+    assert.equal(existsSync(join(root, 'denied.txt')), false);
   });
 
   it('legacy ask normalizes to the safe ask-deny rule', () => {

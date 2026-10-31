@@ -32,8 +32,8 @@ function resolveKusaRoot() {
 }
 
 const pkgRoot = resolveKusaRoot();
-const listenerUrl = pathToFileURL(join(pkgRoot, 'src/sdk-listener.mjs')).href;
-const libUrl = pathToFileURL(join(pkgRoot, 'src/lib.mjs')).href;
+const listenerUrl = pathToFileURL(join(pkgRoot, 'src/features/monitor/sdk-listener.mjs')).href;
+const libUrl = pathToFileURL(join(pkgRoot, 'src/features/monitor/lib.mjs')).href;
 
 async function main() {
   const { SessionListener } = await import(listenerUrl);

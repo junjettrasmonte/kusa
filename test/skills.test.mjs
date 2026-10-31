@@ -33,8 +33,8 @@ import {
   updateSkill,
   validateResourcePath,
   validateSkillMarkdown,
-} from '../src/skills/index.mjs';
-import { createMonitorServer } from '../src/serve.mjs';
+} from '#features/skills/index.mjs';
+import { createMonitorServer } from '#app/console/serve.mjs';
 
 const dirs = [];
 
