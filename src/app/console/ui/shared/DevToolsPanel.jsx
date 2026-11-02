@@ -1,5 +1,7 @@
 import { GitPanel } from '#ui/features/git/GitPanel.jsx';
 import { TrailPanel } from '#ui/features/trail/TrailPanel.jsx';
+import { CaoPanel } from '#ui/features/cao/CaoPanel.jsx';
+import { extensionNavEntries } from '#ui/features/extensions/registry.js';
 
 export function DevToolsPanel({
   subTab,
@@ -12,7 +14,10 @@ export function DevToolsPanel({
   detectGit,
   enforceGit,
   canLiveRefreshGit,
+  canPersistCao = false,
 }) {
+  const caoNav = extensionNavEntries('devtools').some((e) => e.id === subTab && e.extensionId === 'cao');
+
   return (
     <div
       id={`devtools-panel-${subTab}`}
@@ -36,6 +41,7 @@ export function DevToolsPanel({
           canLiveRefresh={canLiveRefreshTrail}
         />
       )}
+      {caoNav ? <CaoPanel canPersist={canPersistCao} /> : null}
     </div>
   );
 }

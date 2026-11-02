@@ -115,6 +115,12 @@ const PROMPT_BADGE_BOUNCE_MS = 2000;
 const PASTE_REQUEST_NOTE =
   'paste it now — Ctrl+V into the box, anywhere on this page; the browser reads the clipboard off that paste, with no permission prompt';
 
+// Heading for the endpoint the Settings fields describe. The server names its
+// group the same way (DEFAULT_ENDPOINT_LABEL in the agent loop), so a fallback
+// list — a chat opened before the server answered, or one with no models — still
+// reads as that endpoint rather than an unnamed one.
+const DEFAULT_MODEL_GROUP = 'Default';
+
 /**
  * First-party Kusă chat surface — transcript styled like VS Code chat:
  * shimmering thinking header, progressive collapsible tool rows, then reply.
@@ -337,43 +343,64 @@ export function ChatHarness({
     commitPick({ model: next });
   }
 
+  // Reload whenever Settings changes an endpoint / declared model list — the
+  // fingerprint is assembled in App.jsx from agentBaseUrl + agentEndpoints so
+  // adding a provider refreshes the picker without a full page reload.
+  const modelsRevision = agentDefaults?.modelsRevision || '';
   useEffect(() => {
+    let cancelled = false;
     const load = async () => {
       try {
         const res = await fetch('/kusa/models', { headers: { Accept: 'application/json' } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = await res.json();
-        // Each entry carries whether it can see images (GET /kusa/models
-        // answers with { id, vision }) — the composer needs that BEFORE a
-        // prompt is sent, so attaching a picture can warn instead of quietly
-        // dropping it. The judgement is the agent loop's own (model-capabilities
-        // .mjs), so the picker and the request can never disagree about what
-        // actually reaches the model. Unknown stays null, never false: the loop
-        // only drops a picture when it is CERTAIN the model is text-only.
-        const records = (Array.isArray(body?.models) ? body.models : [])
-          .map((entry) => {
-            const id = (typeof entry === 'string' ? entry : entry?.id || entry?.model || '')?.trim();
-            if (!id) return null;
-            const vision = typeof entry === 'object' && typeof entry.vision === 'boolean'
-              ? entry.vision
-              : null;
-            return { id, vision };
-          })
-          .filter(Boolean);
+        // GET /kusa/models answers ONE GROUP PER ACTIVE ENDPOINT — the picker
+        // lists every endpoint's models under that endpoint's name, because the
+        // name is what tells the user which base URL and which key a pick would
+        // send. Each entry still carries whether it can see images (GET answers
+        // { id, vision }): the composer needs that BEFORE a prompt is sent, so
+        // attaching a picture can warn instead of quietly dropping it. The
+        // judgement is the agent loop's own (model-capabilities.mjs), so the
+        // picker and the request can never disagree about what reaches the model.
+        // An older page answers flat (`models` only) — that stays one group.
+        const groups = Array.isArray(body?.groups) && body.groups.length
+          ? body.groups
+          : (Array.isArray(body?.models) ? [{ name: DEFAULT_MODEL_GROUP, models: body.models }] : []);
+        const records = groups.flatMap((group) => {
+          const name = String(group?.name || '').trim() || DEFAULT_MODEL_GROUP;
+          return (Array.isArray(group?.models) ? group.models : [])
+            .map((entry) => {
+              const id = (typeof entry === 'string' ? entry : entry?.id || entry?.model || '')?.trim();
+              if (!id) return null;
+              const vision = typeof entry === 'object' && typeof entry.vision === 'boolean'
+                ? entry.vision
+                : null;
+              return { id, vision, group: name };
+            })
+            .filter(Boolean);
+        });
+        if (cancelled) return;
         const fallback = agentDefaults?.model || body?.default || '';
         setModelBackend(body?.backend === 'opencode' ? 'opencode' : 'native');
-        setModels(records.length ? records : (fallback ? [{ id: fallback, vision: null }] : []));
+        setModels(records.length ? records : (fallback ? [{ id: fallback, vision: null, group: DEFAULT_MODEL_GROUP }] : []));
       } catch {
+        if (cancelled) return;
         setModelBackend('');
-        setModels(agentDefaults?.model ? [{ id: agentDefaults.model, vision: null }] : []);
+        setModels(agentDefaults?.model
+          ? [{ id: agentDefaults.model, vision: null, group: DEFAULT_MODEL_GROUP }]
+          : []);
       }
     };
     void load();
-  }, []);
+    return () => { cancelled = true; };
+  }, [modelsRevision, agentDefaults?.model]);
 
-  // A single-model endpoint still gets a picker — it defaults to that model.
-  const modelOptions = (models.length ? models : (modelChoice ? [{ id: modelChoice, vision: null }] : []))
-    .map((record) => ({ id: record.id, label: record.id }));
+  // A single-model endpoint still gets a picker — it defaults to that model. The
+  // group each model came from rides through to the dropdown, which draws a
+  // heading per endpoint, so a pick is never read as another endpoint's
+  // credentials (the same rule resolveAgentEndpoint applies when it is sent).
+  const modelOptions = (models.length ? models : (modelChoice ? [{ id: modelChoice, vision: null, group: DEFAULT_MODEL_GROUP }] : []))
+    .map((record) => ({ id: record.id, label: record.id, group: record.group || DEFAULT_MODEL_GROUP }));
   const activeModel = modelOptions.some((option) => option.id === modelChoice)
     ? modelChoice
     : (modelOptions[0]?.id || modelChoice);
@@ -839,7 +866,12 @@ export function ChatHarness({
               attachments={attachments}
               imagesReachModel={imagesReachModel}
               note={attachNote}
-              className="flex flex-wrap items-center gap-1.5 px-3.5 pb-1"
+              editable
+              onChange={(next) => {
+                setAttachments(next);
+                setAttachNote('');
+              }}
+              className="flex flex-col gap-1.5 px-3.5 pb-1"
             />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
               <p className="min-w-0 flex-1 truncate px-1 text-[11px] text-gray-600">

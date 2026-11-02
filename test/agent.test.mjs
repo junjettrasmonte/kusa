@@ -8,7 +8,9 @@ import {
   createFileTools,
   createKusaHookEmitter,
   createTrailAwareTools,
+  DEFAULT_ENDPOINT_LABEL,
   DEFAULT_MAX_STEPS,
+  listAgentModelGroups,
   resolveAgentEndpoint,
   resolveAgentMaxSteps,
   resolveTrailPolicy,
@@ -22,6 +24,7 @@ import {
   agentToolFlags,
 } from '#features/agent/index.mjs';
 import { laneKey, loadMonitorSettings, saveMonitorSettings } from '#features/monitor/lib.mjs';
+import { publicSettings } from '#features/settings/secrets.mjs';
 import { callTool } from '#features/mcp/tools.mjs';
 
 const dirs = [];
@@ -282,6 +285,119 @@ describe('agent settings', () => {
     });
     assert.equal(withKey.headers.Authorization, 'Bearer abc');
     assert.equal(withKey.apiKey, 'abc');
+  });
+
+  it('persists extra OpenAI-compatible endpoints with per-endpoint keys and comma models', () => {
+    const dir = tempDir();
+    const saved = saveMonitorSettings(dir, {
+      agentBaseUrl: 'https://api.openai.com/v1',
+      agentModel: 'gpt-4o-mini',
+      agentModels: 'gpt-4o-mini, o3-mini',
+      agentAuthMode: 'apikey',
+      agentApiKey: 'sk-default',
+      agentEndpoints: [
+        {
+          name: 'Acme Proxy',
+          baseUrl: 'https://api.acme.test/v1',
+          authMode: 'apikey',
+          apiKey: 'sk-acme',
+          models: 'acme-one, acme-two',
+        },
+        {
+          name: 'Local Ollama',
+          baseUrl: 'http://127.0.0.1:11434/v1',
+          authMode: 'none',
+          models: 'llama3.1',
+        },
+      ],
+    });
+    assert.equal(saved.agentModels.length, 2);
+    assert.deepEqual(saved.agentModels, ['gpt-4o-mini', 'o3-mini']);
+    assert.equal(saved.agentEndpoints.length, 2);
+    assert.equal(saved.agentEndpoints[0].name, 'Acme Proxy');
+    assert.equal(saved.agentEndpoints[0].apiKey, 'sk-acme');
+    assert.deepEqual(saved.agentEndpoints[0].models, ['acme-one', 'acme-two']);
+    assert.ok(saved.agentEndpoints[0].id);
+
+    const reloaded = loadMonitorSettings(dir);
+    assert.equal(reloaded.agentEndpoints[0].apiKey, 'sk-acme');
+    assert.equal(reloaded.agentEndpoints[1].apiKey, '');
+    assert.deepEqual(reloaded.agentEndpoints[1].models, ['llama3.1']);
+
+    // Browser-safe projection never ships keys, only apiKeySet.
+    const pub = publicSettings(reloaded);
+    assert.equal(pub.agentApiKeySet, true);
+    assert.equal(pub.agentEndpoints[0].apiKeySet, true);
+    assert.equal(pub.agentEndpoints[1].apiKeySet, false);
+    assert.equal(Object.hasOwn(pub.agentEndpoints[0], 'apiKey'), false);
+
+    // A whole-list rewrite that omits apiKey keeps the stored key for that id.
+    const kept = saveMonitorSettings(dir, {
+      agentEndpoints: reloaded.agentEndpoints.map((entry) => ({
+        id: entry.id,
+        name: entry.name,
+        baseUrl: entry.baseUrl,
+        authMode: entry.authMode,
+        models: entry.models,
+      })),
+    });
+    assert.equal(kept.agentEndpoints[0].apiKey, 'sk-acme');
+  });
+
+  it('resolveAgentEndpoint routes a pick to the endpoint that declared it', () => {
+    const settings = {
+      agentBaseUrl: 'https://api.openai.com/v1',
+      agentModel: 'acme-one',
+      agentAuthMode: 'apikey',
+      agentApiKey: 'sk-default',
+      agentEndpoints: [
+        {
+          id: 'acme',
+          name: 'Acme',
+          baseUrl: 'https://api.acme.test/v1',
+          authMode: 'apikey',
+          apiKey: 'sk-acme',
+          models: ['acme-one', 'acme-two'],
+        },
+      ],
+    };
+    const hit = resolveAgentEndpoint(settings);
+    assert.equal(hit.baseUrl, 'https://api.acme.test/v1');
+    assert.equal(hit.apiKey, 'sk-acme');
+    assert.equal(hit.headers.Authorization, 'Bearer sk-acme');
+
+    const fallback = resolveAgentEndpoint({ ...settings, agentModel: 'gpt-4o-mini' });
+    assert.equal(fallback.baseUrl, 'https://api.openai.com/v1');
+    assert.equal(fallback.apiKey, 'sk-default');
+  });
+
+  it('listAgentModelGroups lists models from every active endpoint, grouped by name', async () => {
+    const listed = await listAgentModelGroups({
+      agentBaseUrl: 'https://api.openai.com/v1',
+      agentModel: 'gpt-4o-mini',
+      agentModels: ['gpt-4o-mini', 'o3-mini'],
+      agentAuthMode: 'none',
+      agentEndpoints: [
+        {
+          name: 'Acme Proxy',
+          baseUrl: 'https://api.acme.test/v1',
+          authMode: 'none',
+          models: ['acme-one', 'acme-two'],
+        },
+        {
+          name: 'Local',
+          baseUrl: 'http://127.0.0.1:11434/v1',
+          authMode: 'none',
+          models: 'llama3.1, mistral',
+        },
+      ],
+    });
+    assert.equal(listed.default, 'gpt-4o-mini');
+    const names = listed.groups.map((group) => group.name);
+    assert.deepEqual(names, [DEFAULT_ENDPOINT_LABEL, 'Acme Proxy', 'Local']);
+    assert.deepEqual(listed.groups[0].models, ['gpt-4o-mini', 'o3-mini']);
+    assert.deepEqual(listed.groups[1].models, ['acme-one', 'acme-two']);
+    assert.deepEqual(listed.groups[2].models, ['llama3.1', 'mistral']);
   });
 
   it('buildOpencodeConfig wires openai-compatible provider', () => {

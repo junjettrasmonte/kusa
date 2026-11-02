@@ -10,6 +10,7 @@
  *   kusa build              Rebuild the React dashboard assets
  *   kusa init [dir]         Install hook templates into a project
  *   kusa mcp                Run the Kusă MCP server (stdio)
+ *   kusa agent              Interactive agent REPL (standalone CLI)
  *   kusa test               Run package tests
  */
 import { spawnSync } from 'node:child_process';
@@ -50,6 +51,7 @@ Commands:
   init [dir]         Detect Cursor / Copilot, write hooks, add npm scripts
                      Flags: --cursor, --copilot
   mcp                MCP stdio server (skills, learnings, session)
+  agent [--workspace <dir>] Interactive agent REPL (standalone; optional CAO provider kusa_cli)
   test               Run node:test suite
   version            Show installed version
   help               Show this help
@@ -535,6 +537,9 @@ switch (cmd) {
   }
   case 'mcp':
     runNode('mcp', rest);
+    break;
+  case 'agent':
+    runNode('agent', rest);
     break;
   case 'test': {
     const result = spawnSync(process.execPath, ['--test', testDir], {

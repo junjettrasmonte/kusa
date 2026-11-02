@@ -1,6 +1,6 @@
 {
   "name": "kusa",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Kusă — harness-agnostic session counters, live dashboard, and optional MCP server for Copilot, Cursor, and VS Code Local",
   "type": "module",
   "engines": {
@@ -33,6 +33,7 @@
   },
   "files": [
     "src",
+    "extensions",
     "README.md",
     "CHECKLIST.md"
   ],
@@ -44,7 +45,9 @@
     "dev": "vite --config src/app/console/vite.config.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
     "prepublishOnly": "npm run build && npm test",
-    "kusa:serve": "kusa serve"
+    "kusa:serve": "kusa serve",
+    "cao:provider:install": "node src/features/kusa-cli/cao-provider/install.mjs",
+    "cao:provider:uninstall": "node src/features/kusa-cli/cao-provider/install.mjs --uninstall"
   },
   "keywords": [
     "agent",
@@ -57,7 +60,11 @@
   "author": "Junjet Trasmonte",
   "license": "MIT",
   "dependencies": {
+    "@node-saml/node-saml": "^5.2.0",
     "@opencode-ai/sdk": "^1.19.3",
+    "openid-client": "^6.8.9",
+    "otpauth": "^9.5.2",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",

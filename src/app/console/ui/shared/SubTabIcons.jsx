@@ -7,8 +7,12 @@
  *
  * Keys are the sub-tab ids declared in lib/format.js (MONITOR_SUBTAB_IDS,
  * SESSION_SUBTAB_IDS, DEVTOOLS_SUBTAB_IDS, HARNESS_SUBTAB_IDS,
- * SETTINGS_SUBTAB_IDS).
+ * SETTINGS_SUBTAB_IDS). Extension-contributed subtabs resolve via SubTabIcon
+ * → LucideIcons using the extension's `nav.icon` key.
  */
+import { LucideIcon } from './LucideIcons.jsx';
+import { extensionNavIcon } from '#ui/features/extensions/registry.js';
+
 export const SUBTAB_ICONS = {
   /** Monitors › Counters — bar chart on a baseline. */
   counters: (
@@ -81,7 +85,6 @@ export const SUBTAB_ICONS = {
       <path strokeDasharray="1.5 2" strokeLinecap="round" d="M5.5 10.5C7 8 9 8 10.5 5.5" />
     </svg>
   ),
-
   /** Harness › MCP Server — plug / connection node. */
   mcp: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
@@ -132,3 +135,14 @@ export const SUBTAB_ICONS = {
     </svg>
   ),
 };
+
+/** Resolve a rail submenu glyph: hand-drawn SUBTAB_ICONS, else extension lucide. */
+export function SubTabIcon({ id }) {
+  if (SUBTAB_ICONS[id]) return SUBTAB_ICONS[id];
+  const lucide = extensionNavIcon(id);
+  if (lucide) {
+    // Match neighbouring h-3.5 icons: stroke 2.25 → ~1.3px at 14px from a 24 grid.
+    return <LucideIcon name={lucide} className="h-3.5 w-3.5" strokeWidth={2.25} />;
+  }
+  return null;
+}

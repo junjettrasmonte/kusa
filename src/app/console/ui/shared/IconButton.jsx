@@ -84,6 +84,15 @@ export function CloseIcon(props) {
   );
 }
 
+export function InfoIcon(props) {
+  return (
+    <Svg {...props}>
+      <circle cx="8" cy="8" r="5.25" />
+      <path strokeLinecap="round" d="M8 7.25v3.5M8 5.25v.5" />
+    </Svg>
+  );
+}
+
 export function PublishIcon(props) {
   return (
     <Svg {...props}>

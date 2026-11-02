@@ -99,6 +99,7 @@ export const entryPoints = {
   hook: join(srcDir, 'features', 'monitor', 'hook.mjs'),
   demo: join(srcDir, 'features', 'monitor', 'demo.mjs'),
   mcp: join(srcDir, 'features', 'mcp', 'server.mjs'),
+  agent: join(srcDir, 'features', 'kusa-cli', 'agent-repl.mjs'),
   'sdk-listener': join(srcDir, 'features', 'monitor', 'sdk-listener.mjs'),
 };
 export const entryPoint = (name) => {

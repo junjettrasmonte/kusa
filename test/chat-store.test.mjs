@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -12,6 +12,7 @@ import {
   writeChatSession,
   writeSessionConfig,
 } from '#features/chat/data/chat-store.mjs';
+import { sessionAttachmentsDir } from '#features/chat/data/attachments.mjs';
 
 describe('chat-store', () => {
   const dir = mkdtempSync(join(tmpdir(), 'kusa-chat-store-'));
@@ -27,7 +28,7 @@ describe('chat-store', () => {
       });
       assert.deepEqual(written.options, { mode: 'agent', rules: 'allow' });
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'kusa', 'pick-1.chat.json'), 'utf8'),
+        readFileSync(join(dir, 'kusa', 'pick-1', 'pick-1.chat.json'), 'utf8'),
       );
       // The transcript stays a transcript: no picks inside it.
       assert.equal(Object.hasOwn(transcript, 'options'), false);
@@ -63,13 +64,70 @@ describe('chat-store', () => {
       // A hand-edited sidecar that looks like a lane record (id + harness) must
       // not hydrate a row: listLaneFiles reads every other .json in the folder,
       // and a settings file carries no prompts.
+      mkdirSync(join(dir, 'kusa', 'ghost'), { recursive: true });
       writeFileSync(
-        join(dir, 'kusa', 'ghost.session.json'),
+        join(dir, 'kusa', 'ghost', 'session.json'),
         JSON.stringify({ harness: 'kusa', id: 'ghost', rules: 'allow' }),
       );
       const listed = listChatSessions(dir);
       assert.deepEqual(listed.map((s) => s.id), ['pick-1']);
       assert.deepEqual(readSessionConfig(dir, 'ghost'), { rules: 'allow' });
+    });
+
+    it('flat and stem-prefixed session config migrate into session.json', () => {
+      // Pre-folder leftover beside the harness root.
+      writeFileSync(
+        join(dir, 'kusa', 'flat-1.session.json'),
+        JSON.stringify({ rules: 'deny', model: 'from-flat' }),
+      );
+      assert.deepEqual(readSessionConfig(dir, 'flat-1'), { rules: 'deny', model: 'from-flat' });
+      assert.equal(existsSync(join(dir, 'kusa', 'flat-1.session.json')), false);
+      assert.equal(existsSync(join(dir, 'kusa', 'flat-1', 'session.json')), true);
+
+      // Short-lived in-folder `<id>.session.json` name → canonical session.json.
+      mkdirSync(join(dir, 'kusa', 'stem-1'), { recursive: true });
+      writeFileSync(
+        join(dir, 'kusa', 'stem-1', 'stem-1.session.json'),
+        JSON.stringify({ rules: 'allow' }),
+      );
+      assert.deepEqual(readSessionConfig(dir, 'stem-1'), { rules: 'allow' });
+      assert.equal(existsSync(join(dir, 'kusa', 'stem-1', 'stem-1.session.json')), false);
+      assert.equal(existsSync(join(dir, 'kusa', 'stem-1', 'session.json')), true);
+    });
+
+    it('attachment bytes land in the session attachments folder, not chat.json', () => {
+      const dataUrl = 'data:image/png;base64,AAAA';
+      const written = writeChatSession(dir, {
+        id: 'attach-1',
+        key: 'kusa:attach-1',
+        status: 'idle',
+        attempts: 0,
+        createdAt: 1,
+        messages: [{
+          id: 'm1',
+          role: 'user',
+          text: 'see this',
+          at: 1,
+          attachments: [{ name: 'shot.png', kind: 'image', size: 3, mime: 'image/png', dataUrl }],
+        }],
+      });
+      // API view is hydrated so the UI still has the picture.
+      assert.equal(written.messages[0].attachments[0].dataUrl, dataUrl);
+      assert.ok(written.messages[0].attachments[0].file);
+      const transcript = JSON.parse(
+        readFileSync(join(dir, 'kusa', 'attach-1', 'attach-1.chat.json'), 'utf8'),
+      );
+      // On disk the transcript keeps only the pointer — no inline payload.
+      assert.equal(transcript.messages[0].attachments[0].dataUrl, undefined);
+      assert.ok(transcript.messages[0].attachments[0].file);
+      const diskFile = join(
+        sessionAttachmentsDir(dir, 'attach-1'),
+        transcript.messages[0].attachments[0].file,
+      );
+      assert.equal(readFileSync(diskFile).toString('base64'), 'AAAA');
+      // A fresh read hydrates the bytes back from attachments/.
+      const reread = readChatSession(dir, 'attach-1');
+      assert.equal(reread.messages[0].attachments[0].dataUrl, dataUrl);
     });
 
     it('an old transcript that kept picks inside it is migrated out', () => {

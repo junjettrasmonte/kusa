@@ -17,6 +17,7 @@ import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
 import { KusaLogo } from '#ui/shared/KusaLogo.jsx';
 import { ExplorerPanel } from '#ui/features/explorer/ExplorerPanel.jsx';
 import { SearchPanel } from '#ui/features/explorer/SearchPanel.jsx';
+import { ExtensionsPanel } from '#ui/features/extensions/ExtensionsPanel.jsx';
 import { StatusDot } from './StatusDot.jsx';
 import { SessionIndicator } from './SessionIndicator.jsx';
 
@@ -26,16 +27,16 @@ const FILTERS = [
   { id: 'closed', label: 'Closed' },
 ];
 
-/** Compact stroke icons — same visual language as RightRail.jsx. The Agents tab is
- *  lucide's `bot` glyph and the Extensions tab lucide's `blocks`, both kept on lucide's
- *  own 24×24 grid; the rest are house-drawn on 16×16.
+/** Compact stroke icons — same visual language as RightRail.jsx. All view glyphs
+ *  render in an 18×18 box. The Agents tab is lucide's `bot` and the Extensions tab
+ *  lucide's `blocks`, both kept on lucide's own 24×24 grid; the rest are house-drawn
+ *  on 16×16.
  */
 const VIEW_ICONS = {
-  // lucide `bot` (icons/bot.svg), paths verbatim from upstream. Its 24×24 grid means
-  // strokeWidth 2.25 so the ink still lands at 1.5px inside the h-4 w-4 box, matching
-  // the neighbouring view icons.
+  // lucide `bot` (icons/bot.svg), paths verbatim from upstream. 18×18 box on
+  // lucide’s 24×24 grid at stroke 2 → 1.5px ink, matching the neighbouring view icons.
   sessions: (
-    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg className="h-[18px] w-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 8V4H8" />
       <rect width="16" height="12" x="4" y="8" rx="2" />
       <path d="M2 14h2" />
@@ -45,32 +46,24 @@ const VIEW_ICONS = {
     </svg>
   ),
   explorer: (
-    <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+    <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 4h3.5l1.5 1.5h6v7h-11z" />
     </svg>
   ),
   'search-names': (
-    <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+    <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <circle cx="7" cy="7" r="3.5" />
       <path strokeLinecap="round" d="M10 10.5 13.5 14" />
     </svg>
   ),
-  // lucide `blocks` (icons/blocks.svg), paths verbatim from upstream. Its 24×24 grid means
-  // strokeWidth 2.25 so the ink still lands at 1.5px inside the h-4 w-4 box, matching
-  // the neighbouring view icons.
+  // lucide `blocks` (icons/blocks.svg), paths verbatim from upstream. 18×18 box
+  // on lucide’s 24×24 grid at stroke 2 → 1.5px ink (same as ExtensionIcon).
   extensions: (
-    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M10 22V7a1 1 0 0 0-1-1H4a2 2 0 0 0-2 2v12a2 2 0 0 0-2 2h12a2 2 0 0 0-2-2v-5a1 1 0 0 0-1-1H2" />
+    <svg className="h-[18px] w-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M10 22V7a1 1 0 0 0-1-1H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5a1 1 0 0 0-1-1H2" />
       <rect x="14" y="2" width="8" height="8" rx="1" />
     </svg>
   ),
-};
-
-const PLACEHOLDER = {
-  extensions: {
-    title: 'Extensions',
-    body: 'Manage harness extensions and integrations. Coming soon.',
-  },
 };
 
 function matchesFilter(session, filter) {
@@ -171,6 +164,9 @@ export function Sidebar({
   statusLine = null,
   statusLane = null,
   statusKusaSession = null,
+  canPersistExtensions = false,
+  activeExtensionId = null,
+  onSelectExtension = null,
 }) {
   const harnesses = data?.harnesses || [];
   const [view, setView] = useState(initialSidebarView);
@@ -246,8 +242,6 @@ export function Sidebar({
     else onToggleChecked?.(visibleKeys, true);
   }
 
-  const placeholder = PLACEHOLDER[view];
-
   const statusAgentBit = statusKusaSession
     ? `Kusă › ${shortId(statusKusaSession.id)} · ${STATUS_TEXT[statusKusaSession.status] || statusKusaSession.status}`
     : statusLane
@@ -301,14 +295,14 @@ export function Sidebar({
                 disabled
                 className="flex h-7 w-7 items-center justify-center rounded-md text-gray-600"
               >
-                <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M4 6.5 8 10.5 12 6.5" />
                 </svg>
               </button>
             </nav>
             <div className="absolute right-2 top-1/2 -translate-y-1/2">
               <ToolIconButton label="Collapse sidebar" onClick={onToggleCollapsed}>
-                <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 3.5h11v9h-11zM6.5 3.5v9" />
                 </svg>
               </ToolIconButton>
@@ -517,7 +511,7 @@ export function Sidebar({
                         className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
                         onClick={() => onSelectLane(s.key)}
                       >
-                        <SessionIndicator status={s.status} parts={s.live?.parts} />
+                        <SessionIndicator status={s.status} parts={s.live?.parts} harness={h.harness} />
                         <span className={`truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
                         {latest ? <span className="ml-auto text-[10px] uppercase tracking-wide text-emerald-500">latest</span> : null}
                         {!isKusa ? (
@@ -567,6 +561,13 @@ export function Sidebar({
             <ExplorerPanel />
           ) : view === 'search-names' ? (
             <SearchPanel />
+          ) : view === 'extensions' ? (
+            <ExtensionsPanel
+              canPersist={canPersistExtensions}
+              selectedId={activeExtensionId}
+              onSelect={onSelectExtension}
+              collapsed={collapsed}
+            />
           ) : (
             <div
               id={`sidebar-panel-${view}`}
@@ -574,9 +575,7 @@ export function Sidebar({
               aria-labelledby={`sidebar-view-${view}`}
               className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-3 sidebar-label"
             >
-              <p className="text-[11px] leading-relaxed text-gray-600">
-                {placeholder?.body || 'Coming soon.'}
-              </p>
+              <p className="text-[11px] leading-relaxed text-gray-600">Coming soon.</p>
             </div>
           )}
         </>

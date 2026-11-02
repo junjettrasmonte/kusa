@@ -21,12 +21,15 @@ const LOGO = {
   ),
 };
 
-export function HarnessLogo({ harness, size = 'h-4 w-4' }) {
+export function HarnessLogo({ harness, size = 'h-4 w-4', className = '', title = null }) {
   if (harness === 'kusa') {
-    return <KusaLogo className={`${size} shrink-0`} title="" />;
+    return <KusaLogo className={`${size} shrink-0 ${className}`} title={title ?? ''} />;
   }
   return (
-    <span className={`inline-flex shrink-0 ${size} [&>svg]:h-full [&>svg]:w-full`}>
+    <span
+      className={`inline-flex shrink-0 ${size} ${className} [&>svg]:h-full [&>svg]:w-full`}
+      title={title || undefined}
+    >
       {LOGO[harness] || LOGO['vscode-local']}
     </span>
   );

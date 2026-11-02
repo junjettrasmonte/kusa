@@ -21,6 +21,8 @@ export {
 export { createKusaHookEmitter, KUSA_HOOK_VERSION } from './hooks.mjs';
 export {
   DEFAULT_MAX_STEPS,
+  DEFAULT_ENDPOINT_LABEL,
+  listAgentModelGroups,
   listAgentModels,
   resolveAgentEndpoint,
   resolveAgentMaxSteps,

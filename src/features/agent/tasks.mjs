@@ -7,10 +7,10 @@
  *
  * Rows are the SAME {id,content,status} shape the monitor already keeps for
  * Cursor's TodoWrite and they live in the SAME per-session Task List
- * (`.kusa/kusa/tasks.json` → the lane's `todos`), so the chat Task Stack and
- * the dashboard show the model's plan instead of a second copy of it. The tool is
- * the single writer: the monitor picks the rows up through the existing
- * tasks.json → lane hydration, so nothing double-applies them.
+ * (`.kusa/<harness>/<stem>/tasks.json` → the lane's `todos`), so the chat Task
+ * Stack and the dashboard show the model's plan instead of a second copy of it.
+ * The tool is the single writer: the monitor picks the rows up through the
+ * existing tasks.json → lane hydration, so nothing double-applies them.
  *
  * Flagging a task that is already completed is not an error — the call reports
  * `unchanged` so a retried step never duplicates a row or fails the turn.

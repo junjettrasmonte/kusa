@@ -1,8 +1,11 @@
 /**
- * Kusă chat transcripts under `.kusa/kusa/<id>.chat.json`.
+ * Kusă chat transcripts under `.kusa/kusa/<id>/<id>.chat.json`.
  *
- * Monitor lanes (hook counters) stay in `<id>.json`; the chat UI reads/writes
- * these sidecars so message history survives across browsers and reloads.
+ * Every session owns a folder (`<id>/`) that holds its monitor lane, events,
+ * chat transcript, settings sidecar, and an `attachments/` subfolder for files
+ * that rode on messages. Monitor lanes (hook counters) stay in `<id>.json`
+ * inside that same folder; the chat UI reads/writes the transcript sidecar so
+ * message history survives across browsers and reloads.
  */
 import {
   existsSync,
@@ -10,16 +13,27 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
-import { normalizeAttachments } from './attachments.mjs';
+import {
+  hydrateAttachments,
+  normalizeAttachments,
+  persistAttachments,
+} from './attachments.mjs';
 import { createKusaHookEmitter } from '#features/agent/hooks.mjs';
 import { AGENT_MODE_ASK, AGENT_MODE_AGENT, AGENT_MODE_PLAN } from '#features/agent/modes.mjs';
 import { normalizeApprovalMode } from '#features/agent/approval.mjs';
-import { laneFiles, laneKey, sessionFileStem, sessionRankAt } from '#features/monitor/lib.mjs';
+import {
+  ensureSessionDirs,
+  laneFiles,
+  laneKey,
+  migrateFlatSessionFiles,
+  sessionRankAt,
+} from '#features/monitor/lib.mjs';
 
 export const KUSA_HARNESS = 'kusa';
 export const CHAT_SUFFIX = '.chat.json';
@@ -47,14 +61,18 @@ function newId() {
   }
 }
 
+/** Paths for one Kusă session (folder layout; migrates flat files first). */
+function kusaSessionFiles(dir, sessionId) {
+  return migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: sessionId });
+}
+
 /** Absolute path for a session's chat sidecar. */
 export function chatFilePath(dir, sessionId) {
-  const stem = sessionFileStem(sessionId);
-  return join(dir, KUSA_HARNESS, `${stem}${CHAT_SUFFIX}`);
+  return kusaSessionFiles(dir, sessionId).chat;
 }
 
 /**
- * Per-session settings sidecar: `.kusa/kusa/<id>.session.json`.
+ * Per-session settings sidecar: `.kusa/kusa/<id>/session.json`.
  *
  * A chat owns its composer picks (Mode / Rule / Model), and a chat transcript
  * is the wrong place to keep them: the turn path rewrites the transcript on
@@ -62,19 +80,34 @@ export function chatFilePath(dir, sessionId) {
  * so a pick stored inside it only survives as long as the last writer happens
  * to carry it — one writer that rebuilds the record drops the pick and the next
  * refresh reopens the chat on a Settings default. Settings are not turn data,
- * so they get their own file per session: written only when a pick is made,
- * never touched by a turn write, and hand-editable like any other file here.
+ * so they get their own file inside the session folder: written only when a
+ * pick is made, never touched by a turn write, and hand-editable like any
+ * other file here. Flat `<id>.session.json` leftovers (and the short-lived
+ * in-folder `<id>.session.json` name) are migrated on read/write.
  */
+export const SESSION_CONFIG_FILE = 'session.json';
+/** @deprecated use SESSION_CONFIG_FILE — kept for callers matching `*.session.json`. */
 export const SESSION_CONFIG_SUFFIX = '.session.json';
 
 /** Absolute path for a session's settings sidecar. */
 export function sessionConfigPath(dir, sessionId) {
-  const stem = sessionFileStem(sessionId);
-  return join(dir, KUSA_HARNESS, `${stem}${SESSION_CONFIG_SUFFIX}`);
+  return kusaSessionFiles(dir, sessionId).config;
 }
 
-function normalizeMessage(m) {
+/**
+ * Normalize a message. When `dir` + `sessionId` are given, attachment bytes are
+ * written into that session's `attachments/` folder and the returned record
+ * keeps only the slim pointer (`file`) — chat.json must not grow with every
+ * picture. Without a session folder the inline payload is kept (queue / tests).
+ */
+function normalizeMessage(m, { dir = null, sessionId = '', persist = false, hydrate = false } = {}) {
   if (!m || typeof m !== 'object' || typeof m.text !== 'string') return null;
+  let attachments = normalizeAttachments(m.attachments);
+  if (attachments.length && dir && sessionId && persist) {
+    attachments = persistAttachments(dir, sessionId, attachments);
+  } else if (attachments.length && dir && sessionId && hydrate) {
+    attachments = hydrateAttachments(dir, sessionId, attachments);
+  }
   return {
     id: String(m.id || newId()),
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -88,9 +121,7 @@ function normalizeMessage(m) {
     ...(m.stopped === true ? { stopped: true } : {}),
     ...(m.steered === true ? { steered: true } : {}),
     ...(m.error === true ? { error: true } : {}),
-    ...(normalizeAttachments(m.attachments).length
-      ? { attachments: normalizeAttachments(m.attachments) }
-      : {}),
+    ...(attachments.length ? { attachments } : {}),
   };
 }
 
@@ -152,7 +183,7 @@ function clampTitle(raw) {
  * so a hand-edited sidecar cannot smuggle a rule the agent does not implement.
  * Allow / Deny are stored as-is: they are sticky, so a refresh reopens the chat
  * on the rule the user chose and nothing re-derives a fallback from a window.
- * The record lives in the settings sidecar (`<id>.session.json`), not in the
+ * The record lives in the settings sidecar (`session.json`), not in the
  * transcript — see `sessionConfigPath`.
  */
 function normalizeSessionOptions(raw) {
@@ -171,16 +202,28 @@ function normalizeSessionOptions(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-/** Normalize a chat session record for the dashboard UI. */
-export function normalizeChatSession(raw) {
+/**
+ * Normalize a chat session record for the dashboard UI.
+ * @param {object} raw
+ * @param {{ dir?: string, persist?: boolean, hydrate?: boolean }} [opts]
+ *   When `dir` is set, `persist` writes attachment bytes into that session's
+ *   attachments/ folder (for saves) and `hydrate` reloads them (for reads).
+ */
+export function normalizeChatSession(raw, opts = {}) {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : null;
   if (!id) return null;
   const key = typeof raw.key === 'string' && raw.key.startsWith(`${KUSA_HARNESS}:`)
     ? raw.key
     : laneKey(KUSA_HARNESS, id);
+  const messageOpts = {
+    dir: opts.dir || null,
+    sessionId: id,
+    persist: Boolean(opts.persist),
+    hydrate: Boolean(opts.hydrate),
+  };
   const messages = Array.isArray(raw.messages)
-    ? raw.messages.map(normalizeMessage).filter(Boolean)
+    ? raw.messages.map((m) => normalizeMessage(m, messageOpts)).filter(Boolean)
     : [];
   return {
     key,
@@ -224,9 +267,16 @@ export function writeSessionConfig(dir, sessionId, over = {}) {
   return merged;
 }
 
-/** Persistable shape — drop ephemeral live/busy state. */
-export function slimChatSession(session) {
-  const normalized = normalizeChatSession(session);
+/**
+ * Persistable shape — drop ephemeral live/busy state.
+ * Pass `{ dir }` so attachment bytes are written into attachments/ and the
+ * returned messages keep only slim `file` pointers for chat.json.
+ */
+export function slimChatSession(session, opts = {}) {
+  const normalized = normalizeChatSession(session, {
+    dir: opts.dir || null,
+    persist: Boolean(opts.dir),
+  });
   if (!normalized) return null;
   const { live: _live, ...rest } = normalized;
   const status = rest.status === 'ended' ? 'ended' : 'idle';
@@ -281,26 +331,38 @@ export function chatSessionFromLane(lane) {
 function listLaneFiles(dir) {
   const folder = join(dir, KUSA_HARNESS);
   if (!existsSync(folder)) return [];
-  let names = [];
+  let entries = [];
   try {
-    names = readdirSync(folder);
+    entries = readdirSync(folder, { withFileTypes: true });
   } catch {
     return [];
   }
   const out = [];
-  for (const name of names) {
+  const consider = (path) => {
+    const raw = readJsonSafe(path);
+    if (!raw || (raw.harness && raw.harness !== KUSA_HARNESS)) return;
+    if (!raw.id) return;
+    out.push(raw);
+  };
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      // Session-named folder: `<id>/<id>.json` is the lane record.
+      const stem = entry.name;
+      const path = join(folder, stem, `${stem}.json`);
+      if (existsSync(path)) consider(path);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const name = entry.name;
     if (!name.endsWith('.json') || name.endsWith(CHAT_SUFFIX)) continue;
     // Settings belong to a session, not to a lane: a sidecar must never be
     // read as one, or a chat that only picked a Rule would show up as a lane
     // with no prompts.
-    if (name.endsWith(SESSION_CONFIG_SUFFIX)) continue;
+    if (name.endsWith(SESSION_CONFIG_SUFFIX) || name === SESSION_CONFIG_FILE) continue;
     if (/\.(corrupt|legacy)\.json$/.test(name)) continue;
     if (name.endsWith('.events.jsonl')) continue;
-    const path = join(folder, name);
-    const raw = readJsonSafe(path);
-    if (!raw || raw.harness && raw.harness !== KUSA_HARNESS) continue;
-    if (!raw.id) continue;
-    out.push(raw);
+    if (name === 'tasks.json' || name === 'queues.json') continue;
+    consider(join(folder, name));
   }
   return out;
 }
@@ -308,18 +370,35 @@ function listLaneFiles(dir) {
 function listChatFiles(dir) {
   const folder = join(dir, KUSA_HARNESS);
   if (!existsSync(folder)) return [];
-  let names = [];
+  let entries = [];
   try {
-    names = readdirSync(folder);
+    entries = readdirSync(folder, { withFileTypes: true });
   } catch {
     return [];
   }
   const out = [];
-  for (const name of names) {
-    if (!name.endsWith(CHAT_SUFFIX)) continue;
-    const path = join(folder, name);
-    const session = normalizeChatSession(readJsonSafe(path));
+  const consider = (path, sessionIdHint = '') => {
+    const raw = readJsonSafe(path);
+    const session = normalizeChatSession(raw, {
+      dir,
+      hydrate: true,
+    });
     if (session) out.push(session);
+    else if (sessionIdHint) {
+      /* unreadable chat sidecar — skip */
+    }
+  };
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const stem = entry.name;
+      const path = join(folder, stem, `${stem}${CHAT_SUFFIX}`);
+      if (existsSync(path)) consider(path, stem);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const name = entry.name;
+    if (!name.endsWith(CHAT_SUFFIX)) continue;
+    consider(join(folder, name));
   }
   return out;
 }
@@ -354,7 +433,10 @@ export function readChatSession(dir, sessionId) {
   // carries them (written before the sidecar existed) is used only when no
   // sidecar is there, so an old file cannot shadow a newer pick.
   const config = readSessionConfig(dir, id);
-  const fromFile = normalizeChatSession(readJsonSafe(chatFilePath(dir, id)));
+  const fromFile = normalizeChatSession(readJsonSafe(chatFilePath(dir, id)), {
+    dir,
+    hydrate: true,
+  });
   if (fromFile) return config ? { ...fromFile, options: config } : fromFile;
   const lanePath = laneFiles(dir, { harness: KUSA_HARNESS, id }).json;
   const hydrated = chatSessionFromLane(readJsonSafe(lanePath));
@@ -367,9 +449,13 @@ export function readChatSession(dir, sessionId) {
  * (which rebuild this file every step and know nothing about picks) cannot
  * reset a Rule — and a pre-sidecar transcript that still has `options` inside
  * it is migrated out on the first write that touches it.
+ *
+ * Attachment bytes are written into `<id>/attachments/` and the transcript
+ * stores slim pointers only, so chat.json stays readable and the files survive
+ * for as long as the session folder does.
  */
 export function writeChatSession(dir, session) {
-  const slim = slimChatSession(session);
+  const slim = slimChatSession(session, { dir });
   if (!slim) {
     const err = new Error('invalid chat session');
     err.code = 'EINVAL';
@@ -382,9 +468,12 @@ export function writeChatSession(dir, session) {
   });
   const { options: _picks, ...transcript } = slim;
   atomicWriteFile(chatFilePath(dir, slim.id), `${JSON.stringify(transcript, null, 2)}\n`);
-  // The record handed back is the dashboard's view: transcript + the session's
-  // effective settings, whatever the sidecar says now.
-  return { ...slim, options: merged };
+  // Keep attachments/ and sub-sessions/ present once the session folder exists.
+  ensureSessionDirs(kusaSessionFiles(dir, slim.id));
+  // Hand back a hydrated view so the dashboard / agent still see dataUrls —
+  // the on-disk transcript stays slim.
+  const hydrated = normalizeChatSession(transcript, { dir, hydrate: true }) || slim;
+  return { ...hydrated, options: merged };
 }
 
 /** Create an empty chat + monitor lane (sessionStart hook). */
@@ -459,7 +548,12 @@ export function migrateChatSessions(dir, sessions, { workspaceRoot = process.cwd
   return { imported, skipped, sessions: listChatSessions(dir) };
 }
 
-/** Remove chat sidecars for the given session ids (best-effort). */
+/**
+ * Remove chat transcript, settings, and attachments for the given ids.
+ * The monitor lane (and its events) stay so a lane-only row can still hydrate;
+ * an explicit session delete goes through `deleteSessions`, which drops the
+ * whole folder.
+ */
 export function deleteChatFiles(dir, sessionIds) {
   const deleted = [];
   for (const raw of sessionIds || []) {
@@ -467,20 +561,24 @@ export function deleteChatFiles(dir, sessionIds) {
     if (!id) continue;
     // Accept either bare id or `kusa:id`.
     const sessionId = id.startsWith(`${KUSA_HARNESS}:`) ? id.slice(KUSA_HARNESS.length + 1) : id;
-    const path = chatFilePath(dir, sessionId);
-    try {
-      unlinkSync(path);
-      // A deleted chat drops its settings too, so the id cannot be reused with
-      // a Rule the user picked in a chat they already threw away.
+    const files = kusaSessionFiles(dir, sessionId);
+    let removed = false;
+    for (const path of [files.chat, files.config]) {
       try {
-        unlinkSync(sessionConfigPath(dir, sessionId));
+        unlinkSync(path);
+        removed = true;
       } catch {
-        /* no sidecar was ever written */
+        /* missing is fine */
       }
-      deleted.push(sessionId);
-    } catch {
-      // missing is fine
     }
+    // Attachments belong to the chat — drop the folder so files cannot outlive
+    // a transcript the user already threw away.
+    try {
+      rmSync(files.attachments, { recursive: true, force: true });
+    } catch {
+      /* no attachments folder */
+    }
+    if (removed) deleted.push(sessionId);
   }
   return deleted;
 }

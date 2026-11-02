@@ -229,11 +229,22 @@ export function ToolIcon({ className = 'text-gray-500' }) {
   );
 }
 
+/**
+ * The agent's own glyph, drawn on an 18×18 grid inside the h-4.5 w-4.5 box the
+ * chat's row headers give it — the same grid as its box, so the stroke is a true
+ * 1.5px and the robot fills that box instead of floating inside it. It is the
+ * house drawing of the original 16×16 glyph, scaled ×1.2 and re-centred: the head
+ * keeps its rounded corners, its antenna, its eyes, and its mouth, and the whole
+ * thing keeps the side / vertical padding the other house glyphs keep inside their
+ * own grid. Scaling the drawing rather than the box is the point: an 18px box over
+ * a 16-unit drawing put 1.69px of ink on screen next to the lucide glyphs' 1.5px,
+ * so one grid drift read as a heavier robot at the same size.
+ */
 export function AgentIcon({ className = 'text-gray-500' }) {
   return (
     <svg
       className={`h-4.5 w-4.5 shrink-0 ${className}`}
-      viewBox="0 0 16 16"
+      viewBox="0 0 18 18"
       fill="none"
       stroke="currentColor"
       strokeWidth="1.5"
@@ -242,9 +253,9 @@ export function AgentIcon({ className = 'text-gray-500' }) {
       <path
         strokeLinecap="round"
         strokeLinejoin="round"
-        d="M8 1.75v1.5M4.5 5.25h7a1.5 1.5 0 0 1 1.5 1.5v4.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 3 11.25v-4.5a1.5 1.5 0 0 1 1.5-1.5z"
+        d="M9 2.4v1.8M4.8 6.6h8.4a1.8 1.8 0 0 1 1.8 1.8v5.4a1.8 1.8 0 0 1-1.8 1.8h-8.4A1.8 1.8 0 0 1 3 13.8v-5.4a1.8 1.8 0 0 1 1.8-1.8z"
       />
-      <path strokeLinecap="round" d="M6.25 8.25h.01M9.75 8.25h.01M6.5 10.25h3" />
+      <path strokeLinecap="round" d="M6.9 10.2h.01M11.1 10.2h.01M7.2 12.6h3.6" />
     </svg>
   );
 }

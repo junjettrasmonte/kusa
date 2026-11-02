@@ -57,7 +57,7 @@ describe('kusa agent task tools', () => {
       'Add the task tools',
       'Wire them into the agent',
     ]);
-    assert.ok(existsSync(tasksFilePath(dir)));
+    assert.ok(existsSync(tasksFilePath(dir, sessionKey)));
 
     const listed = tasks.list();
     assert.equal(listed.total, 2);

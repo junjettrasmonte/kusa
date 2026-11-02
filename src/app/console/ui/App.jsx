@@ -4,13 +4,19 @@ import { HarnessPanel } from './shared/HarnessPanel.jsx';
 import { MonitorsPanel } from './shared/MonitorsPanel.jsx';
 import { SessionPanel } from './shared/SessionPanel.jsx';
 import { SettingsPanel } from './features/settings/SettingsPanel.jsx';
+import { UserPanel } from './features/user/UserPanel.jsx';
+import {
+  extensionNavEntries,
+  getBuiltinExtension,
+  isExtensionInstalled,
+  resolveDevtoolsSubTabs,
+  resolveExtensionNav,
+} from './features/extensions/registry.js';
 import { RightRail } from './shared/RightRail.jsx';
 import { Sidebar } from './features/monitor/Sidebar.jsx';
 import { ConfirmDialog } from './shared/ConfirmDialog.jsx';
 import { TrashIcon } from './shared/IconButton.jsx';
 import {
-  DEVTOOLS_SUBTAB_IDS,
-  DEVTOOLS_SUBTAB_LABELS,
   HARNESS_NAMES,
   HARNESS_SUBTAB_IDS,
   HARNESS_SUBTAB_LABELS,
@@ -27,6 +33,9 @@ import {
   TAB_IDS,
 } from './shared/lib/format.js';
 import { readJsonSet, readLocal, writeJsonSet, writeLocal } from './shared/lib/storage.js';
+
+/** Core Dev Tools ids plus installed extension nav placements (e.g. CAO). */
+const { ids: DEVTOOLS_SUBTAB_IDS, labels: DEVTOOLS_SUBTAB_LABELS } = resolveDevtoolsSubTabs();
 
 function initialMonitorsSubTab() {
   const savedTab = readLocal('monitor.tab', 'monitors');
@@ -58,13 +67,49 @@ function initialDevtoolsSubTab() {
   if (savedTab === 'graft') return 'trail';
   if (DEVTOOLS_SUBTAB_IDS.includes(savedTab)) return savedTab;
   const saved = readLocal('monitor.devtoolsSubTab', 'git');
-  return DEVTOOLS_SUBTAB_IDS.includes(saved) ? saved : 'git';
+  if (DEVTOOLS_SUBTAB_IDS.includes(saved)) return saved;
+  // Extension catalog selection with a Dev Tools nav placement.
+  const extId = readLocal('monitor.activeExtension', '');
+  const ext = extId ? getBuiltinExtension(extId) : null;
+  if (ext?.nav?.placement === 'devtools' && isExtensionInstalled(ext)) {
+    const navId = ext.nav.id || ext.id;
+    if (DEVTOOLS_SUBTAB_IDS.includes(navId)) return navId;
+  }
+  return 'git';
+}
+
+/** Restore the last opened built-in extension (catalog highlight). */
+function initialActiveExtensionId() {
+  const saved = readLocal('monitor.activeExtension', '');
+  if (saved && getBuiltinExtension(saved)) return saved;
+  const legacySub = readLocal('monitor.devtoolsSubTab', '');
+  const legacyTab = readLocal('monitor.tab', '');
+  if (legacySub === 'cao' || legacyTab === 'cao') return 'cao';
+  return null;
+}
+
+/** Open an installed extension at its configured nav placement (or catalog-only). */
+function openExtension(id, {
+  setActiveExtensionId,
+  setTab,
+  setDevtoolsSubTab,
+}) {
+  setActiveExtensionId(id);
+  const ext = getBuiltinExtension(id);
+  const resolved = resolveExtensionNav(ext);
+  if (!resolved) return;
+  if (resolved.nav.placement === 'devtools') {
+    setTab('devtools');
+    setDevtoolsSubTab(resolved.nav.id || resolved.ext.id);
+  }
 }
 
 function initialSettingsSubTab() {
   const savedTab = readLocal('monitor.tab', 'settings');
   if (SETTINGS_SUBTAB_IDS.includes(savedTab)) return savedTab;
   const saved = readLocal('monitor.settingsSubTab', 'agent');
+  // Auth moved to the Account (user) page — stale 'auth' must not stick.
+  if (saved === 'auth') return 'agent';
   return SETTINGS_SUBTAB_IDS.includes(saved) ? saved : 'agent';
 }
 
@@ -460,15 +505,22 @@ export default function App() {
     const saved = readLocal('monitor.tab', 'monitors');
     // Plan → Chat Session/Prompts; Graft → Developer Tools/Trail;
     // Skills/MCP → Harness; Counters/… → Monitors; Prompts/Tools → Chat Session;
-    // Git/Trail → Developer Tools.
+    // Git/Trail/CAO → Developer Tools.
     if (saved === 'plan') return 'session';
     if (saved === 'graft') return 'devtools';
+    // Settings › Auth moved to Account (user avatar below theme).
+    if (saved === 'auth' || readLocal('monitor.settingsSubTab', '') === 'auth') return 'user';
     if (MONITOR_SUBTAB_IDS.includes(saved)) return 'monitors';
     if (SESSION_SUBTAB_IDS.includes(saved)) return 'session';
     if (DEVTOOLS_SUBTAB_IDS.includes(saved)) return 'devtools';
     if (HARNESS_SUBTAB_IDS.includes(saved)) return 'harness';
     if (SETTINGS_SUBTAB_IDS.includes(saved)) return 'settings';
-    return TAB_IDS.includes(saved) ? saved : 'monitors';
+    if (TAB_IDS.includes(saved)) return saved;
+    // Restoring an installed extension whose nav lives under Dev Tools.
+    const extId = readLocal('monitor.activeExtension', '');
+    const ext = extId ? getBuiltinExtension(extId) : null;
+    if (ext?.nav?.placement === 'devtools' && isExtensionInstalled(ext)) return 'devtools';
+    return 'monitors';
   });
   const [theme, setTheme] = useState(() => {
     const t = document.documentElement.dataset.theme || readLocal('monitor.theme', 'dark');
@@ -479,6 +531,7 @@ export default function App() {
   const [harnessSubTab, setHarnessSubTab] = useState(initialHarnessSubTab);
   const [devtoolsSubTab, setDevtoolsSubTab] = useState(initialDevtoolsSubTab);
   const [settingsSubTab, setSettingsSubTab] = useState(initialSettingsSubTab);
+  const [activeExtensionId, setActiveExtensionId] = useState(initialActiveExtensionId);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => readLocal('monitor.sidebar', 'open') === 'collapsed',
   );
@@ -606,6 +659,10 @@ export default function App() {
   useEffect(() => {
     writeLocal('monitor.devtoolsSubTab', devtoolsSubTab);
   }, [devtoolsSubTab]);
+
+  useEffect(() => {
+    writeLocal('monitor.activeExtension', activeExtensionId || '');
+  }, [activeExtensionId]);
 
   useEffect(() => {
     writeLocal('monitor.settingsSubTab', settingsSubTab);
@@ -804,6 +861,7 @@ export default function App() {
   }
 
   function selectLane(key) {
+    setActiveExtensionId(null);
     setSelected(key);
     setFollow(!isKusaKey(key) && key === data?.focus);
     if (isKusaKey(key)) {
@@ -1806,6 +1864,7 @@ export default function App() {
       labels: MONITOR_SUBTAB_LABELS,
       value: monitorsSubTab,
       onChange: (next) => {
+        setActiveExtensionId(null);
         setMonitorsSubTab(next);
         setTab('monitors');
       },
@@ -1817,6 +1876,7 @@ export default function App() {
       labels: SESSION_SUBTAB_LABELS,
       value: sessionSubTab,
       onChange: (next) => {
+        setActiveExtensionId(null);
         setSessionSubTab(next);
         setTab('session');
       },
@@ -1828,6 +1888,7 @@ export default function App() {
       labels: HARNESS_SUBTAB_LABELS,
       value: harnessSubTab,
       onChange: (next) => {
+        setActiveExtensionId(null);
         setHarnessSubTab(next);
         setTab('harness');
       },
@@ -1841,6 +1902,8 @@ export default function App() {
       onChange: (next) => {
         setDevtoolsSubTab(next);
         setTab('devtools');
+        const navExt = extensionNavEntries('devtools').find((e) => e.id === next);
+        setActiveExtensionId(navExt?.extensionId || null);
       },
       idPrefix: 'devtools',
       ariaLabel: 'Developer tool views',
@@ -1850,6 +1913,7 @@ export default function App() {
       labels: SETTINGS_SUBTAB_LABELS,
       value: settingsSubTab,
       onChange: (next) => {
+        setActiveExtensionId(null);
         setSettingsSubTab(next);
         setTab('settings');
       },
@@ -1916,6 +1980,15 @@ export default function App() {
         statusLine={statusLine}
         statusLane={lane}
         statusKusaSession={kusaSession}
+        canPersistExtensions={canDelete}
+        activeExtensionId={activeExtensionId}
+        onSelectExtension={(id) => {
+          openExtension(id, { setActiveExtensionId, setTab, setDevtoolsSubTab });
+          if (sidebarCollapsed) {
+            setSidebarCollapsed(false);
+            writeLocal('monitor.sidebar', 'open');
+          }
+        }}
       />
 
       <main className={`min-w-0 flex-1 ${sessionChatFill ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'}`}>
@@ -1969,6 +2042,19 @@ export default function App() {
                 model: settings.agentModel || '',
                 approvalTimeoutMinutes: settings.agentApprovalTimeoutMinutes ?? 2,
                 allowDenyRevertMinutes: settings.agentAllowDenyRevertMinutes ?? 15,
+                // Fingerprint of every active endpoint so ChatHarness reloads
+                // /kusa/models after Settings adds, renames, or re-lists models.
+                modelsRevision: [
+                  settings.agentBaseUrl || '',
+                  settings.agentModel || '',
+                  ...(Array.isArray(settings.agentModels) ? settings.agentModels : []),
+                  ...(Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : []).flatMap((entry) => ([
+                    entry?.id || '',
+                    entry?.name || '',
+                    entry?.baseUrl || '',
+                    ...(Array.isArray(entry?.models) ? entry.models : []),
+                  ])),
+                ].join('\0'),
               }}
             />
           )}
@@ -1987,6 +2073,7 @@ export default function App() {
               detectGit={detectGit}
               enforceGit={enforceGit}
               canLiveRefreshGit={canDelete && detectGit}
+              canPersistCao={canDelete}
             />
           )}
           {tab === 'settings' && (
@@ -2004,15 +2091,29 @@ export default function App() {
               onSettingsChange={saveSettings}
             />
           )}
+          {tab === 'user' && (
+            <UserPanel
+              settings={data?.settings}
+              canPersist={canPersistSettings}
+              settingsBusy={settingsBusy}
+              onSettingsChange={saveSettings}
+              theme={theme}
+              onThemeChange={setTheme}
+            />
+          )}
         </div>
       </main>
 
       <RightRail
         tab={tab}
-        onTabChange={setTab}
+        onTabChange={(next) => {
+          setActiveExtensionId(null);
+          setTab(next);
+        }}
         subTabs={railSubTabs}
         theme={theme}
         onThemeChange={setTheme}
+        userName={data?.settings?.authUsername || ''}
         trailBadge={trailBadge}
         gitBadge={gitBadge}
       />

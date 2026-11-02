@@ -82,7 +82,12 @@ function Chevron({ open }) {
  * A picker: shows the current value, and clicking it opens a menu above the
  * composer (the composer sits at the bottom of the panel, so menus open up).
  * @param {string} title
- * @param {Array<{ id: string, label: string, blurb?: string }>} options
+ * @param {Array<{ id: string, label: string, blurb?: string, group?: string }>} options
+ *   An option may carry a `group` — the Model list spans every configured
+ *   endpoint, and a heading is emitted the first time each group appears, so the
+ *   menu reads as one block per endpoint and a pick can never be read as
+ *   another endpoint's credentials. Options without a group (Mode / Rule) keep
+ *   the flat menu.
  * @param {string} value
  * @param {(id) => void} [onSelect]
  *
@@ -95,6 +100,17 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
   const [open, setOpen] = useState(false);
   const current = options.find((option) => option.id === value) || options[0];
   const label = current?.label || value || '—';
+
+  const rows = [];
+  let lastGroup = null;
+  for (const option of options) {
+    const group = String(option?.group || '');
+    if (group && group !== lastGroup) {
+      rows.push({ heading: group });
+      lastGroup = group;
+    }
+    rows.push({ option });
+  }
 
   return (
     <div className="relative inline-flex items-center">
@@ -131,32 +147,41 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
             title === 'Model' ? 'divide-y divide-gray-800' : ''
           }`}
         >
-          {options.map((option) => (
-            <button
-              key={option.id}
-              type="button"
-              onMouseDown={(e) => {
-                // Press, not release: the trigger's blur can close the menu before
-                // `click` is dispatched, and a released click would then land on
-                // whatever sits behind the removed menu. mousedown always fires
-                // while the option is still in the DOM, so the selection cannot
-                // be lost. Left button only (right-click is a context menu).
-                if (e && typeof e.button === 'number' && e.button !== 0) return;
-                setOpen(false);
-                onSelect?.(option.id);
-              }}
-              className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
-                option.id === value
-                  ? 'bg-gray-800/70 font-medium text-emerald-300'
-                  : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
-              }`}
-            >
-              <span className="font-medium">{option.label}</span>
-              {option.blurb ? (
-                <span className="ml-1.5 text-gray-500">· {option.blurb}</span>
-              ) : null}
-            </button>
-          ))}
+          {rows.map((row) =>
+            row.heading ? (
+              <p
+                key={`heading:${row.heading}`}
+                className="px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-gray-500 border-b border-gray-800 bg-gray-900/70"
+              >
+                {row.heading}
+              </p>
+            ) : (
+              <button
+                key={row.option.id}
+                type="button"
+                onMouseDown={(e) => {
+                  // Press, not release: the trigger's blur can close the menu before
+                  // `click` is dispatched, and a released click would then land on
+                  // whatever sits behind the removed menu. mousedown always fires
+                  // while the option is still in the DOM, so the selection cannot
+                  // be lost. Left button only (right-click is a context menu).
+                  if (e && typeof e.button === 'number' && e.button !== 0) return;
+                  setOpen(false);
+                  onSelect?.(row.option.id);
+                }}
+                className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
+                  row.option.id === value
+                    ? 'bg-gray-800/70 font-medium text-emerald-300'
+                    : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+                }`}
+              >
+                <span className="font-medium">{row.option.label}</span>
+                {row.option.blurb ? (
+                  <span className="ml-1.5 text-gray-500">· {row.option.blurb}</span>
+                ) : null}
+              </button>
+            )
+          )}
         </div>
       ) : null}
     </div>

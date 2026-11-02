@@ -245,8 +245,8 @@ describe('Copilot feature parity', () => {
     }), { wall: 1_700_000_000_200, mono: 200 });
     assert.equal(state.session.todos[0].content, 'Copilot todo');
     assert.equal(state.recent[0].outcome, 'todos');
-    // Per-session sidecar — this lane's key only.
-    assert.ok(existsSync(tasksFilePath(dir)));
+    // Per-session sidecar — this lane's key only, inside its session folder.
+    assert.ok(existsSync(tasksFilePath(dir, 'github-copilot:sess-1')));
     const stored = loadTasks(dir);
     assert.equal(stored['github-copilot:sess-1']?.todos[0].content, 'Copilot todo');
   });

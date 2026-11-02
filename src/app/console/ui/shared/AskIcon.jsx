@@ -17,15 +17,17 @@
  * across those states. Masking keeps the shipped artwork untouched while the
  * colour still comes from the className the call sites pass.
  *
- * Stroke is Lucide's own 2 on its native 24-unit grid, so at 16px it renders
- * 1.33px — thinner than the 1.5px the hand-drawn glyphs in ui/shared/ carry. Kept
- * rather than rescaled so the artwork stays exactly as the set ships it; the
- * paired ApprovalIcon.jsx sits on the same grid at the same weight.
+ * Stroke is Lucide's own 2 on its native 24-unit grid, so at the chat's 18px box
+ * it renders 1.5px — exactly the ink weight the hand-drawn glyphs in ui/shared/
+ * carry. The artwork is never rescaled, only the box: 18px is the smallest size
+ * at which lucide's own stroke still lands on 1.5px, so the glyph needs no
+ * compensation at all. The paired ApprovalIcon.jsx sits on the same grid at the
+ * same weight in the same box.
  *
  * It lives in its own module because two views need it: the chat transcript draws
  * it on the question card, and the sidebar draws it in place of a session's
  * status dot while that session is waiting for an answer. `size` is a prop
- * rather than a fixed class so the same artwork can wear the chat's 16px and the
+ * rather than a fixed class so the same artwork can wear the chat's 18px and the
  * sidebar's smaller row without fighting Tailwind's stylesheet order.
  */
 const ASK_ICON_SVG =
@@ -35,7 +37,7 @@ const ASK_ICON_SVG =
   + '<path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>';
 const ASK_ICON_URI = `data:image/svg+xml,${encodeURIComponent(ASK_ICON_SVG)}`;
 
-export function AskIcon({ className = 'text-gray-500', size = 'h-4 w-4', title = null }) {
+export function AskIcon({ className = 'text-gray-500', size = 'h-4.5 w-4.5', title = null }) {
   return (
     <span
       className={`inline-block shrink-0 ${size} ${className}`}

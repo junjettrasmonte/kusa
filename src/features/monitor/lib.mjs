@@ -27,6 +27,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -41,6 +42,13 @@ import {
   isSecretEnvelope,
   publicSettings,
 } from '#features/settings/secrets.mjs';
+import {
+  authFromDisk,
+  authToDisk,
+  defaultAuthSettings,
+  mergeAuthPatch,
+  normalizeAuth,
+} from '#features/auth/normalize.mjs';
 import { loadTasks, saveTasks } from '#features/chat/data/task-store.mjs';
 import { consoleAsset, dashboardHtmlPath } from '#shared/lib/pkg.mjs';
 
@@ -790,12 +798,23 @@ export function defaultMonitorSettings() {
     agentBaseUrl: '',
     /** Model id sent to the endpoint. */
     agentModel: 'gpt-4o-mini',
+    /** Model ids the Default endpoint declares, comma-delimited in Settings. Empty = whatever its GET /models advertises. */
+    agentModels: [],
     /** Native tool-loop max model↔tool rounds before stopping. */
     agentMaxSteps: 100,
     /** `none` = no auth header; `apikey` = OpenAI-style Authorization: Bearer <api key>. */
     agentAuthMode: 'none',
     /** API key when agentAuthMode is `apikey`. */
     agentApiKey: '',
+    /**
+     * Additional OpenAI-compatible endpoints beyond the Default one. The Default
+     * endpoint stays in the agentBaseUrl / agentAuthMode / agentApiKey / agentModels
+     * fields above, so every existing caller (and an older settings.json) still
+     * has exactly one endpoint; the Settings UI draws all of them as the same
+     * card, the Default one first. Each entry carries its OWN credentials and its
+     * own declared model ids — see normalizeAgentEndpoints for the shape.
+     */
+    agentEndpoints: [],
     /** `native` = Kusă OpenAI tool loop; `opencode` = @opencode-ai/sdk (needs `opencode` CLI). */
     agentBackend: 'native',
     /** 'ask-deny' = kusa_terminal/kusa_browse need a user yes first and a timeout denies them; 'ask-allow' asks but a timeout allows; 'allow' skips the prompt; 'deny' blocks them. */
@@ -804,6 +823,8 @@ export function defaultMonitorSettings() {
     agentApprovalTimeoutMinutes: 2,
     /** Minutes the composer Allow / Deny rules stay before reverting to ask-deny. */
     agentAllowDenyRevertMinutes: 15,
+    /** Console login gate (local password+TOTP, OIDC, or SAML). */
+    auth: defaultAuthSettings(),
   };
 }
 
@@ -838,6 +859,88 @@ function normalizeApprovalMode(raw) {
   return mode === 'ask-allow' ? 'ask-allow' : 'ask-deny';
 }
 
+/** How many extra endpoints the Settings UI will take (the Default one is separate). */
+const MAX_AGENT_ENDPOINTS = 12;
+/** Declared model ids per endpoint. A generous ceiling, not a policy. */
+const MAX_ENDPOINT_MODELS = 60;
+
+/**
+ * Model ids an endpoint declares, from either the comma-delimited Settings field
+ * or an already-split array. Blank stays blank: an endpoint that declares nothing
+ * is listed from its own GET /models instead (see listAgentModels), so the field
+ * is an override, never a requirement.
+ * @param {string|Array<string>} raw
+ * @returns {Array<string>}
+ */
+function normalizeModelList(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(/[,;\n]/) : []);
+  const ids = list.map((value) => String(value ?? '').trim()).filter(Boolean);
+  const unique = [...new Set(ids)];
+  return unique.slice(0, MAX_ENDPOINT_MODELS).map((id) => id.slice(0, 200));
+}
+
+/**
+ * Extra OpenAI-compatible endpoints, each with its own credentials and model ids.
+ * An entry with no base URL is a half-typed draft (the add form posts as soon as
+ * a field is filled) and is dropped, so a discarded draft can never shadow a real
+ * endpoint. ids are kept when they are safe slugs, else minted from the name —
+ * the Settings UI needs a stable id per card to edit or remove one card alone.
+ * @param {Array<object>} raw
+ * @returns {Array<{ id: string, name: string, baseUrl: string, authMode: string, apiKey: string, models: Array<string> }>}
+ */
+function normalizeAgentEndpoints(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  /** @type {Array<{ id: string, name: string, baseUrl: string, authMode: string, apiKey: string, models: Array<string> }>} */
+  const out = [];
+  const taken = new Set();
+  for (const index in list) {
+    if (out.length >= MAX_AGENT_ENDPOINTS) break;
+    const entry = list[index];
+    if (!entry || typeof entry !== 'object') continue;
+    const baseUrl = typeof entry.baseUrl === 'string' ? entry.baseUrl.trim() : '';
+    if (!baseUrl) continue;
+    const name = String(entry.name ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40);
+    const authMode = (entry.authMode === 'apikey' || entry.authMode === 'bearer')
+      ? 'apikey'
+      : 'none';
+    const apiKey = typeof entry.apiKey === 'string' ? entry.apiKey.trim().slice(0, 4000) : '';
+    const id = mintEndpointId(entry.id, name || `Endpoint ${out.length + 1}`, taken);
+    taken.add(id);
+    out.push({
+      id,
+      name: name || `Endpoint ${out.length + 1}`,
+      baseUrl,
+      authMode,
+      apiKey,
+      models: normalizeModelList(entry.models),
+    });
+  }
+  return out;
+}
+
+function mintEndpointId(raw, name, taken) {
+  const fromId = slugifyEndpointId(raw);
+  const base = fromId || slugifyEndpointId(name) || `endpoint-${taken.size + 1}`;
+  let id = base;
+  for (let n = 2; taken.has(id); n += 1) id = `${base}-${n}`;
+  return id;
+}
+
+function slugifyEndpointId(raw) {
+  const slug = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return slug;
+}
+
 /** Milliseconds the approval gate waits for a human answer (from settings). */
 export function approvalTimeoutMsFromSettings(settings = {}) {
   return normalizeApprovalTimeoutMinutes(settings?.agentApprovalTimeoutMinutes) * 60_000;
@@ -870,6 +973,11 @@ function normalizeMonitorSettings(raw = {}) {
     agentModel: typeof raw.agentModel === 'string' && raw.agentModel.trim()
       ? raw.agentModel.trim().slice(0, 200)
       : 'gpt-4o-mini',
+    // The Default endpoint's declared models. The top-level fields stay the one
+    // source of truth for that endpoint, so an extra card's edit can never move
+    // the Default one — the array carries only the extras.
+    agentModels: normalizeModelList(raw.agentModels),
+    agentEndpoints: normalizeAgentEndpoints(raw.agentEndpoints),
     agentMaxSteps: normalizeAgentMaxSteps(raw.agentMaxSteps),
     agentAuthMode,
     agentApiKey: typeof apiKeyRaw === 'string' ? apiKeyRaw.slice(0, 4000) : '',
@@ -877,6 +985,7 @@ function normalizeMonitorSettings(raw = {}) {
     agentApprovalMode: normalizeApprovalMode(raw.agentApprovalMode),
     agentApprovalTimeoutMinutes: normalizeApprovalTimeoutMinutes(raw.agentApprovalTimeoutMinutes),
     agentAllowDenyRevertMinutes: normalizeAllowDenyRevertMinutes(raw.agentAllowDenyRevertMinutes),
+    auth: normalizeAuth(raw.auth),
   };
 }
 
@@ -901,9 +1010,45 @@ export function loadMonitorSettings(dir) {
 }
 
 export function saveMonitorSettings(dir, patch = {}) {
-  const normalized = normalizeMonitorSettings({ ...loadMonitorSettings(dir), ...patch });
+  const current = loadMonitorSettings(dir);
+  const merged = { ...current, ...patch };
+  // A card edit resends the whole endpoint list, and the browser never sees the
+  // keys inside it — so an entry that omits apiKey keeps the key already stored
+  // under that id. Only an explicit empty string clears one.
+  if (patch.agentEndpoints !== undefined) {
+    merged.agentEndpoints = carryEndpointKeys(current.agentEndpoints, patch.agentEndpoints);
+  }
+  // Auth secrets omitted from a panel patch must keep the values already on disk.
+  if (patch.auth !== undefined) {
+    merged.auth = mergeAuthPatch(current.auth, patch.auth);
+  } else {
+    merged.auth = current.auth;
+  }
+  const normalized = normalizeMonitorSettings(merged);
   writeSettingsFile(dir, normalized);
   return normalized;
+}
+
+/**
+ * Credentials the browser never sees, carried across a whole-list rewrite.
+ * Matched by id, so re-ordering or renaming cards never moves a key.
+ */
+function carryEndpointKeys(previous = [], next = []) {
+  if (!Array.isArray(next)) return next;
+  const byId = new Map();
+  (Array.isArray(previous) ? previous : []).forEach((entry) => {
+    if (entry && typeof entry === 'object' && typeof entry.apiKey === 'string' && entry.apiKey) {
+      byId.set(String(entry.id ?? ''), entry.apiKey);
+    }
+  });
+  return next.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry;
+    if (entry.apiKey === undefined || entry.apiKey === null) {
+      const prior = byId.get(String(entry.id ?? ''));
+      if (prior) return { ...entry, apiKey: prior };
+    }
+    return entry;
+  });
 }
 
 /** Decode on-disk settings; decrypt agentApiKeyEnc → agentApiKey for in-memory use. */
@@ -927,6 +1072,29 @@ function settingsFromDisk(raw) {
     migrate = Boolean(out.agentApiKey);
   }
 
+  // Extra endpoints keep their own credential in the same envelope form, one per
+  // entry, so adding an endpoint never touches the Default one's key.
+  if (Array.isArray(raw.agentEndpoints)) {
+    out.agentEndpoints = raw.agentEndpoints.map((entry) => {
+      if (!entry || typeof entry !== 'object') return entry;
+      const next = { ...entry };
+      const envelope = next.apiKeyEnc;
+      delete next.apiKeyEnc;
+      if (isSecretEnvelope(envelope)) {
+        try {
+          next.apiKey = decryptSecret(envelope);
+        } catch {
+          next.apiKey = '';
+        }
+      }
+      return next;
+    });
+  }
+
+  const authDecoded = authFromDisk(raw.auth);
+  out.auth = authDecoded.auth;
+  if (authDecoded.migrate) migrate = true;
+
   return { memory: out, migrate };
 }
 
@@ -945,16 +1113,25 @@ function settingsToDisk(memorySettings) {
   const s = normalizeMonitorSettings(memorySettings);
   const {
     agentApiKey,
+    agentEndpoints,
+    auth,
     ...rest
   } = s;
   /** @type {Record<string, unknown>} */
   const disk = { ...rest };
+  // Each endpoint keeps its own key; never write any of them as plaintext.
+  disk.agentEndpoints = agentEndpoints.map((entry) => {
+    const { apiKey, ...withoutKey } = entry;
+    if (!apiKey) return withoutKey;
+    return { ...withoutKey, apiKeyEnc: encryptSecret(apiKey) };
+  });
   delete disk.agentAuthToken;
   delete disk.agentApiKeyEnc;
   delete disk.agentApiKeySet;
   if (typeof agentApiKey === 'string' && agentApiKey) {
     disk.agentApiKeyEnc = encryptSecret(agentApiKey);
   }
+  disk.auth = authToDisk(auth);
   return disk;
 }
 
@@ -1295,8 +1472,8 @@ function slimTodoRows(todos) {
 }
 
 /**
- * Write each session's Task List into `.kusa/kusa/tasks.json` (per-session,
- * not shared — the prompt queue is the workspace-shared one).
+ * Write each session's Task List into that session's `tasks.json` (per-session
+ * folder — the prompt queue is the workspace-shared one).
  */
 function persistTasksSidecar(dir, state) {
   if (!dir || !state) return;
@@ -1331,7 +1508,7 @@ function persistTasksSidecar(dir, state) {
   }
 }
 
-/** Overlay per-session rows from tasks.json onto matching lanes (newer wins). */
+/** Overlay per-session rows from each session's tasks.json onto matching lanes (newer wins). */
 function hydrateTasksFromSidecar(dir, state) {
   if (!dir || !state) return;
   let stored = {};
@@ -2160,35 +2337,33 @@ export function deleteSessions(dir, keys, { config, origin, nowWall = Date.now()
   });
 }
 
-/** Best-effort remove of a Kusă `.chat.json` when no lane record exists. */
+/** Best-effort remove of a Kusă session folder when no lane record exists. */
 function removeOrphanChat(dir, key) {
   const text = String(key || '');
   if (!text.startsWith('kusa:')) return false;
   const id = text.slice('kusa:'.length);
   if (!id) return false;
-  const path = join(harnessDir(dir, 'kusa'), `${sessionFileStem(id)}.chat.json`);
-  try {
-    unlinkSync(path);
-    return true;
-  } catch {
-    return false;
-  }
+  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id });
+  const had = existsSync(files.dir) || existsSync(files.chat) || existsSync(files.config);
+  if (!had) return false;
+  removeSessionFiles(dir, { harness: 'kusa', id }, { dropChat: true });
+  return true;
 }
 
 /**
- * Best-effort remove of a Kusă Settings sidecar (mirrors chat-store's
- * `sessionConfigPath`). A deleted chat must not leave its composer picks behind:
- * the id could otherwise be reused with a Rule the user made in a chat they
- * already threw away.
+ * Best-effort remove of a Kusă Settings sidecar. A deleted chat must not leave
+ * its composer picks behind: the id could otherwise be reused with a Rule the
+ * user made in a chat they already threw away. When the rest of the session
+ * folder is still present (lane / chat), only the config file is dropped.
  */
 function removeSessionConfig(dir, key) {
   const text = String(key || '');
   if (!text.startsWith('kusa:')) return false;
   const id = text.slice('kusa:'.length);
   if (!id) return false;
-  const path = join(harnessDir(dir, 'kusa'), `${sessionFileStem(id)}.session.json`);
+  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id });
   try {
-    unlinkSync(path);
+    unlinkSync(files.config);
     return true;
   } catch {
     return false;
@@ -2196,7 +2371,7 @@ function removeSessionConfig(dir, key) {
 }
 
 /**
- * Drop deleted sessions' rows from the tasks.json sidecar. `persistTasksSidecar`
+ * Drop deleted sessions' rows from each session's tasks.json. `persistTasksSidecar`
  * keeps entries whose lane is absent — that is what lets a task-tool write
  * survive the re-render it triggers — so an explicit delete has to clear the
  * rows on disk first, or the deleted session's list is written straight back.
@@ -2796,17 +2971,35 @@ function applyCopilotEvent(state, event, clocks) {
  *
  *   index.json                        shared state: focus, current lane per harness,
  *                                     in-flight calls, dedup keys, monitoring errors
- *   <harness>/<session>.json          one record per session (counters, tools, warnings)
- *   <harness>/<session>.events.jsonl  that session's recent event metadata
+ *   <harness>/<session>/              one folder per session (all related files)
+ *     <session>.json                  counters, tools, warnings
+ *     <session>.events.jsonl          that session's recent event metadata
+ *     <session>.chat.json             Kusă transcript (kusa harness only)
+ *     session.json                    Kusă composer picks (kusa harness only)
+ *     tasks.json                      that session's Task List (plan/todo rows)
+ *     attachments/                    files attached to messages in this session
+ *     sub-sessions/                   reserved for nested sub-sessions (later)
  *   dashboard.{md,html,css}, monitor-data.js   derived views, rewritten on every event
  *
- * <harness> is the fixed harness id (github-copilot, vscode-local, cursor); <session> is
- * the session id when it is already a safe file name, otherwise a hash of it.
+ * <harness> is the fixed harness id (github-copilot, vscode-local, cursor, kusa);
+ * <session> is the session id when it is already a safe file name, otherwise a hash
+ * of it. Flat pre-folder files (`<harness>/<session>.json`) are migrated into the
+ * session folder on the next read or write that touches them.
  */
 
 const SAFE_NAME = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const EVENTS_SUFFIX = '.events.jsonl';
+const ATTACHMENTS_DIR = 'attachments';
+const SUB_SESSIONS_DIR = 'sub-sessions';
+/** Composer picks for a Kusă session — lives inside the session folder. */
+const SESSION_CONFIG_FILE = 'session.json';
 const LANE_ALIASES = ['session', 'tools', 'recent', 'warnings', 'subagents', 'agentErrors', 'attemptTimes', 'repeatWarnedAt', 'summary'];
+/**
+ * Shared sidecars that live under a harness root, not inside a session folder.
+ * `queues.json` is workspace-shared. Legacy shared `tasks.json` may still sit
+ * here until the task store migrates it into each session folder.
+ */
+const HARNESS_ROOT_FILES = new Set(['tasks.json', 'queues.json']);
 
 /** File stem for a session id: the id itself when path-safe, else `h-<sha256 prefix>`. */
 export function sessionFileStem(sessionId) {
@@ -2821,15 +3014,138 @@ function harnessDir(dir, harness) {
   return join(dir, SAFE_NAME.test(name) ? name : sessionFileStem(name));
 }
 
-/** `{ json, events, chat }` paths for a lane. `chat` is Kusă transcript sidecar. */
+/**
+ * Absolute folder that owns every file for one session:
+ * `<dataDir>/<harness>/<stem>/`.
+ */
+export function sessionDir(dir, lane) {
+  const stem = sessionFileStem(lane?.id);
+  return join(harnessDir(dir, lane?.harness), stem);
+}
+
+/**
+ * `{ dir, json, events, chat, config, tasks, attachments, subSessions }` paths
+ * for a lane. Everything for one session lives under `dir`; `attachments` holds
+ * composer files; `tasks` is that session's Task List; `subSessions` is reserved
+ * for nested sub-sessions later.
+ */
 export function laneFiles(dir, lane) {
   const stem = sessionFileStem(lane.id);
-  const folder = harnessDir(dir, lane.harness);
+  const folder = sessionDir(dir, lane);
   return {
+    dir: folder,
     json: join(folder, `${stem}.json`),
     events: join(folder, `${stem}${EVENTS_SUFFIX}`),
     chat: join(folder, `${stem}.chat.json`),
+    config: join(folder, SESSION_CONFIG_FILE),
+    tasks: join(folder, 'tasks.json'),
+    attachments: join(folder, ATTACHMENTS_DIR),
+    subSessions: join(folder, SUB_SESSIONS_DIR),
   };
+}
+
+/** Ensure the session folder and its reserved subfolders exist on disk. */
+export function ensureSessionDirs(files) {
+  if (!files?.dir) return files;
+  mkdirSync(files.dir, { recursive: true });
+  mkdirSync(files.attachments, { recursive: true });
+  mkdirSync(files.subSessions, { recursive: true });
+  return files;
+}
+
+/**
+ * Move flat pre-folder session files into the session-named folder when they
+ * still sit beside each other under the harness root. Idempotent: a folder that
+ * already holds the lane record is left alone, and a missing flat file is fine.
+ * Always ensures `attachments/` and `sub-sessions/` exist once the session
+ * folder is in play.
+ */
+export function migrateFlatSessionFiles(dir, lane) {
+  if (!dir || !lane?.id) return laneFiles(dir, lane);
+  const stem = sessionFileStem(lane.id);
+  const harness = harnessDir(dir, lane.harness);
+  const files = laneFiles(dir, lane);
+  const flat = {
+    json: join(harness, `${stem}.json`),
+    events: join(harness, `${stem}${EVENTS_SUFFIX}`),
+    chat: join(harness, `${stem}.chat.json`),
+    // Pre-folder settings sidecar, and the short-lived in-folder stem name.
+    config: join(harness, `${stem}.session.json`),
+  };
+  const legacyInFolderConfig = join(files.dir, `${stem}.session.json`);
+  const anyFlat = Object.values(flat).some((path) => existsSync(path))
+    || (existsSync(legacyInFolderConfig) && legacyInFolderConfig !== files.config);
+  if (anyFlat) {
+    ensureSessionDirs(files);
+    for (const [key, from] of Object.entries(flat)) {
+      if (!existsSync(from)) continue;
+      const to = files[key];
+      if (!to) continue;
+      if (!existsSync(to)) {
+        try {
+          renameSync(from, to);
+        } catch {
+          /* leave the flat file; the next write recreates under the folder */
+        }
+      } else if (from !== to) {
+        // Folder already has the canonical file — drop the flat leftover so a
+        // session cannot keep two copies of its config / lane.
+        try { unlinkSync(from); } catch { /* ignore */ }
+      }
+    }
+    // Rename `<stem>.session.json` inside the folder → `session.json`.
+    if (existsSync(legacyInFolderConfig) && legacyInFolderConfig !== files.config) {
+      if (!existsSync(files.config)) {
+        try {
+          renameSync(legacyInFolderConfig, files.config);
+        } catch {
+          /* next write recreates the canonical name */
+        }
+      } else {
+        try { unlinkSync(legacyInFolderConfig); } catch { /* ignore */ }
+      }
+    }
+  }
+  // Folder already in play (lane, chat, config, or a prior write) — keep
+  // reserved subfolders present even when there was nothing flat to migrate.
+  if (
+    existsSync(files.json)
+    || existsSync(files.chat)
+    || existsSync(files.config)
+    || existsSync(files.dir)
+    || anyFlat
+  ) {
+    return ensureSessionDirs(files);
+  }
+  return files;
+}
+
+/** Best-effort remove of an entire session folder (and any leftover flat files). */
+export function removeSessionFiles(dir, lane, { dropChat = true } = {}) {
+  if (!dir || !lane?.id) return;
+  const stem = sessionFileStem(lane.id);
+  const harness = harnessDir(dir, lane.harness);
+  const files = laneFiles(dir, lane);
+  try {
+    rmSync(files.dir, { recursive: true, force: true });
+  } catch {
+    /* already gone */
+  }
+  // Flat leftovers from a half-migrated install.
+  const flatPaths = [
+    join(harness, `${stem}.json`),
+    join(harness, `${stem}${EVENTS_SUFFIX}`),
+  ];
+  if (dropChat) {
+    flatPaths.push(
+      join(harness, `${stem}.chat.json`),
+      join(harness, `${stem}.session.json`),
+      join(harness, SESSION_CONFIG_FILE),
+    );
+  }
+  for (const path of flatPaths) {
+    try { unlinkSync(path); } catch { /* missing is fine */ }
+  }
 }
 
 /** Fill a lane read from disk with the fields the current code expects. */
@@ -2973,25 +3289,55 @@ function readState(dir, config, origin) {
   }
   for (const alias of LANE_ALIASES) delete state[alias];
 
-  // Every <harness>/<session>.json is a lane. Folder and file names are not trusted;
-  // the harness and id come from the record itself.
+  // Every session lane lives under <harness>/<session>/<session>.json (folder
+  // layout). Flat pre-folder files (<harness>/<session>.json) are still read and
+  // migrated into the session folder. Folder and file names are not trusted; the
+  // harness and id come from the record itself.
   let entries = [];
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { /* no data yet */ }
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-    const folder = join(dir, entry.name);
-    let files = [];
-    try { files = readdirSync(folder); } catch { continue; }
-    for (const file of files) {
+    const harnessFolder = join(dir, entry.name);
+    let children = [];
+    try { children = readdirSync(harnessFolder, { withFileTypes: true }); } catch { continue; }
+    for (const child of children) {
+      if (child.isDirectory()) {
+        // Session-named folder: look for its lane record inside.
+        const sessionFolder = join(harnessFolder, child.name);
+        let sessionFiles = [];
+        try { sessionFiles = readdirSync(sessionFolder); } catch { continue; }
+        for (const file of sessionFiles) {
+          if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
+          if (file.endsWith('.chat.json') || file.endsWith('.session.json')) continue;
+          // Task List / composer picks — not lane records.
+          if (file === 'tasks.json' || file === SESSION_CONFIG_FILE) continue;
+          const path = join(sessionFolder, file);
+          try {
+            const lane = normalizeLane(readJsonFile(path));
+            if (!lane) throw new Error('unexpected shape');
+            state.sessions[lane.key] = lane;
+          } catch {
+            setAside(path, '.corrupt');
+            corrupted = true;
+            noteError(state, `session file ${entry.name}/${child.name}/${file} was corrupt and was set aside`, Date.now());
+          }
+        }
+        continue;
+      }
+      if (!child.isFile()) continue;
+      const file = child.name;
       if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
-      // Kusă chat transcripts live beside lane files as `<id>.chat.json`.
-      if (file.endsWith('.chat.json')) continue;
-      // Sidecars under the kusa harness folder (not session lanes).
-      if (file === 'tasks.json' || file === 'queues.json') continue;
-      const path = join(folder, file);
+      // Kusă chat / settings sidecars are not lanes.
+      if (file.endsWith('.chat.json') || file.endsWith('.session.json')) continue;
+      // Shared sidecars under the kusa harness folder (not session lanes).
+      if (HARNESS_ROOT_FILES.has(file)) continue;
+      const path = join(harnessFolder, file);
       try {
         const lane = normalizeLane(readJsonFile(path));
         if (!lane) throw new Error('unexpected shape');
+        // Promote flat files into the session folder so the next persist writes
+        // only under the new layout.
+        migrateFlatSessionFiles(dir, lane);
         state.sessions[lane.key] = lane;
       } catch {
         setAside(path, '.corrupt');
@@ -3000,7 +3346,7 @@ function readState(dir, config, origin) {
       }
     }
   }
-  // Overlay per-session Task Lists from kusa/tasks.json (newer wins).
+  // Overlay per-session Task Lists from each session's tasks.json (newer wins).
   hydrateTasksFromSidecar(dir, state);
   return { state: finishState(state), corrupted };
 }
@@ -3023,21 +3369,28 @@ function persist(dir, state) {
   // Per-session Task List sidecar (prompt queue is the workspace-shared one).
   persistTasksSidecar(dir, state);
   for (const lane of Object.values(state.sessions)) {
-    const files = laneFiles(dir, lane);
+    // Promote any leftover flat files before writing so we never leave a
+    // second copy beside the session folder, and keep attachments/ +
+    // sub-sessions/ present for later use.
+    const files = ensureSessionDirs(migrateFlatSessionFiles(dir, lane));
     index.sessionFiles[lane.key] = relative(dir, files.json).split('\\').join('/');
     atomicWrite(files.json, `${JSON.stringify(lane, null, 2)}\n`);
     const lines = lane.recent.slice().reverse().map((entry) => JSON.stringify(entry)).join('\n');
     atomicWrite(files.events, lines ? `${lines}\n` : '');
   }
   atomicWrite(join(dir, 'index.json'), `${JSON.stringify(index, null, 2)}\n`);
-  // Sessions dropped by the per-harness cap (or explicit delete) take lane files
-  // with them. Kusă `.chat.json` transcripts are removed only on explicit delete
-  // (lane._dropChat) so a monitor-lane prune cannot wipe chat history.
+  // Sessions dropped by the per-harness cap (or explicit delete) take their
+  // session folder with them. Kusă chat / attachments are removed only on
+  // explicit delete (lane._dropChat) so a monitor-lane prune cannot wipe chat
+  // history — in that case only the lane + events files are dropped.
   for (const lane of state.pruned || []) {
-    const files = laneFiles(dir, lane);
-    const paths = [files.json, files.events];
-    if (lane.harness !== 'kusa' || lane._dropChat) paths.push(files.chat);
-    for (const path of paths) {
+    const dropChat = lane.harness !== 'kusa' || Boolean(lane._dropChat);
+    if (dropChat) {
+      removeSessionFiles(dir, lane, { dropChat: true });
+      continue;
+    }
+    const files = migrateFlatSessionFiles(dir, lane);
+    for (const path of [files.json, files.events]) {
       try { unlinkSync(path); } catch { /* already gone */ }
     }
   }
@@ -3662,9 +4015,9 @@ export function updateSdkListenerStatus(dir, statusPatch = {}) {
 }
 
 /**
- * Re-read state (including `kusa/tasks.json`), promote the workspace Task
- * List onto every session, and rewrite monitor-data / dashboard artifacts.
- * Used on `kusa serve` boot so a bounce shows the shared task list immediately.
+ * Re-read state (including each session's `tasks.json`), hydrate Task Lists
+ * onto matching lanes, and rewrite monitor-data / dashboard artifacts.
+ * Used on `kusa serve` boot so a bounce shows session task lists immediately.
  */
 export function refreshMonitorArtifacts(dir, { config, origin = 'hooks', nowWall = Date.now() } = {}) {
   return withLock(dir, () => {

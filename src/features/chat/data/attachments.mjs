@@ -8,9 +8,24 @@
  * `text` only on a text file, and a file that is neither keeps its name — the
  * note says why, because a name with no bytes is a reference, not content.
  *
+ * On disk, bytes live under the session's `attachments/` folder; the transcript
+ * keeps a slim record with `file` (basename) so chat.json does not grow with
+ * every picture. Readers hydrate `dataUrl` / `text` back from that folder when
+ * the agent or the UI needs the bytes.
+ *
  * Caps mirror the browser's, and are enforced again here: the transcript and the
  * queue are hand-editable files, so the limit has to hold on the way back in.
  */
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, extname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { migrateFlatSessionFiles } from '#features/monitor/lib.mjs';
+
 export const ATTACHMENT_LIMITS = {
   files: 5,
   fileBytes: 2 * 1024 * 1024,
@@ -20,10 +35,11 @@ export const ATTACHMENT_LIMITS = {
 };
 
 const IMAGE_MIME = /^image\/[a-z0-9.+-]+$/i;
+const SAFE_FILE = /[^A-Za-z0-9._-]+/g;
 
 /**
  * @param {unknown} raw
- * @returns {null|{name,kind,size,mime?,dataUrl?,text?,note?}}
+ * @returns {null|{name,kind,size,mime?,dataUrl?,text?,note?,file?}}
  */
 export function normalizeAttachment(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -37,14 +53,21 @@ export function normalizeAttachment(raw) {
   const size = Number.isFinite(raw.size) ? Math.max(0, Math.round(raw.size)) : 0;
   const attachment = { name, kind: resolved, size };
   if (mime) attachment.mime = mime;
+  // Basename pointer into the session's attachments/ folder. Kept even when the
+  // inline payload is present so a later write can skip re-encoding the file.
+  const file = sanitizeAttachmentFileName(raw.file);
+  if (file) attachment.file = file;
 
   if (resolved === 'image') {
     const dataUrl = typeof raw.dataUrl === 'string' ? raw.dataUrl.trim() : '';
-    // Only a real inline image counts as content — anything else is a name.
+    // Only a real inline image counts as content — anything else is a name,
+    // unless a persisted file will hydrate it on read.
     if (dataUrl && dataUrl.startsWith('data:') && dataUrl.length <= ATTACHMENT_LIMITS.dataUrlChars) {
       attachment.dataUrl = dataUrl;
-    } else {
+    } else if (!file) {
       attachment.note = String(raw.note || 'image not included');
+    } else if (raw.note) {
+      attachment.note = String(raw.note);
     }
     return attachment;
   }
@@ -60,6 +83,14 @@ export function normalizeAttachment(raw) {
   }
   if (raw.note) attachment.note = String(raw.note);
   return attachment;
+}
+
+/** Reject path traversal; keep only a plain basename. */
+export function sanitizeAttachmentFileName(raw) {
+  const name = basename(String(raw || '').trim());
+  if (!name || name === '.' || name === '..') return '';
+  if (name.includes('/') || name.includes('\\') || name.includes('\0')) return '';
+  return name.slice(0, ATTACHMENT_LIMITS.nameChars);
 }
 
 /**
@@ -141,8 +172,149 @@ export function formatBytes(bytes) {
 export function attachmentLabels(attachments) {
   return (attachments || []).map((attachment) => {
     const name = String(attachment?.name || 'file');
-    return attachment?.note && !attachment?.dataUrl && !attachment?.text
+    return attachment?.note && !attachment?.dataUrl && !attachment?.text && !attachment?.file
       ? `${name} (not sent)`
       : name;
   });
+}
+
+/** Absolute path of a session's attachments/ folder (creates nothing). */
+export function sessionAttachmentsDir(dir, sessionId) {
+  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id: sessionId });
+  return files.attachments;
+}
+
+/**
+ * Build a collision-safe basename for an attachment inside attachments/.
+ * Keeps a readable stem from the original name and suffixes a short hash of
+ * the payload (or a uuid) so two "shot.png" files in one session never clash.
+ */
+function uniqueAttachmentFileName(attachment, bytes) {
+  const original = String(attachment?.name || 'file');
+  const ext = extname(original).slice(0, 16);
+  const stem = basename(original, ext)
+    .replace(SAFE_FILE, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'file';
+  const digest = bytes && bytes.length
+    ? createHash('sha256').update(bytes).digest('hex').slice(0, 10)
+    : randomUUID().replace(/-/g, '').slice(0, 10);
+  return sanitizeAttachmentFileName(`${stem}-${digest}${ext}`) || `${digest}${ext || '.bin'}`;
+}
+
+function dataUrlToBuffer(dataUrl) {
+  const raw = String(dataUrl || '');
+  const match = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(raw);
+  if (!match) return null;
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || '';
+  try {
+    return Buffer.from(payload, isBase64 ? 'base64' : 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function bufferToDataUrl(buf, mime) {
+  const type = String(mime || 'application/octet-stream');
+  return `data:${type};base64,${Buffer.from(buf).toString('base64')}`;
+}
+
+/**
+ * Write one attachment's bytes into the session attachments/ folder and return
+ * a slim record (no inline payload). Records that already point at a file and
+ * have no new bytes are left alone.
+ * @returns {object|null}
+ */
+export function persistAttachment(dir, sessionId, attachment) {
+  const normalized = normalizeAttachment(attachment);
+  if (!normalized || !dir || !sessionId) return normalized;
+  const folder = sessionAttachmentsDir(dir, sessionId);
+  mkdirSync(folder, { recursive: true });
+
+  let bytes = null;
+  if (normalized.kind === 'image' && normalized.dataUrl) {
+    bytes = dataUrlToBuffer(normalized.dataUrl);
+  } else if (normalized.kind === 'text' && typeof normalized.text === 'string') {
+    bytes = Buffer.from(normalized.text, 'utf8');
+  }
+
+  let fileName = sanitizeAttachmentFileName(normalized.file);
+  if (bytes && bytes.length) {
+    if (!fileName || !existsSync(join(folder, fileName))) {
+      fileName = uniqueAttachmentFileName(normalized, bytes);
+    }
+    writeFileSync(join(folder, fileName), bytes, { mode: 0o600 });
+  } else if (fileName && !existsSync(join(folder, fileName))) {
+    // Pointer with no bytes and no file on disk — drop the pointer.
+    fileName = '';
+  }
+
+  const slim = {
+    name: normalized.name,
+    kind: normalized.kind,
+    size: normalized.size || (bytes ? bytes.length : 0),
+  };
+  if (normalized.mime) slim.mime = normalized.mime;
+  if (normalized.note) slim.note = normalized.note;
+  if (fileName) slim.file = fileName;
+  else if (normalized.kind === 'image' && !slim.note) slim.note = 'image not included';
+  return slim;
+}
+
+/** Persist every attachment on a message; returns slim records. */
+export function persistAttachments(dir, sessionId, attachments) {
+  const list = normalizeAttachments(attachments);
+  if (!list.length) return [];
+  return list.map((attachment) => persistAttachment(dir, sessionId, attachment)).filter(Boolean);
+}
+
+/**
+ * Reload inline payload from the session attachments/ folder when the slim
+ * transcript record only carries a `file` pointer. Missing files keep the
+ * record as a named reference (with a note) rather than inventing bytes.
+ */
+export function hydrateAttachment(dir, sessionId, attachment) {
+  const normalized = normalizeAttachment(attachment);
+  if (!normalized) return null;
+  if (normalized.dataUrl || normalized.text) return normalized;
+  const fileName = sanitizeAttachmentFileName(normalized.file);
+  if (!fileName || !dir || !sessionId) return normalized;
+  const path = join(sessionAttachmentsDir(dir, sessionId), fileName);
+  if (!existsSync(path)) {
+    if (normalized.kind === 'image' && !normalized.note) {
+      return { ...normalized, note: 'image not included' };
+    }
+    return normalized;
+  }
+  try {
+    const buf = readFileSync(path);
+    if (normalized.kind === 'image') {
+      const { note: _note, ...rest } = normalized;
+      return {
+        ...rest,
+        size: normalized.size || buf.length,
+        dataUrl: bufferToDataUrl(buf, normalized.mime || 'image/png'),
+      };
+    }
+    if (normalized.kind === 'text') {
+      const text = buf.toString('utf8');
+      return {
+        ...normalized,
+        size: normalized.size || buf.length,
+        text: text.length > ATTACHMENT_LIMITS.textChars
+          ? text.slice(0, ATTACHMENT_LIMITS.textChars)
+          : text,
+      };
+    }
+    return { ...normalized, size: normalized.size || buf.length };
+  } catch {
+    return normalized;
+  }
+}
+
+export function hydrateAttachments(dir, sessionId, attachments) {
+  const list = normalizeAttachments(attachments);
+  if (!list.length) return [];
+  return list.map((attachment) => hydrateAttachment(dir, sessionId, attachment)).filter(Boolean);
 }

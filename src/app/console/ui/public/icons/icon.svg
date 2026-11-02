@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 300" role="img" aria-label="Kusă">
+  <style>
+    .mark { stroke: #000; }
+    @media (prefers-color-scheme: dark) {
+      .mark { stroke: #fff; }
+    }
+  </style>
+  <g
+    class="mark"
+    fill="none"
+    stroke-width="20"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <g>
+      <animateTransform
+        attributeName="transform"
+        type="rotate"
+        from="0 160 150"
+        to="360 160 150"
+        dur="8s"
+        repeatCount="indefinite"
+      />
+
+      <!-- Main circle -->
+      <circle cx="160" cy="150" r="65"/>
+
+      <!-- Three tangent circles -->
+      <circle cx="160" cy="56" r="29"/>
+      <circle cx="78.6" cy="197" r="29"/>
+      <circle cx="241.4" cy="197" r="29"/>
+    </g>
+
+    <!-- Stationary K -->
+    <path d="M145 123 V177"/>
+    <path d="M145 150 L177 123"/>
+    <path d="M145 150 L177 177"/>
+  </g>
+</svg>

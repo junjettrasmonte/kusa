@@ -130,6 +130,7 @@ export const TAB_IDS = [
   'harness',
   'devtools',
   'settings',
+  'user',
 ];
 
 export const TAB_LABELS = {
@@ -138,6 +139,7 @@ export const TAB_LABELS = {
   harness: 'Harness',
   devtools: 'Developer Tools',
   settings: 'Settings',
+  user: 'Account',
 };
 
 /** Left-sidebar views switched from the sidebar topbar icons. Each id is one
@@ -197,7 +199,11 @@ export const SESSION_SUBTAB_LABELS = {
   tools: 'Tool Call Viewer',
 };
 
-/** Sub-views under the Developer Tools rail tab. */
+/**
+ * Core sub-views under the Developer Tools rail tab.
+ * Installed extensions may append more via `nav.placement: 'devtools'`
+ * (see features/extensions/registry.js → resolveDevtoolsSubTabs).
+ */
 export const DEVTOOLS_SUBTAB_IDS = [
   'git',
   'trail',
@@ -223,7 +229,7 @@ export const HARNESS_SUBTAB_LABELS = {
   knowledgebase: 'Knowledgebase',
 };
 
-/** Sub-views under the Settings rail tab. */
+/** Sub-views under the Settings rail tab. Login/auth lives on the Account (user) page. */
 export const SETTINGS_SUBTAB_IDS = [
   'agent',
   'playback',

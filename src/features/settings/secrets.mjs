@@ -15,6 +15,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { publicAuthSettings } from '#features/auth/shape.mjs';
 
 const ALGO = 'aes-256-gcm';
 const KEY_BYTES = 32;
@@ -139,8 +140,10 @@ export function isSecretEnvelope(value) {
 }
 
 /**
- * Browser-safe settings: never includes agentApiKey / agentApiKeyEnc.
- * Adds agentApiKeySet so the UI can show that a key is configured.
+ * Browser-safe settings: never includes agentApiKey / agentApiKeyEnc. Adds
+ * agentApiKeySet (and agentEndpoints[].apiKeySet) so the UI can show that a
+ * credential is configured without ever shipping one. Auth secrets stay out —
+ * only publicAuthSettings flags are merged in.
  */
 export function publicSettings(settings = {}) {
   const s = settings && typeof settings === 'object' ? settings : {};
@@ -149,6 +152,7 @@ export function publicSettings(settings = {}) {
     || s.agentApiKeySet === true
     || isSecretEnvelope(s.agentApiKeyEnc),
   );
+  const authPublic = publicAuthSettings(s.auth);
   return {
     sdkListenerEnabled: s.sdkListenerEnabled !== false,
     collectReasoningEvents: s.collectReasoningEvents !== false,
@@ -159,6 +163,10 @@ export function publicSettings(settings = {}) {
     enforceGit: s.enforceGit !== false,
     agentBaseUrl: typeof s.agentBaseUrl === 'string' ? s.agentBaseUrl : '',
     agentModel: typeof s.agentModel === 'string' ? s.agentModel : 'gpt-4o-mini',
+    // Declared model ids for the Default endpoint. The UI needs them to group its
+    // model picker, so they stay browser-safe — they are ids, not secrets.
+    agentModels: publicModelList(s.agentModels),
+    agentEndpoints: publicAgentEndpoints(s.agentEndpoints),
     agentMaxSteps: (() => {
       const n = Number(s.agentMaxSteps);
       if (!Number.isFinite(n)) return 100;
@@ -184,5 +192,52 @@ export function publicSettings(settings = {}) {
       return Math.min(240, Math.max(1, Math.floor(n)));
     })(),
     agentApiKeySet: hasKey,
+    authMode: authPublic.authMode,
+    authConfigured: authPublic.authConfigured,
+    totpEnabled: authPublic.totpEnabled,
+    authUsername: authPublic.authUsername,
+    authOidc: authPublic.oidc,
+    authSaml: authPublic.saml,
   };
+}
+
+/**
+ * Model ids the Default endpoint declares, from the comma-delimited Settings
+ * field or an array. Mirrors monitor lib.mjs normalizeModelList — the two must
+ * agree or a saved list would round-trip differently than the UI reads it.
+ */
+function publicModelList(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(/[,;\n]/) : []);
+  const ids = list.map((value) => String(value ?? '').trim()).filter(Boolean);
+  return [...new Set(ids)].slice(0, 60).map((id) => id.slice(0, 200));
+}
+
+/**
+ * Extra endpoints for the UI: name, base URL, auth class, declared models, and
+ * whether a key exists — never the key itself.
+ */
+function publicAgentEndpoints(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    const baseUrl = typeof entry.baseUrl === 'string' ? entry.baseUrl.trim() : '';
+    if (!baseUrl) continue;
+    if (out.length >= 12) break;
+    out.push({
+      id: typeof entry.id === 'string' ? entry.id.trim() : '',
+      name: String(entry.name ?? '').replace(/\s+/g, ' ').trim().slice(0, 40),
+      baseUrl,
+      authMode: (entry.authMode === 'apikey' || entry.authMode === 'bearer') ? 'apikey' : 'none',
+      apiKeySet: Boolean(
+        (typeof entry.apiKey === 'string' && entry.apiKey.trim())
+        || entry.apiKeySet === true
+        || isSecretEnvelope(entry?.apiKeyEnc),
+      ),
+      models: publicModelList(entry?.models),
+    });
+  }
+  return out;
 }

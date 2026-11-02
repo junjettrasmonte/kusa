@@ -1,3 +1,6 @@
+import { AgentEndpointsPanel } from '#ui/features/settings/AgentEndpointsPanel.jsx';
+import { Choice, Field } from '#ui/shared/SettingsControls.jsx';
+
 export function SettingsPanel({
   subTab,
   follow,
@@ -18,6 +21,8 @@ export function SettingsPanel({
     enforceGit: true,
     agentBaseUrl: '',
     agentModel: 'gpt-4o-mini',
+    agentModels: [],
+    agentEndpoints: [],
     agentMaxSteps: 100,
     agentAuthMode: 'none',
     agentApiKeySet: false,
@@ -26,9 +31,7 @@ export function SettingsPanel({
     agentAllowDenyRevertMinutes: 15,
   };
   const L = sdkListener || { status: 'idle' };
-  const authApiKey = s.agentAuthMode === 'apikey' || s.agentAuthMode === 'bearer';
   const backendOpencode = s.agentBackend === 'opencode';
-  const apiKeySet = s.agentApiKeySet === true;
 
   return (
     <div
@@ -41,65 +44,26 @@ export function SettingsPanel({
             <h2 className="mb-2 text-base font-semibold">Kusă agent</h2>
             <p className="mb-3 text-xs text-gray-500">
               Powers the Kusă chat harness. Connects to any OpenAI-compatible{' '}
-              <code className="text-sky-300">/v1</code> endpoint. File tools are Kusă&apos;s own
+              <code className="text-sky-300">/v1</code> endpoint — as many of them as you want, each with
+              its own key and model ids below. File tools are Kusă&apos;s own
               sandboxed read/write/list/grep (also advertised over MCP). OpenCode SDK mode needs the{' '}
               <code className="text-sky-300">opencode</code> CLI on PATH.
             </p>
-            <div className="space-y-3 rounded-xl border border-gray-800 bg-gray-900/60 p-3">
-              <Field
-                label="Base URL"
-                hint="Example: https://api.openai.com/v1 or http://127.0.0.1:11434/v1"
-                value={s.agentBaseUrl || ''}
-                disabled={!canPersist || settingsBusy}
-                placeholder="https://api.openai.com/v1"
-                onCommit={(v) => onSettingsChange?.({ agentBaseUrl: v })}
-              />
-              <Field
-                label="Model"
-                hint="Model id sent to the endpoint"
-                value={s.agentModel || 'gpt-4o-mini'}
-                disabled={!canPersist || settingsBusy}
-                placeholder="gpt-4o-mini"
-                onCommit={(v) => onSettingsChange?.({ agentModel: v })}
-              />
-              <div>
-                <p className="mb-1 text-sm text-gray-300">Auth</p>
-                <div className="flex flex-wrap gap-2">
-                  <Choice
-                    active={!authApiKey}
-                    disabled={!canPersist || settingsBusy}
-                    onClick={() => onSettingsChange?.({ agentAuthMode: 'none' })}
-                    label="None"
-                  />
-                  <Choice
-                    active={authApiKey}
-                    disabled={!canPersist || settingsBusy}
-                    onClick={() => onSettingsChange?.({ agentAuthMode: 'apikey' })}
-                    label="API key"
-                  />
-                </div>
-                <p className="mt-1 text-xs text-gray-500">
-                  None sends no auth. API key is sent as{' '}
-                  <code className="text-sky-300">Authorization: Bearer &lt;key&gt;</code>{' '}
-                  (OpenAI-compatible).
-                </p>
-              </div>
-              {authApiKey ? (
-                <Field
-                  label="API key"
-                  hint="Encrypted at rest in .kusa/settings.json (master key in ~/.config/kusa/). Leave blank to keep the current key."
-                  value=""
-                  disabled={!canPersist || settingsBusy}
-                  placeholder={apiKeySet ? '••••••••' : 'sk-…'}
-                  type="password"
-                  resetKey={apiKeySet ? 'set' : 'empty'}
-                  onCommit={(v) => {
-                    const next = String(v || '').trim();
-                    if (!next) return; // empty blur = leave encrypted secret unchanged
-                    onSettingsChange?.({ agentApiKey: next });
-                  }}
-                />
-              ) : null}
+            <AgentEndpointsPanel
+              defaultEndpoint={{
+                baseUrl: s.agentBaseUrl || '',
+                model: s.agentModel || 'gpt-4o-mini',
+                authMode: s.agentAuthMode || 'none',
+                apiKeySet: s.agentApiKeySet === true,
+                models: s.agentModels || [],
+              }}
+              endpoints={s.agentEndpoints || []}
+              canPersist={canPersist}
+              settingsBusy={settingsBusy}
+              onSettingsChange={onSettingsChange}
+            />
+            <hr className="my-6 border-0 border-t border-gray-700" />
+            <div className="space-y-3">
               <div>
                 <p className="mb-1 text-sm text-gray-300">Backend</p>
                 <div className="flex flex-wrap gap-2">
@@ -311,51 +275,6 @@ function SliderToggle({ checked, disabled, onChange, label, hint }) {
         />
       </button>
     </div>
-  );
-}
-
-function Choice({ active, disabled, onClick, label }) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className={`rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
-        active
-          ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300'
-          : 'border-gray-700 bg-gray-950 text-gray-400 hover:border-gray-600 hover:text-gray-200'
-      } disabled:cursor-not-allowed disabled:opacity-50`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function Field({ label, hint, value, disabled, placeholder, onCommit, type = 'text', resetKey }) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-sm text-gray-300">{label}</span>
-      <input
-        type={type}
-        defaultValue={value}
-        key={`${label}:${resetKey ?? value}`}
-        disabled={disabled}
-        placeholder={placeholder}
-        spellCheck={false}
-        autoComplete="off"
-        onBlur={(e) => {
-          const next = e.target.value;
-          if (next !== value) onCommit?.(next);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.currentTarget.blur();
-          }
-        }}
-        className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-1.5 font-mono text-sm text-gray-100 placeholder:text-gray-600 disabled:opacity-50"
-      />
-      {hint ? <span className="mt-1 block text-xs text-gray-500">{hint}</span> : null}
-    </label>
   );
 }
 

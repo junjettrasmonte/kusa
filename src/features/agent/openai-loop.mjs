@@ -28,17 +28,8 @@ export const DEFAULT_MAX_STEPS = 100;
 const MAX_MAX_STEPS = 1000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
-/**
- * @param {object} settings
- * @returns {{ baseUrl: string, model: string, headers: Record<string, string>, authMode: string, apiKey: string }}
- */
-export function resolveAgentEndpoint(settings = {}) {
-  const baseUrl = String(settings.agentBaseUrl || '').trim().replace(/\/+$/, '');
-  const model = String(settings.agentModel || '').trim() || 'gpt-4o-mini';
-  const authMode = (settings.agentAuthMode === 'apikey' || settings.agentAuthMode === 'bearer')
-    ? 'apikey'
-    : 'none';
-  const apiKey = String(settings.agentApiKey ?? settings.agentAuthToken ?? '').trim();
+/** Auth headers for one endpoint's class + key (Default or extra — same rule). */
+function endpointHeaders(authMode, apiKey) {
   /** @type {Record<string, string>} */
   const headers = {
     'Content-Type': 'application/json',
@@ -47,7 +38,60 @@ export function resolveAgentEndpoint(settings = {}) {
   if (authMode === 'apikey' && apiKey) {
     headers.Authorization = `Bearer ${apiKey}`;
   }
-  return { baseUrl, model, headers, authMode, apiKey };
+  return headers;
+}
+
+/**
+ * The OpenAI-compatible endpoint a request should talk to.
+ *
+ * The Default endpoint keeps living in the agentBaseUrl / agentAuthMode /
+ * agentApiKey fields, so a settings file written before extra endpoints existed
+ * still resolves to exactly one working endpoint. A model that one of the EXTRA
+ * endpoints declares resolves to THAT endpoint instead — its own base URL and its
+ * own key — which is why the loop, the OpenCode config and the instance key all
+ * call this one function rather than reading the fields themselves. The caller
+ * puts the chosen model in settings.agentModel (runKusaAgent scopes it there),
+ * so nothing downstream has to know about endpoints.
+ * @param {object} settings
+ * @returns {{ baseUrl: string, model: string, headers: Record<string, string>, authMode: string, apiKey: string }}
+ */
+/** The endpoint the top-level agent* fields describe — the Default one, always present. */
+function defaultAgentEndpoint(settings = {}) {
+  const authMode = (settings.agentAuthMode === 'apikey' || settings.agentAuthMode === 'bearer')
+    ? 'apikey'
+    : 'none';
+  const apiKey = String(settings.agentApiKey ?? settings.agentAuthToken ?? '').trim();
+  return {
+    baseUrl: String(settings.agentBaseUrl || '').trim().replace(/\/+$/, ''),
+    model: String(settings.agentModel || '').trim() || 'gpt-4o-mini',
+    headers: endpointHeaders(authMode, apiKey),
+    authMode,
+    apiKey,
+  };
+}
+
+export function resolveAgentEndpoint(settings = {}) {
+  const requested = String(settings.agentModel || '').trim();
+  const extras = Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : [];
+  // Declared ids own their endpoint: an id two endpoints both offer belongs to
+  // the one the user configured by name, and the model picker applies the same
+  // rule when it lists it under that endpoint's heading.
+  const match = extras.find((entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    return Array.isArray(entry.models) && entry.models.some((id) => String(id).trim() === requested);
+  });
+  if (match) {
+    const authMode = (match.authMode === 'apikey' || match.authMode === 'bearer') ? 'apikey' : 'none';
+    const apiKey = String(match.apiKey ?? '').trim();
+    return {
+      baseUrl: String(match.baseUrl || '').trim().replace(/\/+$/, ''),
+      model: requested,
+      headers: endpointHeaders(authMode, apiKey),
+      authMode,
+      apiKey,
+    };
+  }
+  return defaultAgentEndpoint(settings);
 }
 
 /**
@@ -62,17 +106,20 @@ export function resolveAgentMaxSteps(settings = {}) {
 }
 
 const MODEL_LIST_TIMEOUT_MS = 8_000;
+/** Heading for the endpoint the top-level agent* fields describe. */
+export const DEFAULT_ENDPOINT_LABEL = 'Default';
 
 /**
- * Models the configured OpenAI-compatible endpoint advertises (`GET /models`).
- * A single-model endpoint still gets a picker — it defaults to that model.
- * @param {object} settings
- * @returns {{ default: string, models: string[] }}
+ * Model ids one endpoint advertises over `GET /models` — its own headers, so an
+ * extra endpoint is probed with its own credentials. Empty when it does not
+ * answer: a dead or offline endpoint is not an error here, the picker simply has
+ * nothing to offer from it.
+ * @param {string} baseUrl
+ * @param {object} [headers]
+ * @returns {Array<string>}
  */
-export async function listAgentModels(settings = {}) {
-  const { baseUrl, model, headers } = resolveAgentEndpoint(settings);
-  const fallback = { default: model, models: model ? [model] : [] };
-  if (!baseUrl) return fallback;
+async function probeEndpointModels(baseUrl, headers = {}) {
+  if (!baseUrl) return [];
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT_MS);
   try {
@@ -80,29 +127,107 @@ export async function listAgentModels(settings = {}) {
       headers: { ...headers, Accept: 'application/json' },
       signal: controller.signal,
     });
-    if (!res.ok) return fallback;
+    if (!res.ok) return [];
     const raw = await res.text();
     let data;
     try {
       data = raw ? JSON.parse(raw) : {};
     } catch {
-      return fallback;
+      return [];
     }
     const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data?.models) ? data.models : []);
-    const ids = list
+    return list
       .map((entry) => (typeof entry === 'string' ? entry : String(entry?.id ?? entry?.model ?? '')).trim())
       .filter(Boolean);
-    const unique = [...new Set(ids.length ? ids : fallback.models)];
-    // Keep the configured model first so the picker's default is obvious.
-    const ordered = model && unique.includes(model)
-      ? [model, ...unique.filter((id) => id !== model)]
-      : unique;
-    return { default: model, models: ordered };
   } catch {
-    return fallback;
+    return [];
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Declared model ids, trimmed and de-duplicated — the comma-delimited field's final form. */
+function declaredModelList(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(/[,;\n]/) : []);
+  const ids = list.map((value) => String(value ?? '').trim()).filter(Boolean);
+  return [...new Set(ids)];
+}
+
+/**
+ * Models EVERY configured (active) endpoint has, as one group per endpoint — the
+ * composer's Model picker draws those headings, so a pick states which base URL
+ * and which key it would use. Every endpoint with a base URL is active: its group
+ * merges what it declares (comma-delimited) with what its own `GET /models`
+ * advertises. The Default endpoint (the agentBaseUrl fields) is listed first.
+ * An id an extra endpoint declared belongs to that endpoint alone, which is the
+ * rule resolveAgentEndpoint applies when the pick is sent — probed-only ids do
+ * not steal ownership across endpoints.
+ * @param {object} settings
+ * @returns {{ default: string, groups: Array<{ name: string, models: Array<string> }> }}
+ */
+export async function listAgentModelGroups(settings = {}) {
+  const extras = (Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : [])
+    .filter((entry) => entry && typeof entry === 'object' && String(entry.baseUrl || '').trim())
+    .map((entry, index) => {
+      const authMode = (entry.authMode === 'apikey' || entry.authMode === 'bearer') ? 'apikey' : 'none';
+      const apiKey = String(entry.apiKey ?? '').trim();
+      const declared = declaredModelList(entry.models);
+      return {
+        name: String(entry.name ?? '').trim() || `Endpoint ${index + 1}`,
+        baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
+        headers: endpointHeaders(authMode, apiKey),
+        declared,
+      };
+    });
+  /** @type {Array<{ name: string, models: Array<string> }>} */
+  const groups = [];
+  // Only a DECLARED id claims ownership of it. A list an endpoint merely
+  // advertises does not — two servers that both happen to offer gpt-4o-mini
+  // would otherwise steal the id from each other, and the pick would resolve to
+  // credentials the heading does not show.
+  const declaredByExtras = new Set(extras.flatMap((entry) => entry.declared));
+  const current = defaultAgentEndpoint(settings);
+  const probedDefault = await probeEndpointModels(current.baseUrl, current.headers);
+  const declaredDefault = declaredModelList(settings.agentModels);
+  // The configured model leads so the picker's default is obvious.
+  const merged = [...new Set([current.model, ...declaredDefault, ...probedDefault])]
+    .filter((id) => id && !declaredByExtras.has(id));
+  const offered = new Set(merged);
+  for (const entry of extras) {
+    const probed = await probeEndpointModels(entry.baseUrl, entry.headers);
+    const ids = [...new Set([...entry.declared, ...probed])]
+      .filter((id) => id && !offered.has(id));
+    if (!ids.length) continue;
+    ids.forEach((id) => offered.add(id));
+    groups.push({ name: entry.name, models: ids });
+  }
+  return {
+    default: resolveAgentEndpoint(settings).model,
+    groups: [
+      ...(merged.length ? [{ name: DEFAULT_ENDPOINT_LABEL, models: merged }] : []),
+      ...groups,
+    ],
+  };
+}
+
+/**
+ * Flat union of every endpoint's models — the shape a single-endpoint caller
+ * already expects. The picker wants listAgentModelGroups; this stays for callers
+ * that only need the ids (a single endpoint produces exactly the old list).
+ * @param {object} settings
+ * @returns {{ default: string, models: Array<string> }}
+ */
+export async function listAgentModels(settings = {}) {
+  const { default: defaultModel, groups } = await listAgentModelGroups(settings);
+  const models = [];
+  for (const group of groups) {
+    for (const id of group.models) {
+      if (!models.includes(id)) models.push(id);
+    }
+  }
+  return { default: defaultModel, models };
 }
 
 /**

@@ -192,7 +192,7 @@ function runTrailCli(workspaceRoot, args) {
  * @param {string} workspaceRoot
  * @param {{ enforceTrail?: boolean, approvalMode?: 'ask-deny'|'ask-allow'|'allow'|'deny', mode?: 'ask'|'plan'|'agent', onApprove?: (request) => boolean, approvalEvent?: (request) => void, signal?: AbortSignal, dataDir?: string, sessionKey?: string }} [options]
  *   dataDir + sessionKey are the monitor context for this turn — the task tools
- *   need them to keep the model's task list in `.kusa/kusa/tasks.json`.
+ *   need them to keep the model's task list in that session's `tasks.json`.
  *   onAsk + askEvent are the interactive channel for kusa_ask: without them the
  *   ask cannot reach a human and refuses immediately instead of stalling.
  */

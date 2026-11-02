@@ -17,26 +17,34 @@
  *   /favicon.svg      Kusă mark (SVG favicon)
  *   /monitor-data.js  <workspace>/.kusa/monitor-data.js
  *   /index.json, /dashboard.md                  same folder, read-only
- *   /sessions/<harness>/<session>.json          one session's record
- *   /sessions/<harness>/<session>.events.jsonl  that session's recent events
+ *   /sessions/<harness>/<session>/<session>.json          one session's record
+ *   /sessions/<harness>/<session>/<session>.events.jsonl  that session's recent events
+ *   /sessions/<harness>/<session>/attachments/<file>      a file attached to that session
  *   DELETE /sessions  JSON body { "keys": ["harness:id", ...] } — remove sessions
  *   GET/POST /settings  read/update SDK listener + Kusă agent settings (settings.json)
  *   POST /kusa/chat   Kusă harness prompt (JSON or SSE stream=1 / Accept: text/event-stream)
  *   GET  /kusa/chat/live?queueKey=  re-attach SSE to a running turn (survives refresh)
  *   POST /kusa/chat/options  mid-turn Mode / Rules update (takes effect on the next tool call; an Allow / Deny Rule also settles an ask that is already waiting)
  *   GET/POST /kusa/queue  composer held/steering prompts (persisted in kusa/queues.json)
- *   GET /kusa/sessions          list Kusă chat transcripts (.kusa/kusa/*.chat.json)
+ *   GET /kusa/sessions          list Kusă chat transcripts (.kusa/kusa/<id>/<id>.chat.json)
  *                                 (busy sessions include in-memory `live` while a turn runs)
  *   POST /kusa/sessions         create an empty Kusă chat (+ monitor lane)
  *   PUT /kusa/sessions          upsert one `{ session }` or many `{ sessions }`
  *   POST /kusa/sessions/migrate import legacy browser-local chats
  *   GET /kusa/tools   the tool set the Kusă agent advertises for a chat session
- *   GET /kusa/models  models the configured endpoint advertises (for the picker)
+ *   GET /kusa/models  models every active endpoint has, grouped by endpoint / provider name (for the picker)
  *   GET /git          live working-copy status (git status for the workspace)
  *   GET /trail        live Trail CLI + .trail/cache readiness
  *   GET /files        workspace file tree (sidebar Explorer view; ?depth= ?entries=)
  *   GET /search       workspace file-name search (sidebar File names pane; ?q= required, ?path= scope)
  *   GET /ready        combined git + trail readiness (dashboard load check)
+ *   GET /health       lightweight serve-up probe (PWA splash; no auth)
+ *   GET /auth/status  console auth gate status
+ *   POST /auth/setup|/auth/login|/auth/totp|/auth/logout
+ *   GET /auth/oidc/start|/auth/oidc/callback  OIDC SSO
+ *   GET /auth/saml/metadata|/auth/saml/start  SAML SSO
+ *   POST /auth/saml/acs
+ *   /manifest.webmanifest /sw.js /icons/*  PWA shell assets
  *   GET/POST /skills  list / create skills (canonical store under .kusa/skills)
  *   GET/PUT/DELETE /skills/:id  read / update / delete
  *   POST /skills/:id/duplicate|publish|restore|import-destination
@@ -61,7 +69,7 @@ import {
   approvalModeLabel,
   APPROVAL_GATED_TOOLS,
   createKusaHookEmitter,
-  listAgentModels,
+  listAgentModelGroups,
   normalizeAgentMode,
   normalizeApprovalMode,
   resolveTrailPolicy,
@@ -92,6 +100,16 @@ import {
   ATTACHMENT_LIMITS,
 } from '#features/chat/data/attachments.mjs';
 import { supportsVision } from '#features/agent/index.mjs';
+import {
+  buildProfileDocument,
+  collectCaoStatus,
+  createCaoProfile,
+  deleteCaoProfile,
+  listCaoProfiles,
+  parseProfileDocument,
+  readCaoProfileSource,
+  updateCaoProfile,
+} from '#features/cao/index.mjs';
 import {
   collectGitStatus,
   collectTrailStatus,
@@ -142,6 +160,13 @@ import {
   syncCursorMcpRegistration,
   updateCustomTool,
 } from '#features/mcp/index.mjs';
+import {
+  enforceAuthGate,
+  handleAuthHttp,
+  hashPassword,
+  mergeAuthPatch,
+} from '#features/auth/index.mjs';
+import { existsSync, readdirSync } from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = defaultWorkspaceRoot();
@@ -300,7 +325,7 @@ export function createMonitorServer({
       /* disk must not break queue mutations */
     }
   };
-  // Rehydrate per-session Task Lists from kusa/tasks.json into monitor-data
+  // Rehydrate per-session Task Lists from each session's tasks.json into monitor-data
   // so each chat's tasks survive a serve bounce.
   try {
     refreshMonitorArtifacts(dataDir);
@@ -427,21 +452,105 @@ export function createMonitorServer({
     '/dashboard.css': { file: join(pageDir, 'dashboard.css'), type: 'text/css; charset=utf-8' },
     '/dashboard.js': { file: join(pageDir, 'dashboard.js'), type: 'text/javascript; charset=utf-8' },
     '/favicon.svg': { file: join(pageDir, 'favicon.svg'), type: 'image/svg+xml' },
+    '/manifest.webmanifest': {
+      file: join(pageDir, 'manifest.webmanifest'),
+      type: 'application/manifest+json; charset=utf-8',
+    },
+    '/sw.js': { file: join(pageDir, 'sw.js'), type: 'text/javascript; charset=utf-8' },
     '/monitor-data.js': { file: join(dataDir, 'monitor-data.js'), type: 'text/javascript; charset=utf-8' },
     '/index.json': { file: join(dataDir, 'index.json'), type: 'application/json; charset=utf-8' },
     '/dashboard.md': { file: join(dataDir, 'dashboard.md'), type: 'text/markdown; charset=utf-8' },
   };
-  // /sessions/<harness>/<file>: both segments must be plain names (no dots-only, no
-  // separators), and the file must be a session record or its event log.
+  // Workbox runtime files + PWA icons published next to dashboard.*.
+  try {
+    for (const name of readdirSync(pageDir)) {
+      if (/^workbox-.*\.js$/.test(name) && !routes[`/${name}`]) {
+        routes[`/${name}`] = {
+          file: join(pageDir, name),
+          type: 'text/javascript; charset=utf-8',
+        };
+      }
+    }
+  } catch { /* pageDir may be incomplete during first boot */ }
+  const iconsDir = join(pageDir, 'icons');
+  if (existsSync(iconsDir)) {
+    try {
+      for (const name of readdirSync(iconsDir)) {
+        if (!/\.(png|svg|ico|webp)$/i.test(name)) continue;
+        const type = name.endsWith('.svg')
+          ? 'image/svg+xml'
+          : name.endsWith('.ico')
+            ? 'image/x-icon'
+            : name.endsWith('.webp')
+              ? 'image/webp'
+              : 'image/png';
+        routes[`/icons/${name}`] = { file: join(iconsDir, name), type };
+      }
+    } catch { /* ignore */ }
+  }
+  // /sessions/<harness>/<session>/<file>  — session folder layout
+  // /sessions/<harness>/<session>/attachments/<file>  — persisted composer files
+  // Legacy flat paths (/sessions/<harness>/<file>) still resolve for old links.
+  // Every segment must be a plain name (no dots-only, no separators).
   const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
   const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
   const sessionRoute = (pathname) => {
-    const parts = pathname.split('/');
-    if (parts.length !== 4 || parts[1] !== 'sessions') return null;
-    const [, , harness, file] = parts;
-    if (!SEGMENT.test(harness) || !SEGMENT.test(file) || harness.includes('..') || file.includes('..')) return null;
-    if (file.endsWith('.events.jsonl')) return { file: join(dataDir, harness, file), type: 'application/x-ndjson; charset=utf-8' };
-    if (file.endsWith('.json')) return { file: join(dataDir, harness, file), type: 'application/json; charset=utf-8', harness, stem: file.slice(0, -'.json'.length) };
+    const parts = pathname.split('/').filter(Boolean);
+    if (parts[0] !== 'sessions' || parts.length < 3) return null;
+    const harness = parts[1];
+    if (!SEGMENT.test(harness) || harness.includes('..')) return null;
+    // Folder layout: /sessions/<harness>/<stem>/attachments/<file>
+    if (parts.length === 4 && parts[3] === 'attachments') return null;
+    if (parts.length === 5 && parts[3] === 'attachments') {
+      const stem = parts[2];
+      const file = parts[4];
+      if (!SEGMENT.test(stem) || !SEGMENT.test(file) || stem.includes('..') || file.includes('..')) return null;
+      return {
+        file: join(dataDir, harness, stem, 'attachments', file),
+        type: 'application/octet-stream',
+        harness,
+        stem,
+        attachment: true,
+      };
+    }
+    // Folder layout: /sessions/<harness>/<stem>/<file>
+    if (parts.length === 3) {
+      const stem = parts[2];
+      if (!SEGMENT.test(stem) || stem.includes('..')) return null;
+      // Bare stem with no file — not a route.
+      if (!stem.includes('.')) return null;
+      // Legacy flat: /sessions/<harness>/<stem>.json
+      const file = stem;
+      if (file.endsWith('.events.jsonl')) {
+        return { file: join(dataDir, harness, file), type: 'application/x-ndjson; charset=utf-8' };
+      }
+      if (file.endsWith('.json')) {
+        return {
+          file: join(dataDir, harness, file),
+          type: 'application/json; charset=utf-8',
+          harness,
+          stem: file.slice(0, -'.json'.length),
+        };
+      }
+      return null;
+    }
+    if (parts.length === 4) {
+      const stem = parts[2];
+      const file = parts[3];
+      if (!SEGMENT.test(stem) || !SEGMENT.test(file) || stem.includes('..') || file.includes('..')) return null;
+      if (file.endsWith('.events.jsonl')) {
+        return { file: join(dataDir, harness, stem, file), type: 'application/x-ndjson; charset=utf-8' };
+      }
+      if (file.endsWith('.json')) {
+        return {
+          file: join(dataDir, harness, stem, file),
+          type: 'application/json; charset=utf-8',
+          harness,
+          stem: file.slice(0, -'.json'.length),
+        };
+      }
+      return null;
+    }
     return null;
   };
 
@@ -464,8 +573,36 @@ export function createMonitorServer({
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    // Service worker must be cacheable enough to update; APIs stay no-store.
+    if (url.pathname === '/sw.js' || url.pathname.startsWith('/workbox-')) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+      res.setHeader('Service-Worker-Allowed', '/');
+    } else if (
+      url.pathname === '/manifest.webmanifest'
+      || url.pathname.startsWith('/icons/')
+      || url.pathname === '/favicon.svg'
+    ) {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    } else {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
     res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    // PWA splash / login / SSO — before the session gate.
+    if (await handleAuthHttp(req, res, {
+      url,
+      dataDir,
+      readBody,
+      sendJson,
+      mcpPort: boundMcpPort,
+    })) {
+      return;
+    }
+
+    // Console APIs require a session once auth is configured (or setup first).
+    if (enforceAuthGate(req, res, { url, dataDir, sendJson })) {
+      return;
+    }
 
     // Localhost MCP protocol endpoint (Streamable HTTP JSON-RPC).
     if (await handleMcpRpcRequest(req, res, {
@@ -881,6 +1018,102 @@ export function createMonitorServer({
       return;
     }
 
+    // CAO (CLI Agent Orchestrator): status + profile/connection CRUD proxied to
+    // local cao-server. Profiles are the writable provider connections.
+    {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts[0] === 'cao') {
+        const section = parts[1] || null;
+        const profileName = parts[2] ? decodeURIComponent(parts[2]) : null;
+        try {
+          if (!section && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await collectCaoStatus({ force: true }));
+            return;
+          }
+          if (section === 'providers' && (req.method === 'GET' || req.method === 'HEAD')) {
+            const status = await collectCaoStatus({ force: true });
+            sendJson(res, 200, { providers: status.providers || [], serverUp: status.serverUp });
+            return;
+          }
+          if (section === 'profiles' && !profileName && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await listCaoProfiles());
+            return;
+          }
+          if (section === 'profiles' && !profileName && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 200_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const name = String(body.name || '').trim();
+            const content = typeof body.content === 'string' && body.content.trim()
+              ? body.content
+              : buildProfileDocument({
+                name,
+                provider: body.provider,
+                model: body.model,
+                description: body.description,
+                body: body.body,
+              });
+            const created = await createCaoProfile({ name, content });
+            sendJson(res, 201, { ...created, name, parsed: parseProfileDocument(content) });
+            return;
+          }
+          if (section === 'profiles' && profileName && (req.method === 'GET' || req.method === 'HEAD')) {
+            const source = await readCaoProfileSource(profileName);
+            const parsed = parseProfileDocument(source.content);
+            const editable = !source.profile?.builtin;
+            sendJson(res, 200, { ...source, parsed, editable });
+            return;
+          }
+          if (section === 'profiles' && profileName && req.method === 'PUT') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 200_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const name = String(body.name || profileName).trim();
+            const content = typeof body.content === 'string' && body.content.trim()
+              ? body.content
+              : buildProfileDocument({
+                name,
+                provider: body.provider,
+                model: body.model,
+                description: body.description,
+                body: body.body,
+              });
+            const updated = await updateCaoProfile(profileName, { content });
+            sendJson(res, 200, { ...updated, name: profileName, parsed: parseProfileDocument(content) });
+            return;
+          }
+          if (section === 'profiles' && profileName && req.method === 'DELETE') {
+            sendJson(res, 200, await deleteCaoProfile(profileName));
+            return;
+          }
+          sendJson(res, section ? 405 : 404, { error: section ? 'method not allowed' : 'not found' });
+          return;
+        } catch (err) {
+          const code = err?.code === 'ENOENT' ? 404
+            : err?.code === 'EEXIST' ? 409
+              : err?.code === 'EINVAL' ? 400
+                : err?.code === 'ECONN' || err?.status === 0 ? 503
+                  : err?.status >= 400 && err?.status < 600 ? err.status
+                    : 500;
+          sendJson(res, code, {
+            error: err?.message || 'cao api failed',
+            ...(err?.data?.detail ? { detail: err.data.detail } : {}),
+          });
+          return;
+        }
+      }
+    }
+
     // Sidebar Explorer: one bounded walk of the workspace source tree. Depth and
     // entry caps come from the query so a huge folder can never blow up the
     // response; VCS and build output are skipped server-side, and any folder over
@@ -972,6 +1205,12 @@ export function createMonitorServer({
           ...(patch.agentAllowDenyRevertMinutes !== undefined
             ? { agentAllowDenyRevertMinutes: Number(patch.agentAllowDenyRevertMinutes) }
             : {}),
+          // The Default endpoint's model list and the extra endpoint list pass
+          // through untouched: normalizeMonitorSettings owns their shape (it
+          // splits the comma-delimited field itself) and settingsToDisk owns the
+          // per-endpoint credential encryption, so no key can leave as plaintext.
+          ...(patch.agentModels !== undefined ? { agentModels: patch.agentModels } : {}),
+          ...(patch.agentEndpoints !== undefined ? { agentEndpoints: patch.agentEndpoints } : {}),
         };
         // Omit agentApiKey from the patch to leave the existing encrypted secret unchanged.
         // Empty string clears it. Legacy agentAuthToken maps to agentApiKey when present.
@@ -979,6 +1218,23 @@ export function createMonitorServer({
           update.agentApiKey = patch.agentApiKey;
         } else if (typeof patch.agentAuthToken === 'string') {
           update.agentApiKey = patch.agentAuthToken;
+        }
+        // Console auth (Settings → Auth). Password plaintext is hashed here; omit
+        // secrets to keep prior values (same pattern as agent API keys).
+        if (patch.auth && typeof patch.auth === 'object') {
+          const authPatch = { ...patch.auth };
+          if (authPatch.local && typeof authPatch.local === 'object') {
+            const local = { ...authPatch.local };
+            if (typeof local.password === 'string') {
+              if (local.password) local.passwordHash = hashPassword(local.password);
+              delete local.password;
+            }
+            authPatch.local = local;
+          }
+          update.auth = mergeAuthPatch(
+            loadMonitorSettings(dataDir).auth,
+            authPatch,
+          );
         }
         const settings = saveMonitorSettings(dataDir, update);
         // Refresh listener detail on the dashboard without inventing session events.
@@ -1239,19 +1495,26 @@ export function createMonitorServer({
       return;
     }
 
-    // GET /kusa/models — models the configured endpoint advertises (GET /models).
-    // A single-model endpoint still returns one entry, so the picker defaults to it.
-    // Each entry carries whether it can see images: the composer needs that before
-    // a prompt is sent, so attaching a picture can warn instead of silently drop
-    // it. The judgement is the one the agent loop uses (model-capabilities.mjs),
-    // so the picker and the request can never disagree.
+    // GET /kusa/models — models EVERY active endpoint has, grouped by endpoint
+    // name: the composer's Model picker lists all of them under the endpoint they
+    // belong to, so the group heading is what tells the user which credentials a
+    // pick would use. Each endpoint with a base URL is active — its group merges
+    // declared ids with what its own GET /models advertises. `groups` is what the
+    // picker needs; `models` stays the flat union so an older page still works.
     if (req.method === 'GET' && url.pathname === '/kusa/models') {
       const settings = loadMonitorSettings(dataDir);
-      const listed = await listAgentModels(settings);
+      const listed = await listAgentModelGroups(settings);
+      const withCapability = (ids) => (
+        Array.isArray(ids) ? ids : []
+      ).map((id) => ({ id, vision: supportsVision(id) }));
       sendJson(res, 200, {
         backend: settings?.agentBackend === 'opencode' ? 'opencode' : 'native',
         default: listed.default,
-        models: listed.models.map((id) => ({ id, vision: supportsVision(id) })),
+        groups: listed.groups.map((group) => ({
+          name: group.name,
+          models: withCapability(group.models),
+        })),
+        models: withCapability(listed.groups.flatMap((group) => group.models)),
       });
       return;
     }

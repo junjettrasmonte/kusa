@@ -1,4 +1,4 @@
-import { SUBTAB_ICONS } from './SubTabIcons.jsx';
+import { SubTabIcon } from './SubTabIcons.jsx';
 
 /**
  * The sub-views of one rail section, as a context menu hanging beside the rail
@@ -65,7 +65,7 @@ export function RailSubmenu({
             }`}
             onClick={() => onChange(id)}
           >
-            {SUBTAB_ICONS[id]}
+            <SubTabIcon id={id} />
             {labels[id]}
           </button>
         );
