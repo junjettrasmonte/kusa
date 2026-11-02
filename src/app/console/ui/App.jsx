@@ -429,10 +429,9 @@ async function readSseChat(res, onEvent) {
     onEvent({ ...data, type });
     // A user Stop ends the stream with `stopped` instead of `done` — both are a
     // final frame, and the partial reply comes back in `text` either way.
-    if (type === 'done' || type === 'stopped') finalPayload = data;
-    if (type === 'error') {
-      throw new Error(data.message || 'kusa chat failed');
-    }
+    // Model/endpoint failures end with `error` the same way: a settled turn
+    // that keeps the transcript and paints a styled error card (not a throw).
+    if (type === 'done' || type === 'stopped' || type === 'error') finalPayload = data;
   };
 
   const drain = () => {
@@ -1159,10 +1158,18 @@ export default function App() {
         || liveSnap.thinking;
 
       const turnId = payload?.turnId || null;
+      const isError = payload?.type === 'error';
+      const errorText = isError
+        ? String(payload?.text || payload?.message || textOut || 'kusa chat failed')
+        : '';
       const assistantMsg = {
         id: newMessageId(),
         role: 'assistant',
-        text: textOut || (thinkingOut || tools.length ? '' : '(empty response)'),
+        // Keep any thinking/tools already streamed this turn; the error card
+        // replaces only the reply body so a mid-turn failure still shows work.
+        text: isError
+          ? errorText
+          : (textOut || (thinkingOut || tools.length ? '' : '(empty response)')),
         thinking: thinkingOut || '',
         tools,
         parts: parts.length ? parts : undefined,
@@ -1170,6 +1177,7 @@ export default function App() {
         turnId: turnId || undefined,
         backend: payload?.backend || null,
         stopped: payload?.type === 'stopped' ? true : undefined,
+        ...(isError ? { error: true } : {}),
       };
 
       setKusaSessions((prev) => {
@@ -1226,10 +1234,11 @@ export default function App() {
             {
               id: newMessageId(),
               role: 'assistant',
-              text: `Agent error: ${err?.message || err}`,
+              text: String(err?.message || err || 'kusa chat failed'),
               thinking: '',
               tools: [],
               at: Date.now(),
+              error: true,
             },
           ],
         };
@@ -1279,7 +1288,14 @@ export default function App() {
   async function sendKusaMessage(
     sessionKey,
     text,
-    { editMessageId = null, mode = null, model = null, approvalMode = null, attachments = null } = {},
+    {
+      editMessageId = null,
+      mode = null,
+      model = null,
+      endpointId = null,
+      approvalMode = null,
+      attachments = null,
+    } = {},
   ) {
     if (!canPersistSettings) {
       window.alert('Kusă chat needs the local server (npm run kusa:serve).');
@@ -1303,7 +1319,13 @@ export default function App() {
     // re-reads history, so an attachment-only turn must survive here too or the
     // model would see a bare "Attached file" note with no owner.
     const history = kept
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .filter((m) => (
+        (m.role === 'user' || m.role === 'assistant')
+        // Failed turns stay in the transcript UI but must not re-enter the
+        // model as assistant content on the next Send.
+        && m.error !== true
+        && !/^Agent error:\s*/i.test(String(m.text || ''))
+      ))
       .map((m) => ({
         role: m.role,
         text: m.text,
@@ -1354,6 +1376,9 @@ export default function App() {
           title: `Kusă ${sessionId}`.trim(),
           mode,
           model,
+          // Which Endpoints card the Model pick sat under — probed-only picks
+          // need this or resolveAgentEndpoint falls through to Default.
+          endpointId,
           approvalMode,
           // The composer's files for THIS prompt. The server normalises them
           // again (see normalizeAttachments) so a hand-edited record cannot
@@ -1370,10 +1395,11 @@ export default function App() {
       const assistantMsg = {
         id: newMessageId(),
         role: 'assistant',
-        text: `Agent error: ${err?.message || err}`,
+        text: String(err?.message || err || 'kusa chat failed'),
         thinking: '',
         tools: [],
         at: Date.now(),
+        error: true,
       };
       const errSession = {
         ...busySession,
@@ -1491,12 +1517,19 @@ export default function App() {
    * Settings → Kusă agent. Written straight to disk so a refresh — even mid-turn —
    * reopens the chat with the same pickers.
    */
-  async function updateKusaSessionOptions(sessionKey, { mode = null, rules = null, model = null } = {}) {
+  async function updateKusaSessionOptions(sessionKey, {
+    mode = null,
+    rules = null,
+    model = null,
+    endpointId = null,
+  } = {}) {
     if (!canPersistSettings || !sessionKey) return;
     const patch = {
       ...(mode ? { mode } : {}),
       ...(rules ? { rules } : {}),
       ...(model ? { model } : {}),
+      // Allow clearing back to Default when the user picks a Default model.
+      ...(endpointId != null ? { endpointId: String(endpointId).trim() } : {}),
     };
     if (!Object.keys(patch).length) return;
     const session = kusaSessions.find((s) => s.key === sessionKey);
@@ -1625,6 +1658,7 @@ export default function App() {
             await sendKusaMessage(sessionKey, text, {
               mode: options.mode || null,
               model: options.model || null,
+              endpointId: options.endpointId || null,
               approvalMode: options.approvalMode || null,
               // The files the composer staged when the prompt was queued: a
               // flushed prompt must behave exactly as pressing Send then did.
@@ -1688,6 +1722,7 @@ export default function App() {
         await sendKusaMessage(sessionKey, text, {
           mode: options.mode || null,
           model: options.model || null,
+          endpointId: options.endpointId || null,
           approvalMode: options.approvalMode || null,
           attachments: options.attachments || null,
         });

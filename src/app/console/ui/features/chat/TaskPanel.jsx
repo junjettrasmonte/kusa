@@ -63,7 +63,7 @@ export const TASK_PREVIEW_CHARS = 120;
  * form. The rows themselves refresh on every monitor poll (one second), which is
  * what keeps the counter moving after each step instead of only at the end.
  */
-export function TaskStack({ tasks, expanded = true }) {
+export function TaskStack({ tasks, expanded = true, dock = 'bottom', onDockToggle = null, onClose = null }) {
   const total = tasks.length;
   if (!total || !expanded) return null;
   const done = tasks.filter((task) => task?.status === 'completed').length;
@@ -83,6 +83,9 @@ export function TaskStack({ tasks, expanded = true }) {
       maxHeightPx={TASK_MAX_HEIGHT_PX}
       summary={summary}
       ariaLabel="Session task list"
+      dock={dock}
+      onDockToggle={onDockToggle}
+      onClose={onClose}
     >
       {tasks.map((task, index) => (
         <TaskRow key={task?.id || `task-${index}`} task={task} index={index} />

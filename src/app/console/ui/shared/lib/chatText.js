@@ -128,6 +128,42 @@ export function answeredAskText(ask) {
 }
 
 /**
+ * Whether an assistant row is a failed turn (model/endpoint error), not a
+ * normal reply. Legacy rows stored the failure as `Agent error: …` text before
+ * the `error` flag existed.
+ * @param {object | null | undefined} msg
+ */
+export function isAgentErrorMessage(msg) {
+  if (!msg || msg.role !== 'assistant') return false;
+  if (msg.error === true) return true;
+  return /^Agent error:\s*/i.test(String(msg.text || ''));
+}
+
+/**
+ * Human-readable body for an agent/model failure. Strips the legacy
+ * `Agent error:` prefix and unwraps `Model endpoint HTTP N: <json>` payloads
+ * (including Google's `[{ error: { message } }]` shape) down to the message.
+ * @param {object | string | null | undefined} msgOrText
+ */
+export function agentErrorDisplayText(msgOrText) {
+  let raw = typeof msgOrText === 'string'
+    ? msgOrText
+    : String(msgOrText?.text || '');
+  raw = raw.replace(/^Agent error:\s*/i, '').trim();
+  const httpMatch = raw.match(/^Model endpoint HTTP (\d+):\s*([\s\S]*)$/i);
+  if (httpMatch) {
+    let detail = httpMatch[2].trim();
+    try {
+      const data = JSON.parse(detail);
+      const entry = Array.isArray(data) ? data[0] : data;
+      detail = String(entry?.error?.message || entry?.message || detail).trim();
+    } catch { /* keep detail */ }
+    return detail || `Model endpoint HTTP ${httpMatch[1]}`;
+  }
+  return raw || 'Something went wrong talking to the model.';
+}
+
+/**
  * Rough context-window estimate for the composer meter (~4 chars per token).
  * The endpoint reports no usage, so this is an estimate of what a turn would
  * send: the transcript plus whatever is streaming now.

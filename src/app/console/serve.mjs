@@ -1512,6 +1512,9 @@ export function createMonitorServer({
         default: listed.default,
         groups: listed.groups.map((group) => ({
           name: group.name,
+          // Empty for Default; extras carry their settings id so the composer
+          // can send it back on POST /kusa/chat and route probed-only picks.
+          endpointId: String(group.endpointId || ''),
           models: withCapability(group.models),
         })),
         models: withCapability(listed.groups.flatMap((group) => group.models)),
@@ -1672,6 +1675,7 @@ export function createMonitorServer({
         const options = {
           mode: String(patch?.options?.mode || ''),
           model: String(patch?.options?.model || ''),
+          endpointId: String(patch?.options?.endpointId || ''),
           approvalMode: String(patch?.options?.approvalMode || ''),
           ...(normalizeAttachments(patch?.options?.attachments).length
             ? { attachments: normalizeAttachments(patch?.options?.attachments) }
@@ -1869,6 +1873,12 @@ export function createMonitorServer({
       // Composer pickers: Ask/Plan/Agent mode, approval rules, model override.
       const agentMode = normalizeAgentMode(body.mode);
       const requestedModel = typeof body.model === 'string' ? body.model.trim().slice(0, 200) : '';
+      // Which Endpoints card the Model pick sat under (agentEndpoints[].id).
+      // Empty / absent = Default (agentBaseUrl). Required for probed-only picks
+      // that were never typed into that card's Models field.
+      const requestedEndpointId = typeof body.endpointId === 'string'
+        ? body.endpointId.trim().slice(0, 80)
+        : '';
       // Ask rules carry their timeout default ('ask-deny' | 'ask-allow'); legacy
       // 'ask' normalizes to 'ask-deny'. Empty means "follow settings".
       const approvalRules = String(body.approvalMode || '').trim()
@@ -1954,6 +1964,7 @@ export function createMonitorServer({
             hooks,
             mode: agentMode,
             modelOverride: requestedModel,
+            endpointIdOverride: requestedEndpointId,
             approvalMode: initialApproval,
             // "Send now" while busy: the loop polls this per streamed chunk, so
             // the prompt interrupts the in-flight model call and the agent
@@ -2043,11 +2054,14 @@ export function createMonitorServer({
             if (hooks.enabled) {
               hooks.agentStop({ stopReason: 'error', status: 'error' });
             }
-            // Persist a visible error row as a normal completion so refresh still
-            // sees a settled transcript (clients treat stream `error` as throw).
+            // Settled error frame (like `stopped`): client treats it as a final
+            // payload, persists error:true on the assistant row, and keeps the
+            // user prompt + prior transcript. Do not prefix "Agent error:" —
+            // the harness renders a styled card from the message body.
             finishTurnJob(jobKey, {
-              type: 'done',
-              text: `Agent error: ${err?.message || 'kusa chat failed'}`,
+              type: 'error',
+              message: err?.message || 'kusa chat failed',
+              text: err?.message || 'kusa chat failed',
               thinking: '',
               toolTrace: [],
               turnId: job.turnId,
@@ -2072,6 +2086,7 @@ export function createMonitorServer({
           hooks,
           mode: agentMode,
           modelOverride: requestedModel,
+          endpointIdOverride: requestedEndpointId,
           approvalMode: approvalRules || settings?.agentApprovalMode,
           onSteer: queueKey ? () => drainSteering(queueKey) : undefined,
           signal: turnAbort.signal,

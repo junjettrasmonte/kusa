@@ -26,9 +26,9 @@ export function KusaLogo({ className = 'h-7 w-7', title = 'Kusă' }) {
             repeatCount="indefinite"
           />
           <circle cx="160" cy="150" r="65" />
-          <circle cx="160" cy="56" r="29" />
-          <circle cx="78.6" cy="197" r="29" />
-          <circle cx="241.4" cy="197" r="29" />
+          <circle cx="254" cy="150" r="29" />
+          <circle cx="113" cy="68.6" r="29" />
+          <circle cx="113" cy="231.4" r="29" />
         </g>
         <path d="M145 123 V177" />
         <path d="M145 150 L177 123" />

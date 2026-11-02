@@ -263,16 +263,12 @@ export async function readClipboardAttachment() {
     return null;
   }
   for (const item of (items || [])) {
-    try {
-      const transfer = item.getDataTransfer();
-      if (transfer) return await dataTransferToAttachment(transfer);
-    } catch {
-      /* this browser hands back no DataTransfer — fall through to the parts */
-    }
     for (const type of (item?.types || [])) {
       if (!String(type).startsWith('image/')) continue;
       try {
-        const blob = await item.getImage(type);
+        // Standard ClipboardItem API — getType(mime), not a non-standard getImage.
+        const blob = await item.getType(type);
+        if (!blob) continue;
         const extension = String(type).split('/')[1] || 'png';
         const file = new File(
           [blob],
@@ -281,11 +277,13 @@ export async function readClipboardAttachment() {
         );
         return await dataTransferToAttachment({
           kind: 'image',
+          name: file.name,
           size: file.size,
+          mime: type,
           dataUrl: await readAsDataUrl(file),
         });
       } catch {
-        return null;
+        /* this type could not be read — try the next */
       }
     }
   }
@@ -330,9 +328,23 @@ export async function readClipboardViaPaste(maxMs = PASTE_READ_WINDOW_MS) {
 async function awaitPasteEvent(maxMs) {
   const transfer = await new Promise((resolve) => {
     let timer = 0;
-    const onPaste = (event) => {
+    const finish = (value) => {
       document.removeEventListener('paste', onPaste);
-      resolve(event?.clipboardData || null);
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
+    const onPaste = (event) => {
+      // Composer onPaste may already have staged files from this gesture —
+      // leave that path alone rather than attaching the same payload twice.
+      if (event.defaultPrevented) {
+        finish(null);
+        return;
+      }
+      // Consume the gesture: attaching the clipboard and letting the browser
+      // also type it into the composer would put the same payload on the
+      // message twice.
+      event.preventDefault();
+      finish(event?.clipboardData || null);
     };
     // Document-wide, not composer-only: a paste into the textarea bubbles here,
     // and a paste made anywhere else on the page still carries the clipboard.
@@ -341,8 +353,7 @@ async function awaitPasteEvent(maxMs) {
       timer = setTimeout(() => {
         // The window closed with no gesture: take the listener back off the
         // page, or the next unrelated paste would be read as this request.
-        document.removeEventListener('paste', onPaste);
-        resolve(null);
+        finish(null);
       }, Math.max(1000, Number(maxMs) || PASTE_READ_WINDOW_MS));
     } catch {
       /* no timer: the next paste, or nothing, decides */
@@ -368,28 +379,41 @@ async function clipboardRecordFrom(source) {
   let mime = '';
   let dataUrl = '';
   let text = '';
-  const items = source?.items;
-  if (items) {
-    // A DataTransfer: the newest entry wins, which is what a paste hands over.
-    for (const entry of items) {
-      const type = String(entry?.type || '');
-      if (type.startsWith('image/')) {
-        const file = new File([entry], '', { type });
+
+  // Paste events hand a DataTransfer. Prefer files (screenshots / copied
+  // images) then plain text — never wrap a DataTransferItem as a File blob.
+  if (typeof source.getData === 'function' || source.files || source.items) {
+    const files = source.files ? [...source.files] : [];
+    for (const file of files) {
+      if (!file?.type?.startsWith('image/')) continue;
+      kind = 'image';
+      name = file.name || clipboardName(String(file.type).split('/')[1] || 'png');
+      size = file.size;
+      mime = file.type;
+      dataUrl = await readAsDataUrl(file);
+      break;
+    }
+    if (!kind && source.items) {
+      for (const entry of source.items) {
+        const type = String(entry?.type || '');
+        if (!type.startsWith('image/')) continue;
+        const file = typeof entry.getAsFile === 'function' ? entry.getAsFile() : null;
+        if (!file) continue;
         kind = 'image';
-        name = file.name;
+        name = file.name || clipboardName(type.split('/')[1] || 'png');
         size = file.size;
         mime = type;
         dataUrl = await readAsDataUrl(file);
-      } else if (type === 'text/plain' || type === 'text/html') {
-        const file = new File([entry], '', { type });
-        const body = await readAsText(file);
-        if (type === 'text/html' && !body.trim()) continue;
+        break;
+      }
+    }
+    if (!kind && typeof source.getData === 'function') {
+      const body = String(source.getData('text/plain') || '');
+      if (body.trim()) {
         kind = 'text';
-        name = '';
-        size = file.size;
-        mime = type;
-        dataUrl = '';
         text = body;
+        size = body.length;
+        mime = 'text/plain';
       }
     }
   } else {
@@ -423,6 +447,50 @@ async function clipboardRecordFrom(source) {
  */
 export async function dataTransferToAttachment(source) {
   return await clipboardRecordFrom(source);
+}
+
+/**
+ * Files/images from a paste or drop `DataTransfer` — not plain text.
+ *
+ * Plain text stays for the composer to type in; a screenshot, a dragged file,
+ * or a clipboard image becomes an attachment. Dedupes by name+size so a
+ * transfer that lists the same file in both `files` and `items` only yields
+ * one entry.
+ * @param {DataTransfer|null|undefined} transfer
+ * @returns {File[]}
+ */
+export function collectTransferFiles(transfer) {
+  if (!transfer) return [];
+  /** @type {File[]} */
+  const out = [];
+  const seen = new Set();
+  function push(file) {
+    if (!file) return;
+    const key = `${file.name || ''}:${file.size || 0}:${file.type || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(file);
+  }
+  if (transfer.files?.length) {
+    for (const file of transfer.files) push(file);
+  }
+  if (transfer.items) {
+    for (const entry of transfer.items) {
+      if (entry?.kind && entry.kind !== 'file') continue;
+      const type = String(entry?.type || '');
+      // Prefer real files; also take clipboard images that only appear as items.
+      if (entry?.kind === 'file' || type.startsWith('image/')) {
+        const file = typeof entry.getAsFile === 'function' ? entry.getAsFile() : null;
+        push(file);
+      }
+    }
+  }
+  return out;
+}
+
+/** True when a paste/drop carries at least one file or image to attach. */
+export function transferHasFiles(transfer) {
+  return collectTransferFiles(transfer).length > 0;
 }
 
 function clipboardName(extension) {

@@ -9,6 +9,7 @@ import {
   AGENT_MODE_OPTIONS,
   AttachmentPicker,
   ComposerDropdown,
+  ComposerOptionsMenu,
   ContextRing,
   DictateIcon,
   RULE_OPTIONS,
@@ -17,26 +18,45 @@ import {
 } from './ComposerControls.jsx';
 import {
   ATTACHMENT_LIMITS,
+  collectTransferFiles,
   fileToAttachment,
   pickFilesWithOsDialog,
   readClipboardAttachment,
   readClipboardViaPaste,
   stageAttachments,
+  transferHasFiles,
 } from '#ui/shared/lib/attachments.js';
-import { AttachmentChips } from '#ui/shared/AttachmentChips.jsx';
-import { PopupList, PopupToggle } from './PopupList.jsx';
+import { PopupToggle } from './PopupList.jsx';
 import { estimateContextTokens, truncate } from '#ui/shared/lib/chatText.js';
+import { readLocal, writeLocal } from '#ui/shared/lib/storage.js';
 import {
   ArrowUpIcon,
+  AttachmentsIcon,
   ChevronDownIcon,
   QueueIcon,
   StopIcon,
   TaskIcon,
 } from './ChatGlyphs.jsx';
+import { AttachmentStack } from './AttachmentPanel.jsx';
 import { ClippedGrow, lastPendingGate } from './ClippedGrow.jsx';
 import { QueueStack } from './QueuePanel.jsx';
 import { TaskStack } from './TaskPanel.jsx';
 import { ChatTurn } from './TranscriptTurns.jsx';
+
+/** Persist drawer dock across reloads — shared by Queue / Tasks / Attachments. */
+const DRAWER_DOCK_KEY = 'kusa.chat.drawerDock';
+const DRAWER_HEIGHT_KEY = 'kusa.chat.drawerHeight';
+const DRAWER_WIDTH_KEY = 'kusa.chat.drawerWidth';
+/** Bottom-dock default ≈ summary chrome + former 168px list cap. */
+const DRAWER_DEFAULT_HEIGHT = 200;
+const DRAWER_DEFAULT_WIDTH = 320;
+const DRAWER_MIN_HEIGHT = 120;
+const DRAWER_MIN_WIDTH = 200;
+
+function readDrawerSize(key, fallback) {
+  const raw = Number(readLocal(key, String(fallback)));
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
 
 // The composer pickers belong to a chat session, not to the browser: each
 // session keeps its own Mode / Rule / Model in its `.chat.json` record (see
@@ -70,6 +90,11 @@ function initialComposerModel(options, defaults) {
   const saved = options?.model;
   if (typeof saved === 'string' && saved.trim()) return saved.trim();
   return defaults?.model || '';
+}
+
+function initialComposerEndpointId(options) {
+  const saved = options?.endpointId;
+  return typeof saved === 'string' ? saved.trim() : '';
 }
 
 // An agent block is height-capped to this share of the transcript panel while
@@ -148,8 +173,8 @@ export function ChatHarness({
   // React state, the POST body and the chat sidecar unchanged.
   const [attachments, setAttachments] = useState([]);
   // Why the last Add Files / Paste From Clipboard did not add what the user
-  // expected: the caps, a cancelled dialog, an empty clipboard. Rendered beside
-  // the chips, and never invented — '' means there is nothing to say.
+  // expected: the caps, a cancelled dialog, an empty clipboard. Shown on the
+  // Attachments drawer summary, and never invented — '' means nothing to say.
   const [attachNote, setAttachNote] = useState('');
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -171,6 +196,10 @@ export function ChatHarness({
   const [agentMode, setAgentMode] = useState(() => initialComposerMode(sessionOptions, agentDefaults));
   const [approvalRules, setApprovalRules] = useState(() => initialComposerRule(sessionOptions, agentDefaults));
   const [modelChoice, setModelChoice] = useState(() => initialComposerModel(sessionOptions, agentDefaults));
+  // Which Endpoints card the Model pick sat under (agentEndpoints[].id). Empty
+  // means Default. Kept beside the model id so a probed-only Google / proxy
+  // pick still routes there after refresh — resolveAgentEndpoint needs it.
+  const [endpointChoice, setEndpointChoice] = useState(() => initialComposerEndpointId(sessionOptions));
   const [models, setModels] = useState([]);
   // Which backend the configured endpoint runs ('opencode' | 'native' | '').
   // OpenCode takes a prompt string, so it never receives an image part — the
@@ -180,11 +209,94 @@ export function ChatHarness({
     60,
     Math.max(1, Math.floor(Number(agentDefaults?.approvalTimeoutMinutes) || 2)),
   );
-  // Queue and Task List share one slot above the composer (tab-style): only
-  // one list is open at a time. Off hides the rows only — the server still
-  // holds queued prompts / tasks, so closing a tab can never drop them.
+  // Queue, Task List, and Attachments share one slot above the composer
+  // (tab-style): only one list is open at a time. Off hides the rows only —
+  // the server still holds queued prompts / tasks, and staged files stay on
+  // the draft, so closing a tab can never drop them.
   const [queueExpanded, setQueueExpanded] = useState(true);
   const [tasksExpanded, setTasksExpanded] = useState(false);
+  const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
+  // Shared dock for all three drawers: bottom (above the composer) or right
+  // (flush left of the right rail). One icon on every open drawer toggles it.
+  const [drawerDock, setDrawerDock] = useState(() => (
+    readLocal(DRAWER_DOCK_KEY, 'bottom') === 'right' ? 'right' : 'bottom'
+  ));
+  // Shared size for the open dock — height when bottom, width when right —
+  // capped at half the chat shell (measured below).
+  const [drawerHeight, setDrawerHeight] = useState(() => (
+    readDrawerSize(DRAWER_HEIGHT_KEY, DRAWER_DEFAULT_HEIGHT)
+  ));
+  const [drawerWidth, setDrawerWidth] = useState(() => (
+    readDrawerSize(DRAWER_WIDTH_KEY, DRAWER_DEFAULT_WIDTH)
+  ));
+  const shellRef = useRef(null);
+  const [shellSize, setShellSize] = useState({ w: 0, h: 0 });
+
+  function toggleDrawerDock() {
+    setDrawerDock((current) => {
+      const next = current === 'right' ? 'bottom' : 'right';
+      writeLocal(DRAWER_DOCK_KEY, next);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    const el = shellRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      setShellSize({ w: Math.floor(rect.width), h: Math.floor(rect.height) });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const maxDrawerHeight = shellSize.h > 0 ? Math.floor(shellSize.h / 2) : 480;
+  const maxDrawerWidth = shellSize.w > 0 ? Math.floor(shellSize.w / 2) : 480;
+  const heightPx = Math.min(Math.max(drawerHeight, DRAWER_MIN_HEIGHT), maxDrawerHeight);
+  const widthPx = Math.min(Math.max(drawerWidth, DRAWER_MIN_WIDTH), maxDrawerWidth);
+
+  function beginDrawerResize(axis, event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    handle.setPointerCapture?.(pointerId);
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startH = heightPx;
+    const startW = widthPx;
+    const onMove = (moveEvent) => {
+      if (axis === 'height') {
+        // Handle sits on the top edge: drag up grows the drawer.
+        const next = Math.min(
+          maxDrawerHeight,
+          Math.max(DRAWER_MIN_HEIGHT, startH + (startY - moveEvent.clientY)),
+        );
+        setDrawerHeight(next);
+        writeLocal(DRAWER_HEIGHT_KEY, String(next));
+      } else {
+        // Handle sits on the left edge: drag left grows the drawer.
+        const next = Math.min(
+          maxDrawerWidth,
+          Math.max(DRAWER_MIN_WIDTH, startW + (startX - moveEvent.clientX)),
+        );
+        setDrawerWidth(next);
+        writeLocal(DRAWER_WIDTH_KEY, String(next));
+      }
+    };
+    const onUp = () => {
+      handle.releasePointerCapture?.(pointerId);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
   const messages = session?.messages || [];
   const busy = session?.status === 'busy' || session?.status === 'thinking';
   const live = session?.live;
@@ -339,8 +451,13 @@ export function ChatHarness({
   }
 
   function selectComposerModel(next) {
+    // Look up the live listing so the heading's endpointId rides with the pick —
+    // probed-only ids never appear in that endpoint's declared Models list.
+    const record = models.find((entry) => entry.id === next);
+    const endpointId = record?.endpointId || '';
     setModelChoice(next);
-    commitPick({ model: next });
+    setEndpointChoice(endpointId);
+    commitPick({ model: next, endpointId });
   }
 
   // Reload whenever Settings changes an endpoint / declared model list — the
@@ -368,6 +485,7 @@ export function ChatHarness({
           : (Array.isArray(body?.models) ? [{ name: DEFAULT_MODEL_GROUP, models: body.models }] : []);
         const records = groups.flatMap((group) => {
           const name = String(group?.name || '').trim() || DEFAULT_MODEL_GROUP;
+          const endpointId = String(group?.endpointId || '').trim();
           return (Array.isArray(group?.models) ? group.models : [])
             .map((entry) => {
               const id = (typeof entry === 'string' ? entry : entry?.id || entry?.model || '')?.trim();
@@ -375,19 +493,21 @@ export function ChatHarness({
               const vision = typeof entry === 'object' && typeof entry.vision === 'boolean'
                 ? entry.vision
                 : null;
-              return { id, vision, group: name };
+              return { id, vision, group: name, endpointId };
             })
             .filter(Boolean);
         });
         if (cancelled) return;
         const fallback = agentDefaults?.model || body?.default || '';
         setModelBackend(body?.backend === 'opencode' ? 'opencode' : 'native');
-        setModels(records.length ? records : (fallback ? [{ id: fallback, vision: null, group: DEFAULT_MODEL_GROUP }] : []));
+        setModels(records.length
+          ? records
+          : (fallback ? [{ id: fallback, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }] : []));
       } catch {
         if (cancelled) return;
         setModelBackend('');
         setModels(agentDefaults?.model
-          ? [{ id: agentDefaults.model, vision: null, group: DEFAULT_MODEL_GROUP }]
+          ? [{ id: agentDefaults.model, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }]
           : []);
       }
     };
@@ -397,17 +517,31 @@ export function ChatHarness({
 
   // A single-model endpoint still gets a picker — it defaults to that model. The
   // group each model came from rides through to the dropdown, which draws a
-  // heading per endpoint, so a pick is never read as another endpoint's
-  // credentials (the same rule resolveAgentEndpoint applies when it is sent).
-  const modelOptions = (models.length ? models : (modelChoice ? [{ id: modelChoice, vision: null, group: DEFAULT_MODEL_GROUP }] : []))
-    .map((record) => ({ id: record.id, label: record.id, group: record.group || DEFAULT_MODEL_GROUP }));
-  const activeModel = modelOptions.some((option) => option.id === modelChoice)
-    ? modelChoice
-    : (modelOptions[0]?.id || modelChoice);
+  // heading per endpoint, and endpointId is what resolveAgentEndpoint uses when
+  // the pick is sent (declared Models alone cannot cover probed-only ids).
+  const modelOptions = (models.length
+    ? models
+    : (modelChoice
+      ? [{ id: modelChoice, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: endpointChoice }]
+      : []))
+    .map((record) => ({
+      id: record.id,
+      label: record.id,
+      group: record.group || DEFAULT_MODEL_GROUP,
+      endpointId: record.endpointId || '',
+    }));
+  const matchedModel = modelOptions.find((option) => option.id === modelChoice);
+  const activeModel = matchedModel?.id || modelOptions[0]?.id || modelChoice;
+  // Prefer the live listing's endpoint for this id; fall back to the saved pick
+  // so a send before /kusa/models returns still keeps the extra endpoint.
+  const activeEndpointId = matchedModel
+    ? (matchedModel.endpointId || '')
+    : (endpointChoice || modelOptions[0]?.endpointId || '');
   const composerOptions = {
     mode: agentMode,
     approvalMode: approvalRules,
     model: activeModel,
+    endpointId: activeEndpointId,
   };
   // Whether an image attached to THIS draft can actually reach the model. A
   // text-only endpoint cannot see one, and OpenCode takes a prompt string, so
@@ -428,6 +562,7 @@ export function ChatHarness({
     setAgentMode(initialComposerMode(sessionOptions, agentDefaults));
     setApprovalRules(initialComposerRule(sessionOptions, agentDefaults));
     setModelChoice(initialComposerModel(sessionOptions, agentDefaults));
+    setEndpointChoice(initialComposerEndpointId(sessionOptions));
   }
 
   const onSessionOptionsRef = useRef(onSessionOptions);
@@ -441,6 +576,7 @@ export function ChatHarness({
       mode: over.mode !== undefined ? over.mode : agentMode,
       rules: over.rules !== undefined ? over.rules : approvalRules,
       model: over.model !== undefined ? over.model : modelChoice,
+      endpointId: over.endpointId !== undefined ? over.endpointId : endpointChoice,
     });
   };
   // No blanket write-back. Every pick reaches the record through commitPick, and
@@ -549,13 +685,50 @@ export function ChatHarness({
   }, [session?.key]);
 
   /**
+   * Merge freshly-read attachment records into the draft and open the
+   * Attachments drawer. Shared by the paperclip menu, composer paste, and
+   * composer drop so the three paths cannot disagree about caps or notes.
+   */
+  function commitStaged(added, emptyNote = '') {
+    const already = added.filter((attachment) =>
+      attachments.some((held) => held?.name === attachment.name && held?.size === attachment.size),
+    );
+    const { list, rejected } = stageAttachments(attachments, added);
+    setAttachments(list);
+    setAttachNote(
+      rejected.length
+        ? `not added — this message holds ${ATTACHMENT_LIMITS.files} files at most`
+        : already.length && !rejected.length && already.length === added.length
+          ? 'already on this message — it is attached once'
+          : emptyNote,
+    );
+    if (list.length) {
+      setAttachmentsExpanded(true);
+      setQueueExpanded(false);
+      setTasksExpanded(false);
+    }
+  }
+
+  /** Turn dropped/pasted File objects into staged attachment records. */
+  async function stageFiles(files) {
+    const added = [];
+    for (const file of files || []) {
+      const attachment = await fileToAttachment(file);
+      if (attachment) added.push(attachment);
+    }
+    if (!added.length) return;
+    commitStaged(added);
+  }
+
+  /**
    * One paperclip action, run the moment the user clicks it. The file chooser
    * is the operating system's own (showOpenFilePicker where the browser has it,
    * a file <input> where it does not) and the user answers it at their own
-   * pace, so this runs async: the composer never blocks, and the chips appear
-   * when the dialog answers. Nothing is invented here — a file the browser
-   * cannot read keeps its name and a note saying so, a cancelled dialog adds
-   * nothing, and an over-budget pick is refused rather than half-attached.
+   * pace, so this runs async: the composer never blocks, and the Attachments
+   * drawer opens when the dialog answers. Nothing is invented here — a file
+   * the browser cannot read keeps its name and a note saying so, a cancelled
+   * dialog adds nothing, and an over-budget pick is refused rather than
+   * half-attached.
    */
   function attachRequested(action) {
     const run = async () => {
@@ -577,7 +750,9 @@ export function ChatHarness({
             setAttachNote(PASTE_REQUEST_NOTE);
             pasted = await readClipboardViaPaste();
           }
-          if (!pasted) {
+          if (pasted) {
+            added.push(pasted);
+          } else {
             note = 'the clipboard holds no image or text to take — a normal paste types into the composer instead';
           }
         }
@@ -585,20 +760,37 @@ export function ChatHarness({
         // A chooser the browser cannot open is simply no attachment: what the
         // user already staged stays on the message.
       }
-      const already = added.filter((attachment) =>
-        attachments.some((held) => held?.name === attachment.name && held?.size === attachment.size),
-      );
-      const { list, rejected } = stageAttachments(attachments, added);
-      setAttachments(list);
-      setAttachNote(
-        rejected.length
-          ? `not added — this message holds ${ATTACHMENT_LIMITS.files} files at most`
-          : already.length
-            ? 'already on this message — it is attached once'
-            : note,
-      );
+      commitStaged(added, note);
     };
     void run();
+  }
+
+  /**
+   * Paste into the composer: files/images become attachments; plain text
+   * types into the box as usual. Same rule as a drop onto the message box.
+   */
+  function onComposerPaste(event) {
+    const transfer = event.clipboardData;
+    if (!transferHasFiles(transfer)) return;
+    event.preventDefault();
+    void stageFiles(collectTransferFiles(transfer));
+  }
+
+  function onComposerDragOver(event) {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    try {
+      event.dataTransfer.dropEffect = 'copy';
+    } catch {
+      /* some browsers reject dropEffect writes */
+    }
+  }
+
+  function onComposerDrop(event) {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void stageFiles(collectTransferFiles(event.dataTransfer));
   }
 
   function submit(event) {
@@ -617,12 +809,14 @@ export function ChatHarness({
       setDraft('');
       setAttachments([]);
       setAttachNote('');
+      setAttachmentsExpanded(false);
       return;
     }
     onSend?.(session.key, text, { ...composerOptions, attachments: staged });
     setDraft('');
     setAttachments([]);
     setAttachNote('');
+    setAttachmentsExpanded(false);
   }
 
   function onKeyDown(event) {
@@ -632,8 +826,56 @@ export function ChatHarness({
     }
   }
 
+  const drawers = (
+    <>
+      <TaskStack
+        tasks={taskItems}
+        expanded={tasksExpanded}
+        dock={drawerDock}
+        onDockToggle={toggleDrawerDock}
+        onClose={() => setTasksExpanded(false)}
+      />
+      <AttachmentStack
+        attachments={attachments}
+        expanded={attachmentsExpanded}
+        imagesReachModel={imagesReachModel}
+        note={attachNote}
+        dock={drawerDock}
+        onDockToggle={toggleDrawerDock}
+        onClose={() => setAttachmentsExpanded(false)}
+        onChange={(next) => {
+          setAttachments(next);
+          setAttachNote('');
+          if (!next.length) setAttachmentsExpanded(false);
+        }}
+      />
+      <QueueStack
+        held={heldQueue}
+        steering={steeringQueue}
+        sessionKey={session?.key}
+        onQueue={onQueue}
+        expanded={queueExpanded}
+        dock={drawerDock}
+        onDockToggle={toggleDrawerDock}
+        onClose={() => setQueueExpanded(false)}
+      />
+    </>
+  );
+
+  const drawerOpen = (
+    (queueExpanded && queueTotal > 0)
+    || (tasksExpanded && taskTotal > 0)
+    || (attachmentsExpanded && attachments.length > 0)
+  );
+  const bottomDockOpen = drawerDock === 'bottom' && drawerOpen;
+  const rightDockOpen = drawerDock === 'right' && drawerOpen;
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div
+      ref={shellRef}
+      className={`flex h-full min-h-0 ${drawerDock === 'right' ? 'flex-row' : 'flex-col'}`}
+    >
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
         ref={panelRef}
         className="min-h-0 flex-1 overflow-y-auto px-6 py-6"
@@ -669,6 +911,7 @@ export function ChatHarness({
                   );
                   setAttachments([]);
                   setAttachNote('');
+                  setAttachmentsExpanded(false);
                 }}
                 agentMaxHeight={agentMaxHeight}
                 onApproval={null}
@@ -744,57 +987,75 @@ export function ChatHarness({
       </div>
 
       {/*
-       * Task List slot: the session's plan/todos, listed above the composer
-       * like the queue is. Fixed sibling slot so the switch state survives
-       * every frame; TaskStack renders nothing while its switch is off or
-       * there are no tasks, so an idle slot stays empty.
+       * Bottom dock: drawers sit above the composer. Height is drag-resized
+       * from the top edge, capped at half the chat shell.
        */}
-      <TaskStack
-        tasks={taskItems}
-        expanded={tasksExpanded}
-      />
-
-      {/*
-       * The queue belongs to the composer, not the transcript: it is the last
-       * thing the message box produced, so it renders directly above the form
-       * and each new card slides up out of that box (see .chat-queue-in).
-       * Fixed sibling slot — the component instance (and its switch state)
-       * survives every SSE frame while prompts are held. QueueStack renders
-       * nothing while the switch is off, so this slot stays empty.
-       */}
-      <QueueStack
-        held={heldQueue}
-        steering={steeringQueue}
-        sessionKey={session?.key}
-        onQueue={onQueue}
-        expanded={queueExpanded}
-      />
+      {bottomDockOpen ? (
+        <div className="relative shrink-0" style={{ height: heightPx }}>
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-valuenow={heightPx}
+            aria-valuemin={DRAWER_MIN_HEIGHT}
+            aria-valuemax={maxDrawerHeight}
+            aria-label="Resize drawer height"
+            title="Drag to resize"
+            onPointerDown={(event) => beginDrawerResize('height', event)}
+            className="absolute inset-x-0 -top-0.5 z-10 h-2 cursor-ns-resize touch-none hover:bg-emerald-500/25"
+          />
+          <div className="flex h-full min-h-0 flex-col overflow-hidden">
+            {drawers}
+          </div>
+        </div>
+      ) : null}
 
       <form
-        className="shrink-0 border-t border-gray-800/80 bg-gray-950/70 px-4 py-3 backdrop-blur sm:px-6"
+        className="@container shrink-0 border-t border-gray-800/80 bg-gray-950/70 px-4 py-3 backdrop-blur sm:px-6"
         onSubmit={submit}
       >
-        <div className="flex flex-wrap items-center gap-2 pb-1.5">
-          <ComposerDropdown
-            title="Mode"
-            options={AGENT_MODE_OPTIONS}
-            value={agentMode}
-            onSelect={selectComposerMode}
-          />
-          <ComposerDropdown
-            title="Rule"
-            options={rulePickerOptions}
-            value={approvalRules}
-            onSelect={selectApprovalRule}
-          />
-          <ComposerDropdown
-            title="Model"
-            options={modelOptions}
-            value={activeModel}
-            onSelect={selectComposerModel}
-          />
+        {/*
+         * Composer chrome: Mode / Rule / Model + Queue / Tasks / Attachments.
+         * The form is an @container so a narrow chat column collapses even when
+         * the window is wide — below 36rem the three pickers merge into one
+         * icon menu (ComposerOptionsMenu) and the popup switches drop their
+         * names, leaving glyph + count.
+         */}
+        <div className="flex items-center gap-1.5 pb-1.5">
+          <div className="hidden min-w-0 flex-wrap items-center gap-2 @[36rem]:flex">
+            <ComposerDropdown
+              title="Mode"
+              options={AGENT_MODE_OPTIONS}
+              value={agentMode}
+              onSelect={selectComposerMode}
+            />
+            <ComposerDropdown
+              title="Rule"
+              options={rulePickerOptions}
+              value={approvalRules}
+              onSelect={selectApprovalRule}
+            />
+            <ComposerDropdown
+              title="Model"
+              options={modelOptions}
+              value={activeModel}
+              onSelect={selectComposerModel}
+            />
+          </div>
+          <div className="@[36rem]:hidden">
+            <ComposerOptionsMenu
+              mode={agentMode}
+              modeOptions={AGENT_MODE_OPTIONS}
+              onModeSelect={selectComposerMode}
+              rule={approvalRules}
+              ruleOptions={rulePickerOptions}
+              onRuleSelect={selectApprovalRule}
+              model={activeModel}
+              modelOptions={modelOptions}
+              onModelSelect={selectComposerModel}
+            />
+          </div>
           {/* Tab-style popup switches (PopupList.jsx): opening one closes the
-              other so only a single list sits above the composer. */}
+              others so only a single list sits above the composer. */}
           <PopupToggle
             className="ml-auto"
             icon={QueueIcon}
@@ -806,7 +1067,10 @@ export function ChatHarness({
             onToggle={() => {
               setQueueExpanded((open) => {
                 const next = !open;
-                if (next) setTasksExpanded(false);
+                if (next) {
+                  setTasksExpanded(false);
+                  setAttachmentsExpanded(false);
+                }
                 return next;
               });
             }}
@@ -824,7 +1088,29 @@ export function ChatHarness({
             onToggle={() => {
               setTasksExpanded((open) => {
                 const next = !open;
-                if (next) setQueueExpanded(false);
+                if (next) {
+                  setQueueExpanded(false);
+                  setAttachmentsExpanded(false);
+                }
+                return next;
+              });
+            }}
+          />
+          <PopupToggle
+            icon={AttachmentsIcon}
+            label="Attachments"
+            count={attachments.length}
+            noun="staged"
+            countClassName="text-sky-300/90"
+            activeClassName="bg-sky-500/15 text-sky-300"
+            expanded={attachmentsExpanded}
+            onToggle={() => {
+              setAttachmentsExpanded((open) => {
+                const next = !open;
+                if (next) {
+                  setQueueExpanded(false);
+                  setTasksExpanded(false);
+                }
                 return next;
               });
             }}
@@ -837,6 +1123,8 @@ export function ChatHarness({
                 ? 'border-gray-700'
                 : 'border-gray-700 focus-within:border-emerald-500/50 focus-within:ring-1 focus-within:ring-emerald-500/30'
             }`}
+            onDragOver={onComposerDragOver}
+            onDrop={onComposerDrop}
           >
             <textarea
               ref={inputRef}
@@ -844,6 +1132,7 @@ export function ChatHarness({
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={onKeyDown}
+              onPaste={onComposerPaste}
               placeholder={
                 busy
                   ? 'Kusă is working… pressing Send holds this prompt in the queue'
@@ -855,41 +1144,25 @@ export function ChatHarness({
               aria-label="Chat message"
               className="block max-h-[200px] min-h-[44px] w-full resize-none bg-transparent px-3.5 pt-3 pb-1.5 text-sm leading-relaxed text-gray-100 placeholder:text-gray-600 focus:outline-none disabled:opacity-50"
             />
-            {/*
-              * What is attached to THIS message, as chips under the input. The
-              * chips are the same component the transcript renders, so a sent
-              * message and the files that made it can never disagree — and a
-              * chip states what will actually reach the model, not what was
-              * intended.
-              */}
-            <AttachmentChips
-              attachments={attachments}
-              imagesReachModel={imagesReachModel}
-              note={attachNote}
-              editable
-              onChange={(next) => {
-                setAttachments(next);
-                setAttachNote('');
-              }}
-              className="flex flex-col gap-1.5 px-3.5 pb-1"
-            />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
-              <p className="min-w-0 flex-1 truncate px-1 text-[11px] text-gray-600">
-                {busy
-                  ? 'Generating response… · pressing Send queues the prompt · Stop ends this run and sends the next queued prompt'
-                  : editingId
-                    ? 'Editing a previous message — resend replaces everything after it'
-                    : (
-                      <>
-                        <kbd className="font-sans text-gray-500">Enter</kbd>
-                        {' '}to send
-                        <span className="mx-1.5 text-gray-700">·</span>
-                        <kbd className="font-sans text-gray-500">Shift</kbd>
-                        +
-                        <kbd className="font-sans text-gray-500">Enter</kbd>
-                        {' '}newline
-                      </>
-                    )}
+              <p className={`min-w-0 flex-1 truncate px-1 text-[11px] ${attachNote ? 'text-rose-400' : 'text-gray-600'}`}>
+                {attachNote
+                  ? attachNote
+                  : busy
+                    ? 'Generating response… · pressing Send queues the prompt · Stop ends this run and sends the next queued prompt'
+                    : editingId
+                      ? 'Editing a previous message — resend replaces everything after it'
+                      : (
+                        <>
+                          <kbd className="font-sans text-gray-500">Enter</kbd>
+                          {' '}to send
+                          <span className="mx-1.5 text-gray-700">·</span>
+                          <kbd className="font-sans text-gray-500">Shift</kbd>
+                          +
+                          <kbd className="font-sans text-gray-500">Enter</kbd>
+                          {' '}newline
+                        </>
+                      )}
               </p>
               <div className="flex shrink-0 items-center gap-0.5">
                 <ContextRing used={estimateContextTokens(messages, live)} />
@@ -969,6 +1242,35 @@ export function ChatHarness({
           </div>
         </div>
       </form>
+      </div>
+
+      {/*
+       * Right dock: same drawers, flush left of the right rail. Width is
+       * drag-resized from the left edge, capped at half the chat shell.
+       * border-l matches the rail's gray-800 edge language.
+       */}
+      {rightDockOpen ? (
+        <aside
+          className="relative flex h-full min-h-0 shrink-0 flex-col border-l border-gray-800 bg-gray-950/70"
+          style={{ width: widthPx }}
+          aria-label="Docked drawer"
+        >
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-valuenow={widthPx}
+            aria-valuemin={DRAWER_MIN_WIDTH}
+            aria-valuemax={maxDrawerWidth}
+            aria-label="Resize drawer width"
+            title="Drag to resize"
+            onPointerDown={(event) => beginDrawerResize('width', event)}
+            className="absolute inset-y-0 -left-0.5 z-10 w-2 cursor-ew-resize touch-none hover:bg-emerald-500/25"
+          />
+          <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+            {drawers}
+          </div>
+        </aside>
+      ) : null}
     </div>
   );
 }

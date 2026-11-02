@@ -70,27 +70,67 @@ function defaultAgentEndpoint(settings = {}) {
   };
 }
 
+/**
+ * Whether a declared model id matches the requested pick. Google AI Studio's
+ * OpenAI-compatible `/models` lists ids as `models/<name>`, so a typed
+ * `gemini-flash-latest` and a probed `models/gemini-flash-latest` are the same
+ * pick for routing.
+ * @param {string} declared
+ * @param {string} requested
+ */
+function modelIdMatches(declared, requested) {
+  const a = String(declared || '').trim();
+  const b = String(requested || '').trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const strip = (id) => id.replace(/^models\//, '');
+  return strip(a) === strip(b);
+}
+
+/**
+ * Build the resolved endpoint shape from one `agentEndpoints[]` entry.
+ * @param {object} entry
+ * @param {string} model
+ */
+function endpointFromExtra(entry, model) {
+  const authMode = (entry.authMode === 'apikey' || entry.authMode === 'bearer') ? 'apikey' : 'none';
+  const apiKey = String(entry.apiKey ?? '').trim();
+  return {
+    baseUrl: String(entry.baseUrl || '').trim().replace(/\/+$/, ''),
+    model,
+    headers: endpointHeaders(authMode, apiKey),
+    authMode,
+    apiKey,
+  };
+}
+
 export function resolveAgentEndpoint(settings = {}) {
   const requested = String(settings.agentModel || '').trim();
+  const requestedEndpointId = String(settings.agentEndpointId || '').trim();
   const extras = Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : [];
+  // Composer pick under an extra endpoint's heading owns that endpoint — the
+  // picker sends its id so a probed-only model (never typed into Models) still
+  // uses that base URL and key instead of falling through to Default.
+  if (requestedEndpointId) {
+    const byId = extras.find((entry) => (
+      entry
+      && typeof entry === 'object'
+      && String(entry.id || '').trim() === requestedEndpointId
+      && String(entry.baseUrl || '').trim()
+    ));
+    if (byId) {
+      return endpointFromExtra(byId, requested || defaultAgentEndpoint(settings).model);
+    }
+  }
   // Declared ids own their endpoint: an id two endpoints both offer belongs to
   // the one the user configured by name, and the model picker applies the same
   // rule when it lists it under that endpoint's heading.
   const match = extras.find((entry) => {
     if (!entry || typeof entry !== 'object') return false;
-    return Array.isArray(entry.models) && entry.models.some((id) => String(id).trim() === requested);
+    return Array.isArray(entry.models)
+      && entry.models.some((id) => modelIdMatches(id, requested));
   });
-  if (match) {
-    const authMode = (match.authMode === 'apikey' || match.authMode === 'bearer') ? 'apikey' : 'none';
-    const apiKey = String(match.apiKey ?? '').trim();
-    return {
-      baseUrl: String(match.baseUrl || '').trim().replace(/\/+$/, ''),
-      model: requested,
-      headers: endpointHeaders(authMode, apiKey),
-      authMode,
-      apiKey,
-    };
-  }
+  if (match) return endpointFromExtra(match, requested);
   return defaultAgentEndpoint(settings);
 }
 
@@ -175,18 +215,21 @@ export async function listAgentModelGroups(settings = {}) {
       const apiKey = String(entry.apiKey ?? '').trim();
       const declared = declaredModelList(entry.models);
       return {
+        id: String(entry.id || '').trim(),
         name: String(entry.name ?? '').trim() || `Endpoint ${index + 1}`,
         baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
         headers: endpointHeaders(authMode, apiKey),
         declared,
       };
     });
-  /** @type {Array<{ name: string, models: Array<string> }>} */
+  /** @type {Array<{ name: string, endpointId: string, models: Array<string> }>} */
   const groups = [];
-  // Only a DECLARED id claims ownership of it. A list an endpoint merely
-  // advertises does not — two servers that both happen to offer gpt-4o-mini
-  // would otherwise steal the id from each other, and the pick would resolve to
-  // credentials the heading does not show.
+  // Only a DECLARED id claims ownership of it when the composer sends no
+  // endpointId. A list an endpoint merely advertises does not steal a bare id
+  // from Default — two servers that both happen to offer gpt-4o-mini would
+  // otherwise resolve to credentials the heading does not show. The picker's
+  // endpointId (group.endpointId) is what makes a probed-only pick under an
+  // extra heading use that endpoint.
   const declaredByExtras = new Set(extras.flatMap((entry) => entry.declared));
   const current = defaultAgentEndpoint(settings);
   const probedDefault = await probeEndpointModels(current.baseUrl, current.headers);
@@ -201,12 +244,12 @@ export async function listAgentModelGroups(settings = {}) {
       .filter((id) => id && !offered.has(id));
     if (!ids.length) continue;
     ids.forEach((id) => offered.add(id));
-    groups.push({ name: entry.name, models: ids });
+    groups.push({ name: entry.name, endpointId: entry.id, models: ids });
   }
   return {
     default: resolveAgentEndpoint(settings).model,
     groups: [
-      ...(merged.length ? [{ name: DEFAULT_ENDPOINT_LABEL, models: merged }] : []),
+      ...(merged.length ? [{ name: DEFAULT_ENDPOINT_LABEL, endpointId: '', models: merged }] : []),
       ...groups,
     ],
   };
@@ -795,10 +838,13 @@ export async function runOpenAiAgentLoop({
 
     if (!response.ok) {
       const raw = await response.text().catch(() => '');
-      let detail = raw.slice(0, 400) || response.statusText;
+      let detail = raw.slice(0, 800) || response.statusText;
       try {
         const data = raw ? JSON.parse(raw) : {};
-        detail = data?.error?.message || data?.message || detail;
+        // Google AI Studio (and some proxies) answer as `[{ error: { message } }]`
+        // rather than OpenAI's `{ error: { message } }`.
+        const entry = Array.isArray(data) ? data[0] : data;
+        detail = entry?.error?.message || entry?.message || detail;
       } catch { /* keep */ }
       const err = new Error(`Model endpoint HTTP ${response.status}: ${detail}`);
       err.code = 'EHTTP';

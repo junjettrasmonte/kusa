@@ -58,7 +58,7 @@ export function QueueGap({ active = false }) {
   );
 }
 
-export function QueueStack({ held, steering, sessionKey, onQueue, expanded = true }) {
+export function QueueStack({ held, steering, sessionKey, onQueue, expanded = true, dock = 'bottom', onDockToggle = null, onClose = null }) {
   const [dragId, setDragId] = useState(null);
   // Insert slot: `{ beforeId }` (null beforeId = append after the last held row).
   const [dropGap, setDropGap] = useState(null);
@@ -154,6 +154,9 @@ export function QueueStack({ held, steering, sessionKey, onQueue, expanded = tru
       maxHeightPx={QUEUE_MAX_HEIGHT_PX}
       summary={summary}
       ariaLabel="Queued prompts"
+      dock={dock}
+      onDockToggle={onDockToggle}
+      onClose={onClose}
     >
         {showGap && dropGap.beforeId === displayHeld[0]?.id ? <QueueGap active /> : null}
         {displayHeld.map((entry, index) => (

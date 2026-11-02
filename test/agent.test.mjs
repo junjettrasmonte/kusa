@@ -371,6 +371,44 @@ describe('agent settings', () => {
     assert.equal(fallback.apiKey, 'sk-default');
   });
 
+  it('resolveAgentEndpoint routes by agentEndpointId for probed-only picks', () => {
+    // Google AI Studio (and similar) advertise models/… ids that were never
+    // typed into the Models field — the composer sends the heading's endpoint
+    // id so those picks do not fall through to Default.
+    const settings = {
+      agentBaseUrl: 'https://strata.example/v1',
+      agentModel: 'models/gemini-flash-latest',
+      agentAuthMode: 'apikey',
+      agentApiKey: 'sk-default',
+      agentEndpointId: 'google-ai-studio',
+      agentEndpoints: [
+        {
+          id: 'google-ai-studio',
+          name: 'Google AI Studio',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+          authMode: 'apikey',
+          apiKey: 'sk-google',
+          models: [],
+        },
+      ],
+    };
+    const hit = resolveAgentEndpoint(settings);
+    assert.equal(hit.baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
+    assert.equal(hit.apiKey, 'sk-google');
+    assert.equal(hit.model, 'models/gemini-flash-latest');
+
+    const prefixed = resolveAgentEndpoint({
+      ...settings,
+      agentEndpointId: '',
+      agentModel: 'models/gemini-flash-latest',
+      agentEndpoints: [{
+        ...settings.agentEndpoints[0],
+        models: ['gemini-flash-latest'],
+      }],
+    });
+    assert.equal(prefixed.baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
+  });
+
   it('listAgentModelGroups lists models from every active endpoint, grouped by name', async () => {
     const listed = await listAgentModelGroups({
       agentBaseUrl: 'https://api.openai.com/v1',
@@ -379,12 +417,14 @@ describe('agent settings', () => {
       agentAuthMode: 'none',
       agentEndpoints: [
         {
+          id: 'acme-proxy',
           name: 'Acme Proxy',
           baseUrl: 'https://api.acme.test/v1',
           authMode: 'none',
           models: ['acme-one', 'acme-two'],
         },
         {
+          id: 'local',
           name: 'Local',
           baseUrl: 'http://127.0.0.1:11434/v1',
           authMode: 'none',
@@ -395,6 +435,9 @@ describe('agent settings', () => {
     assert.equal(listed.default, 'gpt-4o-mini');
     const names = listed.groups.map((group) => group.name);
     assert.deepEqual(names, [DEFAULT_ENDPOINT_LABEL, 'Acme Proxy', 'Local']);
+    assert.equal(listed.groups[0].endpointId, '');
+    assert.equal(listed.groups[1].endpointId, 'acme-proxy');
+    assert.equal(listed.groups[2].endpointId, 'local');
     assert.deepEqual(listed.groups[0].models, ['gpt-4o-mini', 'o3-mini']);
     assert.deepEqual(listed.groups[1].models, ['acme-one', 'acme-two']);
     assert.deepEqual(listed.groups[2].models, ['llama3.1', 'mistral']);

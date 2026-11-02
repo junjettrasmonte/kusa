@@ -1,12 +1,12 @@
 /* Kusă console shell service worker — caches static UI for offline splash. */
-const CACHE = 'kusa-shell-v1';
+const CACHE = 'kusa-shell-v2';
 const SHELL = [
   './dashboard.html',
   './dashboard.js',
   './dashboard.css',
   './favicon.svg',
   './manifest.webmanifest',
-  './icons/icon.svg',
+  './icons/pwa.svg',
 ];
 
 self.addEventListener('install', (event) => {

@@ -15,7 +15,7 @@
       "purpose": "any"
     },
     {
-      "src": "./icons/icon.svg",
+      "src": "./icons/pwa.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"

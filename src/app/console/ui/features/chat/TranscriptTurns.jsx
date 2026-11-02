@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { MarkdownBody, looksLikeMarkdown } from '#ui/shared/MarkdownBody.jsx';
-import { assistantParts, groupAssistantParts, truncate } from '#ui/shared/lib/chatText.js';
+import {
+  agentErrorDisplayText,
+  assistantParts,
+  groupAssistantParts,
+  isAgentErrorMessage,
+  truncate,
+} from '#ui/shared/lib/chatText.js';
 import {
   AgentIcon,
   ArrowUpIcon,
@@ -119,8 +125,8 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
           ) : null}
         </div>
         {/*
-         * The files this prompt carried, as the same chips the composer showed
-         * when they were staged — a sent message states what it actually held,
+         * The files this prompt carried, as a compact chip strip (same shape
+         * the Attachments drawer staged). A sent message states what it held,
          * so a transcript read months later and the prompt that produced it
          * cannot disagree.
          */}
@@ -223,12 +229,35 @@ export function splitAtVisibleRows(parts) {
  * by the user's own reply bubble, which is a new turn and opens a new
  * container.
  */
+/**
+ * Settled model/endpoint failure — not an assistant reply. Keeps the user
+ * prompt and prior turns above it; the next Send can retry.
+ */
+function AgentErrorCard({ text }) {
+  const body = agentErrorDisplayText(text);
+  return (
+    <div
+      className="mt-1 rounded-md border border-rose-900/70 bg-rose-950/50 px-3 py-2.5 text-sm"
+      role="alert"
+    >
+      <div className="flex items-start gap-2">
+        <StatusGlyph status="error" className="mt-0.5" />
+        <div className="min-w-0 flex-1">
+          <p className="font-medium text-rose-300">Model error</p>
+          <p className="mt-1 whitespace-pre-wrap leading-relaxed text-rose-100/90">{body}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function AssistantTurn({ msg, onApproval = null, onAsk = null, agentMaxHeight = null }) {
   const parts = assistantParts(msg);
   const blocks = splitAtVisibleRows(parts);
   const replyText = typeof msg.text === 'string' ? msg.text : '';
   const streaming = Boolean(msg.streaming);
   const stopped = Boolean(msg.stopped);
+  const errored = isAgentErrorMessage(msg);
   // An unresolved question or approval is the user's turn, not the agent's:
   // drop the empty container that follows it, so the container whose work led
   // to that row stays the live one (and keeps its "Awaiting approval…" label).
@@ -308,6 +337,7 @@ export function AssistantTurn({ msg, onApproval = null, onAsk = null, agentMaxHe
         replyText={isLast ? replyText : ''}
         streaming={streaming && isLast}
         stopped={stopped && isLast}
+        error={errored && isLast}
         isLast={isLast}
         gate={gateOf(gateRow)}
         agentMaxHeight={agentMaxHeight}
@@ -315,6 +345,10 @@ export function AssistantTurn({ msg, onApproval = null, onAsk = null, agentMaxHe
       />
     );
   });
+  // Pure failure with no thinking/tools: just the error card under the user turn.
+  if (errored && !parts.length) {
+    return <AgentErrorCard text={replyText} />;
+  }
   // Unsplit turns keep their original DOM: no wrapper around a single container.
   if (blocks.length === 1) return rendered[0];
   return (
@@ -346,6 +380,7 @@ export function AgentSegment({
   replyText = '',
   streaming = false,
   stopped = false,
+  error = false,
   isLast = true,
   gate = null,
   agentMaxHeight = null,
@@ -357,7 +392,9 @@ export function AgentSegment({
   const thinkingStream = Boolean(
     streaming && !replyText && (lastPart?.type === 'thinking' || !parts.length),
   );
-  const hasReply = Boolean(replyText && replyText !== '(empty response)');
+  // Error turns carry the failure text in `replyText` but must not render it as
+  // a normal assistant reply — AgentErrorCard owns that body.
+  const hasReply = Boolean(!error && replyText && replyText !== '(empty response)');
   // The gate this container's work stopped at, as far as its header is
   // concerned: a pending one is still the user's turn, so the rail says which
   // kind of wait it is. A settled one is NOT handed back to the header — its
@@ -416,9 +453,21 @@ export function AgentSegment({
           : hasProgress
             ? 'Working…'
             : 'Thinking…'
-    : stopped
-      ? 'Stopped'
-      : 'Agent';
+    : error
+      ? 'Failed'
+      : stopped
+        ? 'Stopped'
+        : 'Agent';
+
+  // Error-only turns (no thinking/tools) skip the collapsible rail — the card
+  // below is the whole row. Mid-turn failures keep the rail so prior work stays.
+  if (error && !hasProgress) {
+    return (
+      <div className="text-sm">
+        <AgentErrorCard text={replyText} />
+      </div>
+    );
+  }
 
   return (
     <div className="text-sm">
@@ -429,7 +478,7 @@ export function AgentSegment({
         aria-expanded={open}
       >
         <Chevron open={open} className="mt-0.5 shrink-0 text-gray-600 group-hover:text-gray-400" />
-        <AgentIcon className={`mt-0.5 ${streaming ? 'text-gray-400' : 'text-gray-500 group-hover:text-gray-400'}`} />
+        <AgentIcon className={`mt-0.5 ${streaming ? 'text-gray-400' : error ? 'text-rose-400' : 'text-gray-500 group-hover:text-gray-400'}`} />
         {streaming ? (
           <StatusGlyph
             // Only an OPEN gate is hoisted out of this rail; the container
@@ -443,8 +492,10 @@ export function AgentSegment({
             }
             className="mt-0.5"
           />
+        ) : error ? (
+          <StatusGlyph status="error" className="mt-0.5" />
         ) : null}
-        <span className={`min-w-0 truncate ${streaming ? 'chat-shimmer text-gray-300' : 'text-gray-300'}`}>
+        <span className={`min-w-0 truncate ${streaming ? 'chat-shimmer text-gray-300' : error ? 'text-rose-300' : 'text-gray-300'}`}>
           <span className="font-medium">{label}</span>
           {!streaming && stepSummary ? (
             <span className="text-gray-600">
@@ -532,7 +583,9 @@ export function AgentSegment({
           user still has to answer are always reachable. A container closed by
           such an interruption owns no reply at all: that exchange ended with
           the user, so it gets no footer. */}
-      {hasReply ? (
+      {error ? (
+        <AgentErrorCard text={replyText} />
+      ) : hasReply ? (
         <div className="mt-2">
           {looksLikeMarkdown(replyText) || streaming ? (
             <MarkdownBody text={replyText} variant="chat" />

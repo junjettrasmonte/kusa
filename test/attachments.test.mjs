@@ -8,8 +8,10 @@ import {
 } from '#features/chat/data/attachments.mjs';
 import { supportsVision, visionLabel } from '#features/agent/model-capabilities.mjs';
 import {
+  collectTransferFiles,
   dataTransferToAttachment,
   stageAttachments,
+  transferHasFiles,
 } from '#ui/shared/lib/attachments.js';
 import { createTurnJob, turnUserMessage } from '#features/chat/data/chat-turn.mjs';
 import { attachmentPayload, composeUserTurn } from '#features/agent/openai-loop.mjs';
@@ -148,6 +150,21 @@ describe('attachments', () => {
     assert.equal(row.attachments.length, 1);
     // No text and no files is not a prompt at all.
     assert.equal(turnUserMessage(createTurnJob({ queueKey: 'kusa:none', sessionId: 'none' })), null);
+  });
+
+  it('collectTransferFiles takes files and images, not plain text', () => {
+    const image = new File([new Uint8Array([1, 2, 3])], 'shot.png', { type: 'image/png' });
+    const transfer = {
+      files: [image],
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+      getData: () => 'words that stay in the composer',
+    };
+    const files = collectTransferFiles(transfer);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].name, 'shot.png');
+    assert.equal(transferHasFiles(transfer), true);
+    assert.equal(transferHasFiles({ files: [], items: [], getData: () => 'just text' }), false);
+    assert.equal(transferHasFiles(null), false);
   });
 
   it('a clipboard paste becomes the same record a pasted file would make', async () => {

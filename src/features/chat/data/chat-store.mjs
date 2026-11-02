@@ -199,6 +199,14 @@ function normalizeSessionOptions(raw) {
   }
   const model = typeof raw.model === 'string' ? raw.model.trim().slice(0, 200) : '';
   if (model) out.model = model;
+  // Which agentEndpoints[] id the Model pick sat under (empty = Default). Kept
+  // so a probed-only model still routes to that endpoint after a refresh.
+  // Empty string is intentional: writeSessionConfig merges with the prior
+  // record, so omitting the key would leave a stale extra-endpoint id in place
+  // after the user switched back to Default.
+  if (Object.hasOwn(raw, 'endpointId')) {
+    out.endpointId = typeof raw.endpointId === 'string' ? raw.endpointId.trim().slice(0, 80) : '';
+  }
   return Object.keys(out).length ? out : null;
 }
 

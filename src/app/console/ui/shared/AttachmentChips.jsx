@@ -8,17 +8,16 @@ import { PaperclipIcon } from '#ui/features/chat/ChatGlyphs.jsx';
 import { ImageViewer } from '#ui/shared/ImageViewer.jsx';
 
 /**
- * Attachment drawer for a message — composer (editable) and transcript (read).
+ * Compact attachment chips for a transcript user bubble (read-only by default).
  *
- * One component serves both places a message appears: the composer (the files
- * staged for the prompt being typed) and the transcript (the files a sent
- * prompt carried). Same names, same notes, same caps — so the two can never
- * disagree about what was actually sent.
+ * The composer's staged files live in the Attachments PopupList drawer
+ * (AttachmentPanel.jsx) — same shape, same notes, same ImageViewer — so a sent
+ * message and the files that made it can never disagree. This component is the
+ * chip strip under a bubble, not that drawer.
  *
- * In the composer (`editable`), rows are selectable: click toggles selection,
- * Remove drops the selected files from the staged list, and an image row opens
- * the image viewer popup (zoom / fit / actual size via its context-menu icon).
- * In the transcript the same viewer is available; there is nothing to remove.
+ * When `editable` is set (rare outside tests), rows are selectable and Remove
+ * drops the selected files; an image row opens the image viewer popup (zoom /
+ * fit / actual size via its context-menu icon).
  *
  * A row states what WILL happen rather than what was intended:
  *  - a picture the picked model cannot see is marked "not seen by this model";

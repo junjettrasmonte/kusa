@@ -184,6 +184,74 @@ export function TaskIcon({ expanded = true, className = 'text-gray-500' }) {
   );
 }
 
+/**
+ * Attachments toggle glyph — same paperclip wire as PaperclipIcon / the
+ * composer AttachmentIcon, at PopupToggle size. Expanded shows the clip alone
+ * (the list is on screen); collapsed adds a small plus like QueueIcon so the
+ * control still reads as "files exist, open the list".
+ */
+export function AttachmentsIcon({ expanded = true, className = 'text-gray-500' }) {
+  return (
+    <svg
+      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+      {expanded ? null : <path d="M19 3v4" />}
+      {expanded ? null : <path d="M17 5h4" />}
+    </svg>
+  );
+}
+
+/**
+ * Drawer dock toggle — lucide `panel-right` / `panel-bottom`. Shows the
+ * destination the click will move to (not the current dock), so a bottom-docked
+ * drawer offers "dock to the right" and a right-docked drawer offers bottom.
+ */
+export function DrawerDockIcon({ dock = 'bottom', className = 'text-gray-500' }) {
+  const toRight = dock !== 'right';
+  return (
+    <svg
+      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      {toRight ? <path d="M15 3v18" /> : <path d="M3 15h18" />}
+    </svg>
+  );
+}
+
+/** Small × for closing a drawer list (same size as DrawerDockIcon). */
+export function DrawerCloseIcon({ className = 'text-gray-500' }) {
+  return (
+    <svg
+      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </svg>
+  );
+}
+
 /** lucide brain (verbatim path data) for thinking rows. */
 export function BrainIcon({ className = 'text-gray-500' }) {
   return (

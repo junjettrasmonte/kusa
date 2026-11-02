@@ -126,13 +126,21 @@ export async function runKusaAgent({
   onAsk = null,
   mode = null,
   modelOverride = null,
+  endpointIdOverride = null,
   onSteer = null,
   onOptions = null,
   attachments = null,
 }) {
-  const scopedSettings = modelOverride
-    ? { ...settings, agentModel: String(modelOverride).trim() }
-    : settings;
+  // Composer Model pick: model id + optional endpoint id (which heading the
+  // pick sat under). endpointId is what routes a probed-only Google / proxy
+  // model to that endpoint instead of Default.
+  const scopedSettings = {
+    ...settings,
+    ...(modelOverride ? { agentModel: String(modelOverride).trim() } : {}),
+    ...(endpointIdOverride != null
+      ? { agentEndpointId: String(endpointIdOverride).trim() }
+      : {}),
+  };
   const withMode = {
     ...scopedSettings,
     ...(approvalMode ? { agentApprovalMode: approvalMode } : {}),
