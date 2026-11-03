@@ -1,7 +1,7 @@
 export function ServeDownScreen({ onRetry, busy }) {
   return (
     <div className="flex h-full min-h-screen flex-col items-center justify-center bg-gradient-to-b from-gray-950 via-gray-900 to-amber-950/30 px-6 text-center">
-      <img src="./favicon.svg" alt="" className="mb-6 h-14 w-14 opacity-90" />
+      <img src="/favicon.svg" alt="" className="mb-6 h-14 w-14 opacity-90" />
       <h1 className="font-serif text-4xl tracking-tight text-gray-50">Kusă</h1>
       <p className="mt-3 max-w-md text-sm text-gray-400">
         The console shell is ready, but the local server is not running.

@@ -49,12 +49,12 @@ function publishDashboardAssets() {
       if (!html.includes('name="theme-color"')) {
         html = html.replace(
           '</head>',
-          '  <link rel="manifest" href="./manifest.webmanifest">\n  <meta name="theme-color" content="#030712">\n</head>',
+          '  <link rel="manifest" href="/manifest.webmanifest">\n  <meta name="theme-color" content="#030712">\n</head>',
         );
       } else {
         html = html.replace(
           '</head>',
-          '  <link rel="manifest" href="./manifest.webmanifest">\n</head>',
+          '  <link rel="manifest" href="/manifest.webmanifest">\n</head>',
         );
       }
       writeFileSync(resolve(here, 'dashboard.html'), html);

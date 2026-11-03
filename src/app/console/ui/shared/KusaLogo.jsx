@@ -1,4 +1,4 @@
-/** Kusă brand mark — rotating tangent circles with a stationary K. */
+/** Kusă brand mark — tangent circles with a stationary K. */
 export function KusaLogo({ className = 'h-7 w-7', title = 'Kusă' }) {
   return (
     <svg
@@ -16,20 +16,10 @@ export function KusaLogo({ className = 'h-7 w-7', title = 'Kusă' }) {
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <g>
-          <animateTransform
-            attributeName="transform"
-            type="rotate"
-            from="0 160 150"
-            to="360 160 150"
-            dur="8s"
-            repeatCount="indefinite"
-          />
-          <circle cx="160" cy="150" r="65" />
-          <circle cx="254" cy="150" r="29" />
-          <circle cx="113" cy="68.6" r="29" />
-          <circle cx="113" cy="231.4" r="29" />
-        </g>
+        <circle cx="160" cy="150" r="65" />
+        <circle cx="254" cy="150" r="29" />
+        <circle cx="113" cy="68.6" r="29" />
+        <circle cx="113" cy="231.4" r="29" />
         <path d="M145 123 V177" />
         <path d="M145 150 L177 123" />
         <path d="M145 150 L177 177" />

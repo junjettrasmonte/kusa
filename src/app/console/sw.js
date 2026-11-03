@@ -1,17 +1,23 @@
 /* Kusă console shell service worker — caches static UI for offline splash. */
-const CACHE = 'kusa-shell-v2';
+const CACHE = 'kusa-shell-v5';
 const SHELL = [
-  './dashboard.html',
-  './dashboard.js',
-  './dashboard.css',
-  './favicon.svg',
-  './manifest.webmanifest',
-  './icons/pwa.svg',
+  '/dashboard.html',
+  '/dashboard.js',
+  '/dashboard.css',
+  '/favicon.svg',
+  '/icons/pwa-192.png',
+  '/icons/pwa-512.png',
 ];
 
 self.addEventListener('install', (event) => {
+  // Precache best-effort: one missing asset must not abort SW install.
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()),
+    caches.open(CACHE).then(async (cache) => {
+      await Promise.all(
+        SHELL.map((url) => cache.add(url).catch(() => undefined)),
+      );
+      return self.skipWaiting();
+    }),
   );
 });
 
@@ -28,6 +34,11 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
+
+  // Manifest is never intercepted — Chrome's installability check must see
+  // the live file, not a stale Cache Storage entry.
+  if (url.pathname === '/manifest.webmanifest') return;
+
   // Never cache API / auth / live data — network only.
   if (
     url.pathname === '/health'
@@ -51,10 +62,26 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Install icons: network-first so desktop icon updates land immediately.
+  if (url.pathname.startsWith('/icons/')) {
+    event.respondWith(
+      fetch(request).then((response) => {
+        if (response && response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => cache.put(request, copy));
+        }
+        return response;
+      }).catch(() => caches.match(request).then((cached) => {
+        if (cached) return cached;
+        throw new Error('offline');
+      })),
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(request).then((cached) => {
       if (cached) {
-        // Stale-while-revalidate for shell assets when serve is up.
         event.waitUntil(
           fetch(request).then((response) => {
             if (response && response.ok) {
@@ -73,7 +100,7 @@ self.addEventListener('fetch', (event) => {
         return response;
       }).catch(async () => {
         if (request.mode === 'navigate') {
-          const fallback = await caches.match('./dashboard.html');
+          const fallback = await caches.match('/dashboard.html');
           if (fallback) return fallback;
         }
         throw new Error('offline');

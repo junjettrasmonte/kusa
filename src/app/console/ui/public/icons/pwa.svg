@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="Kus">
-  <!-- Dedicated PWA / maskable mark: white strokes on black, static, padded safe zone. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="Kusă">
+  <!-- Dedicated PWA / maskable mark: white on black, static, ~40% safe-zone padding. -->
   <rect width="320" height="320" fill="#000"/>
   <g
     fill="none"
@@ -7,7 +7,7 @@
     stroke-width="20"
     stroke-linecap="round"
     stroke-linejoin="round"
-    transform="translate(160 160) scale(0.72) translate(-160 -150)"
+    transform="translate(160 160) scale(0.58) translate(-160 -150)"
   >
     <circle cx="160" cy="150" r="65"/>
     <circle cx="254" cy="150" r="29"/>

@@ -6,7 +6,7 @@ import './index.css';
 
 if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {
       /* offline / file:// — splash still works without SW */
     });
   });

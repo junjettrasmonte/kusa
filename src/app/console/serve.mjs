@@ -472,22 +472,26 @@ export function createMonitorServer({
       }
     }
   } catch { /* pageDir may be incomplete during first boot */ }
+  // PWA icons are resolved per-request so a new PNG/SVG under icons/ is
+  // served without restarting (manifest updates land while --live is up).
   const iconsDir = join(pageDir, 'icons');
-  if (existsSync(iconsDir)) {
-    try {
-      for (const name of readdirSync(iconsDir)) {
-        if (!/\.(png|svg|ico|webp)$/i.test(name)) continue;
-        const type = name.endsWith('.svg')
-          ? 'image/svg+xml'
-          : name.endsWith('.ico')
-            ? 'image/x-icon'
-            : name.endsWith('.webp')
-              ? 'image/webp'
-              : 'image/png';
-        routes[`/icons/${name}`] = { file: join(iconsDir, name), type };
-      }
-    } catch { /* ignore */ }
-  }
+  const ICON_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(png|svg|ico|webp)$/i;
+  const iconRoute = (pathname) => {
+    if (!pathname.startsWith('/icons/')) return null;
+    const name = pathname.slice('/icons/'.length);
+    if (!ICON_NAME.test(name) || name.includes('/') || name.includes('..')) return null;
+    const file = join(iconsDir, name);
+    if (!existsSync(file)) return null;
+    const lower = name.toLowerCase();
+    const type = lower.endsWith('.svg')
+      ? 'image/svg+xml'
+      : lower.endsWith('.ico')
+        ? 'image/x-icon'
+        : lower.endsWith('.webp')
+          ? 'image/webp'
+          : 'image/png';
+    return { file, type };
+  };
   // /sessions/<harness>/<session>/<file>  — session folder layout
   // /sessions/<harness>/<session>/attachments/<file>  — persisted composer files
   // Legacy flat paths (/sessions/<harness>/<file>) still resolve for old links.
@@ -577,9 +581,12 @@ export function createMonitorServer({
     if (url.pathname === '/sw.js' || url.pathname.startsWith('/workbox-')) {
       res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       res.setHeader('Service-Worker-Allowed', '/');
+    } else if (url.pathname === '/manifest.webmanifest') {
+      // Installability reads this on every visit — never serve a stale copy
+      // that still lists SVG-only icons (Chrome then hides Install).
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     } else if (
-      url.pathname === '/manifest.webmanifest'
-      || url.pathname.startsWith('/icons/')
+      url.pathname.startsWith('/icons/')
       || url.pathname === '/favicon.svg'
     ) {
       res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -2212,7 +2219,7 @@ export function createMonitorServer({
       res.writeHead(302, { Location: '/dashboard.html' }).end();
       return;
     }
-    const route = routes[url.pathname] || sessionRoute(url.pathname);
+    const route = routes[url.pathname] || iconRoute(url.pathname) || sessionRoute(url.pathname);
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found\n');
       return;
