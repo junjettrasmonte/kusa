@@ -19,6 +19,18 @@ describe('cursor stream map', () => {
     assert.equal(parsed.args.path, 'a.txt');
   });
 
+  it('captures the model reported on system init', () => {
+    const state = emptyCursorStreamState();
+    applyCursorStreamEvent(state, {
+      type: 'system',
+      subtype: 'init',
+      session_id: 'sess-model',
+      model: 'composer-1',
+    });
+    assert.equal(state.cliSessionId, 'sess-model');
+    assert.equal(state.model, 'composer-1');
+  });
+
   it('streams thinking, tools, and content deltas', () => {
     const state = emptyCursorStreamState();
     const events = [];

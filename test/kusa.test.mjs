@@ -113,7 +113,7 @@ function persistedText(dir) {
   const { index } = readPersisted(dir);
   for (const rel of Object.values(index.sessionFiles || {})) {
     chunks.push(readFileSync(join(dir, rel), 'utf8'));
-    // Canonical: sessions/<stem>/events.jsonl beside lane.json.
+    // Canonical: agents/<stem>/events.jsonl beside lane.json.
     // Legacy: <stem>.json → <stem>.events.jsonl (flat or in-folder).
     const events = /(?:^|\/)lane\.json$/.test(rel)
       ? rel.replace(/lane\.json$/, 'events.jsonl')
@@ -1708,7 +1708,7 @@ describe('sessionEnd does not invent sidebar rows', () => {
     assert.equal(
       listChatSessions(dir).some((s) => s.id === 'ghost'),
       false,
-      'tool-only Cursor blips stay out of /kusa/sessions',
+      'tool-only Cursor blips stay out of /kusa/agents',
     );
 
     const state = feed(dir, 'sessionEnd', {}, {
@@ -2515,13 +2515,13 @@ describe('kusa chat persistence', () => {
     const { port } = server.address();
     const base = `http://127.0.0.1:${port}`;
     try {
-      let res = await fetch(`${base}/kusa/sessions`);
+      let res = await fetch(`${base}/kusa/agents`);
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.equal(body.sessions.length, 1);
       assert.equal(body.sessions[0].messages[0].text, 'legacy');
 
-      res = await fetch(`${base}/kusa/sessions`, {
+      res = await fetch(`${base}/kusa/agents`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: 'mig-2' }),

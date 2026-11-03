@@ -7,7 +7,7 @@
  *
  * Rows are the SAME {id,content,status} shape the monitor already keeps for
  * Cursor's TodoWrite and they live in the SAME per-session Task List
- * (`.kusa/sessions/<stem>/tasks.json` → the lane's `todos`), so the chat Task
+ * (`.kusa/agents/<stem>/tasks.json` → the lane's `todos`), so the chat Task
  * Stack and the dashboard show the model's plan instead of a second copy of it.
  * The tool is the single writer: the monitor picks the rows up through the
  * existing tasks.json → lane hydration, so nothing double-applies them.

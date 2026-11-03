@@ -9,12 +9,20 @@ import { FILE_TOOL_DEFS, createFileTools, openaiToolSchemas as fileToolSchemas }
 import { TERMINAL_TOOL_DEFS, createTerminalTools } from '#features/agent/terminal.mjs';
 import { BROWSER_TOOL_DEFS, createBrowserTools } from '#features/agent/browser.mjs';
 import { TASK_TOOL_DEFS, createTaskTools, taskToolSchemas } from '#features/agent/tasks.mjs';
+import { createPlanTools, planToolSchemas } from '#features/agent/plans.mjs';
+import { createAssignTools, assignToolSchemas } from '#features/agent/assign.mjs';
+import {
+  createEscalateTools,
+  escalateToolSchemas,
+  isOrchestratedSessionKey,
+} from '#features/agent/escalate.mjs';
 import { SESSION_NAME_TOOL_DEFS, createSessionNameTools, sessionNameToolSchemas } from '#features/agent/session-name.mjs';
 import { ASK_TOOL_DEFS, createAskGate, askToolSchemas } from '#features/agent/ask.mjs';
 import { createApprovalGate } from '#features/agent/approval.mjs';
 import {
   AGENT_MODE_AGENT,
   isToolAllowedInMode,
+  isWriteOrExecTool,
   normalizeAgentMode,
 } from '#features/agent/modes.mjs';
 
@@ -191,11 +199,12 @@ function runTrailCli(workspaceRoot, args) {
  * Wrap file tools with Trail ask/map + optional explore gate, plus the approval-gated
  * terminal and browser tools.
  * @param {string} workspaceRoot
- * @param {{ enforceTrail?: boolean, approvalMode?: 'ask-deny'|'ask-allow'|'allow'|'deny', mode?: 'ask'|'plan'|'agent', onApprove?: (request) => boolean, approvalEvent?: (request) => void, signal?: AbortSignal, dataDir?: string, sessionKey?: string }} [options]
+ * @param {{ enforceTrail?: boolean, approvalMode?: 'ask-deny'|'ask-allow'|'allow'|'deny', mode?: 'ask'|'plan'|'agent', onApprove?: (request) => boolean, approvalEvent?: (request) => void, signal?: AbortSignal, dataDir?: string, sessionKey?: string, onAsk?: Function, askEvent?: Function, onAssignTurn?: Function, onEscalateTurn?: Function }} [options]
  *   dataDir + sessionKey are the monitor context for this turn — the task tools
  *   need them to keep the model's task list in that session's `tasks.json`.
  *   onAsk + askEvent are the interactive channel for kusa_ask: without them the
  *   ask cannot reach a human and refuses immediately instead of stalling.
+ *   onEscalateTurn awaits one provider turn for kusa_escalate (orchestrated only).
  */
 export function createTrailAwareTools(
   workspaceRoot,
@@ -211,12 +220,19 @@ export function createTrailAwareTools(
     sessionKey = '',
     onAsk = null,
     askEvent = null,
+    onAssignTurn = null,
+    onEscalateTurn = null,
   } = {},
 ) {
   // Mutable so a mid-turn composer Mode change takes effect on the next tool
   // call / next model step without rebuilding the whole tool set.
   let agentMode = normalizeAgentMode(mode);
-  const allowed = (name) => isToolAllowedInMode(name, agentMode);
+  // Orchestrated parents coordinate Subagents — they must not implement themselves.
+  const orchestrated = isOrchestratedSessionKey(dataDir, sessionKey);
+  const allowed = (name) => {
+    if (orchestrated && isWriteOrExecTool(name)) return false;
+    return isToolAllowedInMode(name, agentMode);
+  };
   const files = createFileTools(workspaceRoot);
   const gate = { consulted: !enforceTrail };
   const approval = createApprovalGate({
@@ -235,6 +251,22 @@ export function createTrailAwareTools(
     dataDir,
     sessionKey,
     ask: (prompt, callId) => ask.call('kusa_ask', prompt, callId),
+  });
+  const plans = createPlanTools({ dataDir, sessionKey });
+  const assign = createAssignTools({
+    dataDir,
+    sessionKey,
+    workspaceRoot,
+    startTurn: onAssignTurn,
+  });
+  // One-turn provider handoff for orchestrated Agents only; awaits the result
+  // so the caller resumes with the other provider's reply.
+  const escalate = createEscalateTools({
+    dataDir,
+    sessionKey,
+    workspaceRoot,
+    runTurn: onEscalateTurn,
+    signal,
   });
   // Session naming owns the same per-session sidecar the task tools write, so it
   // takes the same dataDir / sessionKey pair: absent, the name stays unpersisted
@@ -264,7 +296,9 @@ export function createTrailAwareTools(
     if (!allowed(name)) {
       return {
         ok: false,
-        error: `${agentMode} mode cannot call ${name}. Ask and Plan modes are read-only — answer from what you can read, or switch to Agent mode to change files.`,
+        error: orchestrated
+          ? `${name} is blocked on orchestrated Agents. Assign a Subagent with kusa_assign (e.g. role=planner for Cursor) instead of implementing yourself.`
+          : `${agentMode} mode cannot call ${name}. Ask and Plan modes are read-only — answer from what you can read, or switch to Agent mode to change files.`,
         code: 'EMODE',
       };
     }
@@ -278,6 +312,21 @@ export function createTrailAwareTools(
     // the working copy, so the model can plan and re-plan before any file read.
     if (/^kusa_task_|^(task_list|task_add|task_update|add_task|update_task|complete_task|list_tasks)$/.test(name)) {
       return tasks.call(name, args, callId);
+    }
+
+    // Workspace plans are not Trail-gated (shared JSON under .kusa/plans/).
+    if (/^kusa_plan_|^(plan_list|plan_create|plan_read|plan_update)$/.test(name)) {
+      return plans.call(name, args, callId);
+    }
+
+    // Orchestrator assign spawns Subagents — not a working-copy edit.
+    if (/^kusa_assign|^assign_/.test(name)) {
+      return assign.call(name, args, callId);
+    }
+
+    // One-turn escalation to another provider — orchestrated sessions only.
+    if (name === 'kusa_escalate' || name === 'escalate') {
+      return escalate.call(name, args, callId);
     }
 
     // Naming is not Trail-gated either: it writes the session's own name, never
@@ -307,6 +356,11 @@ export function createTrailAwareTools(
     ...FILE_TOOL_DEFS,
     ...TRAIL_TOOL_DEFS,
     ...tasks.defs,
+    ...plans.defs,
+    ...assign.defs,
+    // Advertise escalate only on orchestrated sessions; the tool still refuses
+    // elsewhere so a stale schema cannot quietly spawn provider turns.
+    ...(orchestrated ? escalate.defs : []),
     ...names.defs,
     ...ask.defs,
     ...terminal.defs,
@@ -330,6 +384,9 @@ export function createTrailAwareTools(
     trailAsk,
     trailMap,
     tasks,
+    plans,
+    assign,
+    escalate,
     names,
     call,
     readFile: files.readFile,
@@ -347,27 +404,35 @@ export function createTrailAwareTools(
  * The console lists these per session, so the grouping stays here rather than
  * being re-derived from tool names in the UI.
  */
-export function agentToolGroups(mode = null) {
+export function agentToolGroups(mode = null, { orchestrated = false } = {}) {
   const groups = [
     { group: 'file', schemas: fileToolSchemas() },
     { group: 'trail', schemas: toOpenAiSchemas(TRAIL_TOOL_DEFS) },
     { group: 'task', schemas: taskToolSchemas() },
+    { group: 'plan', schemas: planToolSchemas() },
+    { group: 'assign', schemas: assignToolSchemas() },
+    ...(orchestrated ? [{ group: 'escalate', schemas: escalateToolSchemas() }] : []),
     { group: 'session', schemas: sessionNameToolSchemas() },
     { group: 'ask', schemas: askToolSchemas() },
     { group: 'terminal', schemas: toOpenAiSchemas(TERMINAL_TOOL_DEFS) },
     { group: 'browser', schemas: toOpenAiSchemas(BROWSER_TOOL_DEFS) },
   ];
   const normalized = normalizeAgentMode(mode);
-  if (normalized === AGENT_MODE_AGENT) return groups;
+  // Orchestrators stay coordination-only even in Agent mode (no write/exec).
+  const allow = (name) => {
+    if (orchestrated && isWriteOrExecTool(name)) return false;
+    return isToolAllowedInMode(name, normalized);
+  };
+  if (normalized === AGENT_MODE_AGENT && !orchestrated) return groups;
   return groups
     .map((entry) => ({
       ...entry,
-      schemas: entry.schemas.filter((schema) => isToolAllowedInMode(schema?.function?.name, normalized)),
+      schemas: entry.schemas.filter((schema) => allow(schema?.function?.name)),
     }))
     .filter((entry) => entry.schemas.length);
 }
 
 /** OpenAI tool schemas including Trail tools, filtered by agent mode. */
-export function openaiToolSchemasWithTrail(mode = null) {
-  return agentToolGroups(mode).flatMap((entry) => entry.schemas);
+export function openaiToolSchemasWithTrail(mode = null, opts = {}) {
+  return agentToolGroups(mode, opts).flatMap((entry) => entry.schemas);
 }

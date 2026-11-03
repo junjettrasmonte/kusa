@@ -28,7 +28,7 @@ describe('chat-store', () => {
       });
       assert.deepEqual(written.options, { mode: 'agent', rules: 'allow' });
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'sessions', 'pick-1', 'chat.json'), 'utf8'),
+        readFileSync(join(dir, 'agents', 'pick-1', 'chat.json'), 'utf8'),
       );
       // The transcript stays a transcript: no picks inside it.
       assert.equal(Object.hasOwn(transcript, 'options'), false);
@@ -64,9 +64,9 @@ describe('chat-store', () => {
       // A hand-edited sidecar that looks like a lane record (id + harness) must
       // not hydrate a row: listLaneFiles only reads lane.json, and a settings
       // file carries no prompts.
-      mkdirSync(join(dir, 'sessions', 'ghost'), { recursive: true });
+      mkdirSync(join(dir, 'agents', 'ghost'), { recursive: true });
       writeFileSync(
-        join(dir, 'sessions', 'ghost', 'session.json'),
+        join(dir, 'agents', 'ghost', 'session.json'),
         JSON.stringify({ harness: 'kusa', id: 'ghost', rules: 'allow' }),
       );
       const listed = listChatSessions(dir);
@@ -74,7 +74,7 @@ describe('chat-store', () => {
       assert.deepEqual(readSessionConfig(dir, 'ghost'), { rules: 'allow' });
     });
 
-    it('flat and stem-prefixed session config migrate into session.json', () => {
+    it('flat and stem-prefixed session config migrate into agent.json', () => {
       // Pre-folder leftover beside the legacy harness root.
       mkdirSync(join(dir, 'kusa'), { recursive: true });
       writeFileSync(
@@ -83,22 +83,22 @@ describe('chat-store', () => {
       );
       assert.deepEqual(readSessionConfig(dir, 'flat-1'), { rules: 'deny', model: 'from-flat' });
       assert.equal(existsSync(join(dir, 'kusa', 'flat-1.session.json')), false);
-      assert.equal(existsSync(join(dir, 'sessions', 'flat-1', 'session.json')), true);
+      assert.equal(existsSync(join(dir, 'agents', 'flat-1', 'agent.json')), true);
 
-      // Short-lived in-folder `<id>.session.json` name → canonical session.json.
-      mkdirSync(join(dir, 'sessions', 'stem-1'), { recursive: true });
+      // Short-lived in-folder `<id>.session.json` name → canonical agent.json.
+      mkdirSync(join(dir, 'agents', 'stem-1'), { recursive: true });
       writeFileSync(
-        join(dir, 'sessions', 'stem-1', 'stem-1.session.json'),
+        join(dir, 'agents', 'stem-1', 'stem-1.session.json'),
         JSON.stringify({ rules: 'allow' }),
       );
       assert.deepEqual(readSessionConfig(dir, 'stem-1'), { rules: 'allow' });
-      assert.equal(existsSync(join(dir, 'sessions', 'stem-1', 'stem-1.session.json')), false);
-      assert.equal(existsSync(join(dir, 'sessions', 'stem-1', 'session.json')), true);
+      assert.equal(existsSync(join(dir, 'agents', 'stem-1', 'stem-1.session.json')), false);
+      assert.equal(existsSync(join(dir, 'agents', 'stem-1', 'agent.json')), true);
     });
 
     it('stem-prefixed lane/chat/events files migrate to short names', () => {
       const stem = 'short-1';
-      const folder = join(dir, 'sessions', stem);
+      const folder = join(dir, 'agents', stem);
       mkdirSync(folder, { recursive: true });
       writeFileSync(
         join(folder, `${stem}.json`),
@@ -155,7 +155,7 @@ describe('chat-store', () => {
       assert.equal(written.messages[0].attachments[0].dataUrl, dataUrl);
       assert.ok(written.messages[0].attachments[0].file);
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'sessions', 'attach-1', 'chat.json'), 'utf8'),
+        readFileSync(join(dir, 'agents', 'attach-1', 'chat.json'), 'utf8'),
       );
       // On disk the transcript keeps only the pointer — no inline payload.
       assert.equal(transcript.messages[0].attachments[0].dataUrl, undefined);

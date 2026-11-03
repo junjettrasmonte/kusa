@@ -15,6 +15,11 @@ from .config import LiveChatConfig
 log = logging.getLogger("live_chat.server")
 
 
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
+
 class SessionRequest(BaseModel):
     sessionId: Optional[str] = None
     queueKey: Optional[str] = None
@@ -24,6 +29,8 @@ class SessionRequest(BaseModel):
     transport: Optional[str] = None
     tts: Optional[str] = None
     systemPrompt: Optional[str] = None
+    # Prior chat turns from kusa serve (OpenAI-style) so voice has session context.
+    messages: Optional[list[HistoryMessage]] = None
 
 
 class SessionResponse(BaseModel):
@@ -83,16 +90,35 @@ def create_app(cfg: LiveChatConfig | None = None) -> FastAPI:
         tts = (body.tts or config.tts).lower()
         if tts not in ("piper", "kokoro"):
             tts = config.tts
+        history: list[dict[str, str]] = []
+        for item in body.messages or []:
+            role = (item.role or "").strip().lower()
+            content = (item.content or "").strip()
+            if not content:
+                continue
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            # System rows from history are ignored — bot owns the spoken system prompt.
+            if role == "system":
+                continue
+            history.append({"role": role, "content": content})
         _SESSIONS[voice_id] = {
             "sessionId": body.sessionId or "",
             "queueKey": body.queueKey or "",
-            "model": body.model or config.strata_model,
-            "baseUrl": body.baseUrl or config.strata_base_url,
-            "apiKey": body.apiKey if body.apiKey is not None else config.strata_api_key,
+            "model": body.model or config.llm_model,
+            "baseUrl": body.baseUrl or config.llm_base_url,
+            "apiKey": body.apiKey if body.apiKey is not None else config.llm_api_key,
             "transport": transport,
             "tts": tts,
             "systemPrompt": body.systemPrompt or config.system_prompt,
+            "messages": history,
         }
+        log.info(
+            "minted voiceSessionId=%s sessionId=%s history=%d",
+            voice_id,
+            body.sessionId or "-",
+            len(history),
+        )
         return SessionResponse(
             voiceSessionId=voice_id,
             transport=transport,
@@ -134,6 +160,7 @@ def create_app(cfg: LiveChatConfig | None = None) -> FastAPI:
                 api_key=session.get("apiKey"),
                 system_prompt=session.get("systemPrompt"),
                 tts=session.get("tts"),
+                history_messages=session.get("messages") or [],
             )
         except WebSocketDisconnect:
             log.info("client disconnected")
@@ -167,6 +194,7 @@ def create_app(cfg: LiveChatConfig | None = None) -> FastAPI:
                     api_key=session.get("apiKey") if session else body.apiKey,
                     system_prompt=session.get("systemPrompt"),
                     tts=session.get("tts") or body.tts,
+                    history_messages=session.get("messages") or [],
                 )
 
             asyncio.create_task(_run())

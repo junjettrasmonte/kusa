@@ -15,6 +15,14 @@ DEFAULT_PIPER_VOICE = "en_US-lessac-medium"
 DEFAULT_KOKORO_VOICE = "af_heart"
 
 
+def _parse_speed(raw: str, default: float = 1.0) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0.5, min(2.0, value))
+
+
 @dataclass(frozen=True)
 class LiveChatConfig:
     host: str = "127.0.0.1"
@@ -23,9 +31,12 @@ class LiveChatConfig:
     tts: str = "piper"  # piper | kokoro
     piper_voice: str = DEFAULT_PIPER_VOICE
     kokoro_voice: str = DEFAULT_KOKORO_VOICE
-    strata_base_url: str = ""
-    strata_api_key: str = ""
-    strata_model: str = "gpt-4o-mini"
+    tts_speed: float = 1.0
+    gender: str = "any"
+    expressiveness: str = "balanced"
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = "gpt-4o-mini"
     whisper_model: str = "base"
     # Optional callback into kusa serve so transcripts land in chat-store.
     transcript_callback_url: str = ""
@@ -49,6 +60,12 @@ class LiveChatConfig:
             port = int(port_raw)
         except ValueError:
             port = 7860
+        gender = _env("TTS_GENDER", "any").lower()
+        if gender not in ("any", "female", "male"):
+            gender = "any"
+        expressiveness = _env("TTS_EXPRESSIVENESS", "balanced").lower()
+        if expressiveness not in ("calm", "balanced", "expressive"):
+            expressiveness = "balanced"
         return cls(
             host=_env("LIVE_CHAT_HOST", "127.0.0.1") or "127.0.0.1",
             port=port,
@@ -56,9 +73,13 @@ class LiveChatConfig:
             tts=tts,
             piper_voice=_env("PIPER_VOICE", DEFAULT_PIPER_VOICE) or DEFAULT_PIPER_VOICE,
             kokoro_voice=_env("KOKORO_VOICE", DEFAULT_KOKORO_VOICE) or DEFAULT_KOKORO_VOICE,
-            strata_base_url=_env("STRATA_BASE_URL").rstrip("/"),
-            strata_api_key=_env("STRATA_API_KEY"),
-            strata_model=_env("STRATA_MODEL", "gpt-4o-mini") or "gpt-4o-mini",
+            tts_speed=_parse_speed(_env("TTS_SPEED", "1.0"), 1.0),
+            gender=gender,
+            expressiveness=expressiveness,
+            # Prefer LLM_* ; STRATA_* kept as alias (Strata is one possible provider).
+            llm_base_url=(_env("LLM_BASE_URL") or _env("STRATA_BASE_URL")).rstrip("/"),
+            llm_api_key=_env("LLM_API_KEY") or _env("STRATA_API_KEY"),
+            llm_model=_env("LLM_MODEL") or _env("STRATA_MODEL", "gpt-4o-mini") or "gpt-4o-mini",
             whisper_model=_env("WHISPER_MODEL", "base") or "base",
             transcript_callback_url=_env("LIVE_CHAT_TRANSCRIPT_URL"),
             greeting=_env("LIVE_CHAT_GREETING") or cls.greeting,
@@ -72,8 +93,12 @@ class LiveChatConfig:
             "serverUp": True,
             "transport": self.transport,
             "tts": self.tts,
-            "model": self.strata_model,
-            "strataConfigured": bool(self.strata_base_url),
+            "voice": self.kokoro_voice if self.tts == "kokoro" else self.piper_voice,
+            "gender": self.gender,
+            "expressiveness": self.expressiveness,
+            "ttsSpeed": self.tts_speed,
+            "model": self.llm_model,
+            "modelConfigured": bool(self.llm_base_url),
             "whisperModel": self.whisper_model,
             "host": self.host,
             "port": self.port,

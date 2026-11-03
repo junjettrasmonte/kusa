@@ -75,6 +75,23 @@ function publishConsoleAssets() {
           copyIfExists(join(iconsSrc, name), join(iconsDest, name));
         }
       }
+      // Bundled voice weights (npm run voice:models) — copy recursively.
+      const voiceSrc = existsSync(resolve(buildDir, 'voice-models'))
+        ? resolve(buildDir, 'voice-models')
+        : resolve(uiRoot, 'public', 'voice-models');
+      const voiceDest = resolve(here, 'voice-models');
+      if (existsSync(voiceSrc)) {
+        const copyTree = (from, to) => {
+          mkdirSync(to, { recursive: true });
+          for (const name of readdirSync(from, { withFileTypes: true })) {
+            const srcPath = join(from, name.name);
+            const destPath = join(to, name.name);
+            if (name.isDirectory()) copyTree(srcPath, destPath);
+            else copyIfExists(srcPath, destPath);
+          }
+        };
+        copyTree(voiceSrc, voiceDest);
+      }
       // Drop legacy dashboard.* names once console.* owns the shell.
       for (const name of ['dashboard.js', 'dashboard.css']) {
         try { rmSync(resolve(here, name), { force: true }); } catch { /* already gone */ }
@@ -144,7 +161,36 @@ export default defineConfig(({ command }) => {
         '#extensions': resolve(pkgRoot, 'extensions'),
       },
     },
-    plugins: [react(), tailwindcss(), publishConsoleAssets()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      publishConsoleAssets(),
+      // Missing /voice-models/* must 404 — never SPA-fallback to index.html
+      // (transformers.js would JSON.parse `<!doctype…>` and throw).
+      {
+        name: 'voice-models-no-spa-fallback',
+        configureServer(server) {
+          return () => {
+            server.middlewares.use((req, res, next) => {
+              const url = req.url || '';
+              if (!url.startsWith('/voice-models/')) {
+                next();
+                return;
+              }
+              res.statusCode = 404;
+              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+              res.end('Voice model file not found. Run: npm run voice:models');
+            });
+          };
+        },
+      },
+    ],
+    optimizeDeps: {
+      exclude: ['onnxruntime-web', '@ricky0123/vad-web'],
+    },
+    worker: {
+      format: 'es',
+    },
     build: {
       outDir: buildDir,
       emptyOutDir: true,

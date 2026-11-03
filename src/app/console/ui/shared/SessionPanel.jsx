@@ -13,6 +13,7 @@ export function SessionPanel({
   expandedTools,
   onToggleTool,
   chatSession = null,
+  peerSessions = null,
   chatQueue = null,
   onSendMessage,
   onQueueMessage,
@@ -44,6 +45,7 @@ export function SessionPanel({
         {subTab === 'chat' && chatSession && (
           <SessionChat
             session={chatSession}
+            peerSessions={peerSessions}
             queued={chatQueue}
             tasks={lane?.todos || []}
             onSend={onSendMessage}

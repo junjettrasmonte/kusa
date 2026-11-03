@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "generatedAt": "2026-11-03T10:51:16.867Z",
+  "whisper": "onnx-community/whisper-tiny.en",
+  "kokoro": "onnx-community/Kokoro-82M-v1.0-ONNX",
+  "voices": [
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_sarah",
+    "af_sky",
+    "bf_emma",
+    "bf_isabella",
+    "am_adam",
+    "am_michael",
+    "am_fenrir",
+    "am_puck",
+    "bm_george",
+    "bm_lewis"
+  ],
+  "root": "/voice-models/"
+}

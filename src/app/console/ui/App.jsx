@@ -150,7 +150,7 @@ function slimUiChatSession(session) {
 }
 
 async function fetchKusaSessions() {
-  const res = await fetch('/kusa/sessions', { headers: { Accept: 'application/json' } });
+  const res = await fetch('/kusa/agents', { headers: { Accept: 'application/json' } });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const body = await res.json();
   return Array.isArray(body?.sessions) ? body.sessions : [];
@@ -251,7 +251,7 @@ function mergeKusaSessions(prev, incoming) {
 async function persistChatSession(session) {
   const slim = slimUiChatSession(session);
   if (!slim) return null;
-  const res = await fetch('/kusa/sessions', {
+  const res = await fetch('/kusa/agents', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ session: slim }),
@@ -590,7 +590,7 @@ export default function App() {
         let sessions = await fetchKusaSessions();
         const legacy = readLegacyKusaSessions();
         if (legacy.length) {
-          const res = await fetch('/kusa/sessions/migrate', {
+          const res = await fetch('/kusa/agents/migrate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: JSON.stringify({ sessions: legacy }),
@@ -825,6 +825,52 @@ export default function App() {
     [chatSessions, laneKey],
   );
 
+  // Subagents no longer appear in the sidebar — bounce a stale child (or nested
+  // escalation) selection up to the top-level orchestrator so the merged
+  // transcript is what opens.
+  useEffect(() => {
+    if (!chatSession) return;
+    let parentId = chatSession.parentId || chatSession.options?.parentId;
+    if (!parentId) return;
+    const seen = new Set();
+    let root = chatSessions.find((s) => s.id === parentId) || null;
+    while (root) {
+      const nextId = root.parentId || root.options?.parentId;
+      if (!nextId || seen.has(root.id)) break;
+      seen.add(root.id);
+      const next = chatSessions.find((s) => s.id === nextId);
+      if (!next) break;
+      root = next;
+    }
+    if (root?.key) setSelected(root.key);
+  }, [chatSession, chatSessions]);
+
+  // Descendants of the open orchestrated session (assign Subagents + nested
+  // escalations under them) — SessionChat stitches them into one group-chat
+  // transcript. Empty for standard / non-parent sessions.
+  const peerSessions = useMemo(() => {
+    if (!chatSession?.id) return [];
+    if (chatSession.parentId || chatSession.options?.parentId) return [];
+    const rootId = chatSession.id;
+    const byParent = new Map();
+    for (const s of chatSessions || []) {
+      if (!s?.id || s.id === rootId) continue;
+      const pid = s.parentId || s.options?.parentId;
+      if (!pid) continue;
+      if (!byParent.has(pid)) byParent.set(pid, []);
+      byParent.get(pid).push(s);
+    }
+    const out = [];
+    const walk = (pid) => {
+      for (const child of byParent.get(pid) || []) {
+        out.push(child);
+        walk(child.id);
+      }
+    };
+    walk(rootId);
+    return out;
+  }, [chatSession, chatSessions]);
+
   // When a chat session is selected, land on Chat; leave Chat when it isn't.
   useEffect(() => {
     if (chatSession) {
@@ -907,8 +953,18 @@ export default function App() {
 
   function selectLane(key) {
     setActiveExtensionId(null);
-    setSelected(key);
-    if (isChatSessionKey(key) && chatSessions.some((s) => s.key === key)) {
+    // Subagents are hidden from the sidebar; open the parent instead.
+    let nextKey = key;
+    if (isChatSessionKey(key)) {
+      const row = chatSessions.find((s) => s.key === key);
+      const parentId = row?.parentId || row?.options?.parentId;
+      if (parentId) {
+        const parent = chatSessions.find((s) => s.id === parentId);
+        if (parent?.key) nextKey = parent.key;
+      }
+    }
+    setSelected(nextKey);
+    if (isChatSessionKey(nextKey) && chatSessions.some((s) => s.key === nextKey)) {
       setSessionSubTab('chat');
       setTab('session');
     }
@@ -921,7 +977,7 @@ export default function App() {
     }
     let session;
     try {
-      const res = await fetch('/kusa/sessions', {
+      const res = await fetch('/kusa/agents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
@@ -1111,6 +1167,9 @@ export default function App() {
               timeoutDefaultAllowed: ev.timeoutDefaultAllowed === true,
               autoSettled: ev.autoSettled === true,
               reason: ev.reason || null,
+              relayed: ev.relayed === true,
+              sourceAgentId: ev.sourceAgentId || null,
+              sourceRole: ev.sourceRole || null,
             };
             return { ...live, parts: applyApprovalToParts(live.parts, approval) };
           });
@@ -1133,6 +1192,9 @@ export default function App() {
               timeoutMs: Number(ev.timeoutMs) > 0 ? Number(ev.timeoutMs) : null,
               timeoutStartsAt: Number(ev.timeoutStartsAt) > 0 ? Number(ev.timeoutStartsAt) : null,
               reason: ev.reason || null,
+              relayed: ev.relayed === true,
+              sourceAgentId: ev.sourceAgentId || null,
+              sourceRole: ev.sourceRole || null,
             };
             return { ...live, parts: applyAskToParts(live.parts, ask) };
           });
@@ -1825,14 +1887,38 @@ export default function App() {
     if (!sessionKey || !canDelete) return;
     const session = chatSessions.find((s) => s.key === sessionKey);
     if (!session) return;
-    const next = {
-      ...session,
-      archived: archived === true,
-      archivedAt: archived === true ? Date.now() : null,
+    // Subagents belong to their parent — archive/unarchive via the parent only.
+    if (session.parentId || session.options?.parentId) return;
+    const flag = archived === true;
+    const archivedAt = flag ? Date.now() : null;
+    const rootId = session.id;
+    const descendantIds = new Set();
+    {
+      const byParent = new Map();
+      for (const s of chatSessions || []) {
+        const pid = s?.parentId || s?.options?.parentId;
+        if (!pid || !s?.id) continue;
+        if (!byParent.has(pid)) byParent.set(pid, []);
+        byParent.get(pid).push(s.id);
+      }
+      const walk = (pid) => {
+        for (const id of byParent.get(pid) || []) {
+          descendantIds.add(id);
+          walk(id);
+        }
+      };
+      walk(rootId);
+    }
+    const patch = (s) => {
+      if (s.key !== sessionKey && !descendantIds.has(s.id)) return s;
+      return { ...s, archived: flag, archivedAt };
     };
-    setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? next : s)));
+    const nextSessions = (chatSessions || []).map(patch).filter((s) => (
+      s.key === sessionKey || descendantIds.has(s.id)
+    ));
+    setChatSessions((prev) => prev.map(patch));
     try {
-      await persistChatSession(next);
+      await Promise.all(nextSessions.map((s) => persistChatSession(s)));
     } catch {
       /* optimistic UI; next poll / refresh restores disk */
     }
@@ -1852,7 +1938,14 @@ export default function App() {
    */
   function deleteKeys(keys) {
     if (deleteBusy || pendingDelete) return;
-    const list = [...new Set((keys || []).filter(Boolean))];
+    // Subagents nest under a parent — only top-level Agents are deletable here.
+    const subKeys = new Set(
+      (chatSessions || [])
+        .filter((s) => s?.parentId || s?.options?.parentId)
+        .map((s) => s.key)
+        .filter(Boolean),
+    );
+    const list = [...new Set((keys || []).filter((key) => key && !subKeys.has(key)))];
     if (!list.length) return;
 
     if (!canDelete) {
@@ -1876,8 +1969,8 @@ export default function App() {
         body: JSON.stringify({ keys: list }),
       });
       if (!res.ok) {
-        const detailText = await res.text().catch(() => '');
-        throw new Error(detailText || `HTTP ${res.status}`);
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.error || `HTTP ${res.status}`);
       }
       const body = await res.json().catch(() => ({}));
       const deleted = Array.isArray(body?.deleted) ? body.deleted.filter(Boolean) : [];
@@ -2067,8 +2160,8 @@ export default function App() {
               'live-chat': {
                 tone: devtoolsExtReady.liveChat.ok ? 'ok' : 'down',
                 title: devtoolsExtReady.liveChat.ok
-                  ? 'Live Chat bot is ready'
-                  : 'Live Chat bot is not ready (not installed or server down)',
+                  ? 'Live Chat browser voice ready'
+                  : 'Live Chat voice unavailable',
               },
             }
           : {}),
@@ -2197,6 +2290,7 @@ export default function App() {
                   expandedTools={expandedTools}
                   onToggleTool={toggleTool}
                   chatSession={chatSession}
+                  peerSessions={peerSessions}
                   chatQueue={queueForSession(queueByKey, chatSession?.key)}
                   onSendMessage={sendChatMessage}
                   onQueueMessage={queueFromComposer}
@@ -2209,6 +2303,7 @@ export default function App() {
                     mode: 'agent',
                     rules: settings.agentApprovalMode || 'ask-deny',
                     model: settings.agentModel || '',
+                    avatar: settings.agentAvatar || '',
                     approvalTimeoutMinutes: settings.agentApprovalTimeoutMinutes ?? 2,
                     allowDenyRevertMinutes: settings.agentAllowDenyRevertMinutes ?? 15,
                     // Fingerprint of every active endpoint so SessionChat reloads

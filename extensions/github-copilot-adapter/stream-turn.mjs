@@ -77,14 +77,21 @@ export async function runCopilotStreamTurn({
     onJson: (ev) => applyCopilotStreamEvent(state, ev, emit),
   });
 
-  if (state.cliSessionId) {
+  const resolvedModel = String(state.model || opts.model || '').trim();
+  const parentId = String(opts.parentId || session?.parentId || '').trim() || null;
+  if (state.cliSessionId || resolvedModel) {
     try {
       writeSessionConfig(dataDir, sessionId, {
         provider: 'copilot',
         kind: session?.kind || opts.kind || 'standard',
-        copilotCliSessionId: state.cliSessionId,
-        cliSessionId: state.cliSessionId,
-      }, harness);
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+        ...(state.cliSessionId
+          ? {
+            copilotCliSessionId: state.cliSessionId,
+            cliSessionId: state.cliSessionId,
+          }
+          : {}),
+      }, harness, parentId);
     } catch { /* best-effort */ }
   }
 
@@ -103,5 +110,10 @@ export async function runCopilotStreamTurn({
   const text = state.content.trim() || '(empty response)';
   emit({ type: 'content', text, delta: '' });
   emit({ type: 'done', text });
-  return { text, cliSessionId: state.cliSessionId, backend: 'copilot-cli' };
+  return {
+    text,
+    cliSessionId: state.cliSessionId,
+    backend: 'copilot-cli',
+    ...(resolvedModel ? { model: resolvedModel } : {}),
+  };
 }

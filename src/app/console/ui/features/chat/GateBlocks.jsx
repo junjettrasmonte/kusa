@@ -121,6 +121,9 @@ export function ApprovalBlock({ approval, onApproval = null }) {
           ? 'Denied by Rule'
           : autoSettled ? 'Auto-denied' : 'Denied'
         : 'Approval';
+  const relayLabel = approval?.relayed
+    ? (approval.sourceRole ? `Subagent · ${approval.sourceRole}` : 'Subagent')
+    : '';
 
   return (
     <div
@@ -140,6 +143,12 @@ export function ApprovalBlock({ approval, onApproval = null }) {
         {pending ? <StatusGlyph status="awaiting_approval" className="mt-0.5" /> : null}
         <span className={`min-w-0 truncate ${pending ? 'chat-shimmer text-gray-300' : 'text-gray-400'}`}>
           <span className="font-medium text-gray-300">{label}</span>
+          {relayLabel ? (
+            <span className="text-sky-400/90">
+              {' '}
+              <span className="text-gray-700">·</span> {relayLabel}
+            </span>
+          ) : null}
           {approval?.name ? (
             <span className="text-gray-600">
               {' '}
@@ -357,6 +366,9 @@ export function AskCard({ ask, onAsk = null }) {
     : answered
       ? 'Answered'
       : 'No answer';
+  const relayLabel = ask?.relayed
+    ? (ask.sourceRole ? `Subagent · ${ask.sourceRole}` : 'Subagent')
+    : '';
 
   return (
     <div
@@ -377,6 +389,12 @@ export function AskCard({ ask, onAsk = null }) {
         {pending ? <StatusGlyph status="awaiting_answer" className="mt-0.5" /> : null}
         <span className={`min-w-0 truncate ${pending ? 'chat-shimmer text-gray-300' : 'text-gray-400'}`}>
           <span className="font-medium text-gray-300">{label}</span>
+          {relayLabel ? (
+            <span className="text-sky-400/90">
+              {' '}
+              <span className="text-gray-700">·</span> {relayLabel}
+            </span>
+          ) : null}
           {/* Settled, the question is no longer the user's turn to answer, so it
               stops hiding behind the fold: the row names what was asked in one
               line. The full wording stays in the body for when it is opened. */}

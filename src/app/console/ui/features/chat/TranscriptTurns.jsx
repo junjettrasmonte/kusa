@@ -6,8 +6,11 @@ import {
   assistantParts,
   groupAssistantParts,
   isAgentErrorMessage,
+  stripLeakedToolCalls,
   truncate,
 } from '#ui/shared/lib/chatText.js';
+import { HARNESS_NAMES } from '#ui/shared/lib/format.js';
+import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
 import {
   AgentIcon,
   ArrowUpIcon,
@@ -23,6 +26,30 @@ import {
   AskCard,
   gateCarryBack,
 } from './GateBlocks.jsx';
+
+/** Compact model id for the AgentSegment header (drop org/path noise). */
+function shortModelLabel(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return '';
+  const base = raw.includes('/') ? raw.slice(raw.lastIndexOf('/') + 1) : raw;
+  return base.length > 28 ? `${base.slice(0, 26)}…` : base;
+}
+
+function speakerHarness(speaker) {
+  if (!speaker) return '';
+  if (typeof speaker.harness === 'string' && speaker.harness.trim()) return speaker.harness.trim();
+  const provider = String(speaker.provider || '').trim().toLowerCase();
+  if (provider === 'copilot' || provider === 'github-copilot') return 'github-copilot';
+  if (provider === 'cursor') return 'cursor';
+  if (provider === 'kusa') return 'kusa';
+  return provider || 'kusa';
+}
+
+function speakerRoleLabel(speaker) {
+  const role = String(speaker?.role || '').trim();
+  if (!role) return '';
+  return role.replace(/[_-]+/g, ' ');
+}
 
 /**
  * Transcript turns — the outer shape of one chat exchange.
@@ -174,6 +201,22 @@ export function ChatTurn({
   trustBusy = false,
   trustNote = '',
 }) {
+  if (msg.role === 'meta' || msg.role === 'delegate') {
+    const role = speakerRoleLabel(msg.speaker) || msg.roleLabel || 'agent';
+    const brief = typeof msg.text === 'string' ? msg.text.trim() : '';
+    return (
+      <div className="text-xs text-gray-500">
+        <span className="font-medium text-gray-400">Delegated · {role}</span>
+        {brief ? (
+          <span className="text-gray-600">
+            {' '}
+            <span className="text-gray-700">·</span>{' '}
+            {truncate(brief, 120)}
+          </span>
+        ) : null}
+      </div>
+    );
+  }
   if (msg.role === 'user') {
     return (
       <UserMessage
@@ -427,6 +470,7 @@ export function AssistantTurn({
         errorCode={errored && isLast ? (msg?.code || '') : ''}
         isLast={isLast}
         gate={gateOf(gateRow)}
+        speaker={msg?.speaker || null}
         agentMaxHeight={agentMaxHeight}
         onApproval={onApproval}
         onTrustWorkspace={onTrustWorkspace}
@@ -482,6 +526,7 @@ export function AgentSegment({
   errorCode = '',
   isLast = true,
   gate = null,
+  speaker = null,
   agentMaxHeight = null,
   onApproval = null,
   onTrustWorkspace = null,
@@ -489,14 +534,17 @@ export function AgentSegment({
   trustNote = '',
 }) {
   const groups = groupAssistantParts(parts);
-  const hasProgress = parts.length > 0 || (streaming && !replyText);
+  // Strip leaked <tool_call> dumps before deciding what to show — those break
+  // markdown/HTML rendering and the tool UI already covers the same action.
+  const displayReply = stripLeakedToolCalls(replyText);
+  const hasProgress = parts.length > 0 || (streaming && !displayReply);
   const lastPart = parts[parts.length - 1];
   const thinkingStream = Boolean(
-    streaming && !replyText && (lastPart?.type === 'thinking' || !parts.length),
+    streaming && !displayReply && (lastPart?.type === 'thinking' || !parts.length),
   );
   // Error turns carry the failure text in `replyText` but must not render it as
   // a normal assistant reply — AgentErrorCard owns that body.
-  const hasReply = Boolean(!error && replyText && replyText !== '(empty response)');
+  const hasReply = Boolean(!error && displayReply && displayReply !== '(empty response)');
   // The gate this container's work stopped at, as far as its header is
   // concerned: a pending one is still the user's turn, so the rail says which
   // kind of wait it is. A settled one is NOT handed back to the header — its
@@ -544,14 +592,22 @@ export function AgentSegment({
   const stepSummary = stepBits.join(' · ');
 
   // The user pressed Stop: the partial reply is kept but labelled, so it is
-  // never read as a finished answer.
+  // never read as a finished answer. Speaker role/provider wins the idle name
+  // so a merged orchestrated transcript reads as a group of distinct agents.
+  const roleLabel = speakerRoleLabel(speaker);
+  const harness = speakerHarness(speaker);
+  const modelLabel = shortModelLabel(speaker?.model);
+  const isOrchestrator = String(speaker?.role || '').trim().toLowerCase() === 'orchestrator';
+  const idleName = roleLabel
+    ? roleLabel.replace(/\b\w/g, (c) => c.toUpperCase())
+    : 'Agent';
   const label = streaming
     ? awaitingApproval
       ? 'Awaiting approval…'
       : awaitingAsk
         ? 'Awaiting answer…'
         : hasReply
-          ? 'Agent…'
+          ? `${idleName}…`
           : hasProgress
             ? 'Working…'
             : 'Thinking…'
@@ -559,7 +615,13 @@ export function AgentSegment({
       ? 'Failed'
       : stopped
         ? 'Stopped'
-        : 'Agent';
+        : idleName;
+  const providerTitle = isOrchestrator
+    ? 'Orchestrator · chat group'
+    : harness
+      ? (HARNESS_NAMES[harness] || harness)
+      : '';
+  const markClass = `mt-0.5 ${streaming ? 'text-gray-400' : error ? 'text-rose-400' : 'text-gray-500 group-hover:text-gray-400'}`;
 
   // Error-only turns (no thinking/tools) skip the collapsible rail — the card
   // below is the whole row. Mid-turn failures keep the rail so prior work stays.
@@ -586,7 +648,16 @@ export function AgentSegment({
         aria-expanded={open}
       >
         <Chevron open={open} className="mt-0.5 shrink-0 text-gray-600 group-hover:text-gray-400" />
-        <AgentIcon className={`mt-0.5 ${streaming ? 'text-gray-400' : error ? 'text-rose-400' : 'text-gray-500 group-hover:text-gray-400'}`} />
+        {harness ? (
+          <HarnessLogo
+            harness={harness}
+            size="h-4 w-4"
+            className={markClass}
+            title={providerTitle || null}
+          />
+        ) : (
+          <AgentIcon className={markClass} />
+        )}
         {streaming ? (
           <StatusGlyph
             // Only an OPEN gate is hoisted out of this rail; the container
@@ -603,7 +674,7 @@ export function AgentSegment({
         ) : error ? (
           <StatusGlyph status="error" className="mt-0.5" />
         ) : null}
-        <span className={`min-w-0 truncate ${streaming ? 'chat-shimmer text-gray-300' : error ? 'text-rose-300' : 'text-gray-300'}`}>
+        <span className={`min-w-0 flex-1 truncate ${streaming ? 'chat-shimmer text-gray-300' : error ? 'text-rose-300' : 'text-gray-300'}`}>
           <span className="font-medium">{label}</span>
           {!streaming && stepSummary ? (
             <span className="text-gray-600">
@@ -621,6 +692,14 @@ export function AgentSegment({
             </span>
           ) : null}
         </span>
+        {modelLabel ? (
+          <span
+            className="mt-0.5 max-w-[40%] shrink-0 truncate font-mono text-[10px] text-gray-600"
+            title={String(speaker?.model || modelLabel)}
+          >
+            {modelLabel}
+          </span>
+        ) : null}
       </button>
 
       {open ? (
@@ -701,11 +780,11 @@ export function AgentSegment({
         />
       ) : hasReply ? (
         <div className="mt-2">
-          {looksLikeMarkdown(replyText) || streaming ? (
-            <MarkdownBody text={replyText} variant="chat" />
+          {looksLikeMarkdown(displayReply) || streaming ? (
+            <MarkdownBody text={displayReply} variant="chat" />
           ) : (
             <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-200">
-              {replyText}
+              {displayReply}
             </div>
           )}
         </div>

@@ -30,7 +30,7 @@ export const AGENT_MODES = [
 ];
 
 /** Tools that change the working copy — Agent mode only. Bare aliases included. */
-const WRITE_TOOLS = new Set([
+export const WRITE_TOOLS = new Set([
   'kusa_write_file',
   'kusa_patch_file',
   'kusa_delete_file',
@@ -44,7 +44,13 @@ const WRITE_TOOLS = new Set([
 ]);
 
 /** Terminal/browser tools — Agent mode only, and gated by the approval rules. */
-const EXEC_TOOLS = new Set(['kusa_terminal', 'terminal', 'kusa_browse', 'browse']);
+export const EXEC_TOOLS = new Set(['kusa_terminal', 'terminal', 'kusa_browse', 'browse']);
+
+/** True for tools that mutate the tree or run commands (blocked for Ask/Plan and orchestrators). */
+export function isWriteOrExecTool(toolName) {
+  const name = String(toolName || '');
+  return WRITE_TOOLS.has(name) || EXEC_TOOLS.has(name);
+}
 
 /**
  * Anything unknown stays allowed: the native loop only advertises filtered
@@ -55,8 +61,7 @@ const EXEC_TOOLS = new Set(['kusa_terminal', 'terminal', 'kusa_browse', 'browse'
  */
 export function isToolAllowedInMode(toolName, mode) {
   if (normalizeAgentMode(mode) === AGENT_MODE_AGENT) return true;
-  const name = String(toolName || '');
-  return !WRITE_TOOLS.has(name) && !EXEC_TOOLS.has(name);
+  return !isWriteOrExecTool(toolName);
 }
 
 /** Default is Agent so chat keeps its full read/write behaviour when unset. */

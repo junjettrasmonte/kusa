@@ -1,5 +1,5 @@
 /**
- * Per-session task lists under `.kusa/sessions/<stem>/tasks.json`.
+ * Per-Agent task lists under `.kusa/agents/<stem>/tasks.json`.
  *
  * Plan/todo rows from TodoWrite stay tied to the session that wrote them (held
  * prompts sit beside them in `queues.json`; parked prompts stay workspace-shared).
@@ -27,7 +27,7 @@ import {
   laneKey,
   migrateFlatSessionFiles,
   migrateHarnessSessionsToShared,
-  sessionsRoot,
+  agentsRoot,
 } from '#features/monitor/lib.mjs';
 
 export const TASKS_FILE = 'tasks.json';
@@ -107,7 +107,7 @@ function writeSessionTasksFile(path, entry, sessionKey = '') {
     updatedAtWall: entry.updatedAtWall ?? Date.now(),
     todos: entry.todos,
   };
-  // Shared sessions/ folder has no harness in the path — keep the lane key here
+  // Shared agents/ folder has no harness in the path — keep the lane key here
   // so a tasks-only folder still reloads under the right harness:id.
   const key = String(sessionKey || entry.key || '').trim();
   if (key) body.key = key;
@@ -183,7 +183,7 @@ export function loadTasks(dir) {
 
   /** @type {Record<string, { todos: object[], updatedAtWall: number|null }>} */
   const out = {};
-  const root = sessionsRoot(dir);
+  const root = agentsRoot(dir);
   let children = [];
   try {
     children = readdirSync(root, { withFileTypes: true });

@@ -43,7 +43,7 @@ describe('chat providers', () => {
     assert.deepEqual([...CHAT_HARNESSES].sort(), ['cursor', 'github-copilot', 'kusa']);
   });
 
-  it('creates chat sessions under the shared sessions folder', () => {
+  it('creates chat sessions under the shared agents folder', () => {
     const dir = mkdtempSync(join(tmpdir(), 'kusa-providers-'));
     try {
       const kusa = createChatSession(dir, { id: 'k1', provider: 'kusa' });
@@ -76,9 +76,9 @@ describe('chat providers', () => {
       assert.equal(orch.options?.workflowId, 'demo-flow');
       assert.equal(kusa.cliBacked, false);
 
-      assert.equal(existsSync(join(dir, 'sessions', 'k1', 'chat.json')), true);
-      assert.equal(existsSync(join(dir, 'sessions', 'c1', 'chat.json')), true);
-      assert.equal(existsSync(join(dir, 'sessions', 'o1', 'chat.json')), true);
+      assert.equal(existsSync(join(dir, 'agents', 'k1', 'chat.json')), true);
+      assert.equal(existsSync(join(dir, 'agents', 'c1', 'chat.json')), true);
+      assert.equal(existsSync(join(dir, 'agents', 'o1', 'chat.json')), true);
 
       const listed = listChatSessions(dir);
       assert.equal(listed.length, 3);
@@ -94,9 +94,9 @@ describe('chat providers', () => {
     const dir = mkdtempSync(join(tmpdir(), 'kusa-external-cursor-'));
     try {
       const id = 'ui-cursor-1';
-      mkdirSync(join(dir, 'sessions', id), { recursive: true });
+      mkdirSync(join(dir, 'agents', id), { recursive: true });
       writeFileSync(
-        join(dir, 'sessions', id, `${id}.json`),
+        join(dir, 'agents', id, `${id}.json`),
         JSON.stringify({
           key: `cursor:${id}`,
           harness: 'cursor',
@@ -125,10 +125,10 @@ describe('chat providers', () => {
     try {
       const ghostId = 'tool-only-ghost';
       const realId = 'real-cursor-chat';
-      mkdirSync(join(dir, 'sessions', ghostId), { recursive: true });
-      mkdirSync(join(dir, 'sessions', realId), { recursive: true });
+      mkdirSync(join(dir, 'agents', ghostId), { recursive: true });
+      mkdirSync(join(dir, 'agents', realId), { recursive: true });
       writeFileSync(
-        join(dir, 'sessions', ghostId, `${ghostId}.json`),
+        join(dir, 'agents', ghostId, `${ghostId}.json`),
         JSON.stringify({
           key: `cursor:${ghostId}`,
           harness: 'cursor',
@@ -140,7 +140,7 @@ describe('chat providers', () => {
         }),
       );
       writeFileSync(
-        join(dir, 'sessions', realId, `${realId}.json`),
+        join(dir, 'agents', realId, `${realId}.json`),
         JSON.stringify({
           key: `cursor:${realId}`,
           harness: 'cursor',

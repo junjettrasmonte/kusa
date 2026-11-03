@@ -1,6 +1,6 @@
 {
   "name": "kusa",
-  "version": "0.1.16",
+  "version": "0.2.1",
   "description": "Kusă — harness-agnostic session counters, live dashboard, and optional MCP server for Copilot, Cursor, and VS Code Local",
   "type": "module",
   "engines": {
@@ -42,10 +42,12 @@
     "test": "node --test test/*.test.mjs",
     "demo": "node src/features/monitor/demo.mjs",
     "serve": "node src/app/console/serve.mjs",
+    "voice:models": "node scripts/download-voice-models.mjs",
+    "prebuild": "node scripts/download-voice-models.mjs",
     "build": "vite build --config src/app/console/vite.config.mjs",
     "dev": "vite --config src/app/console/vite.config.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepublishOnly": "npm run build && npm test",
+    "prepublishOnly": "npm run voice:models && npm run build && npm test",
     "kusa:serve": "kusa serve",
     "cao:provider:install": "node src/features/kusa-cli/cao-provider/install.mjs",
     "cao:provider:uninstall": "node src/features/kusa-cli/cao-provider/install.mjs --uninstall"
@@ -61,8 +63,12 @@
   "author": "Junjet Trasmonte",
   "license": "MIT",
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "@node-saml/node-saml": "^5.2.0",
     "@opencode-ai/sdk": "^1.19.3",
+    "@ricky0123/vad-web": "^0.0.31",
+    "kokoro-js": "^1.2.1",
+    "onnxruntime-web": "^1.31.1",
     "openid-client": "^6.8.9",
     "otpauth": "^9.5.2",
     "qrcode": "^1.5.4",

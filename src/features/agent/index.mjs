@@ -95,6 +95,19 @@ export {
   createAskGate,
   normalizeAskArgs,
 } from './ask.mjs';
+export {
+  ESCALATE_TOOL_DEFS,
+  createEscalateTools,
+  escalateSystemPromptAddon,
+  escalateToolSchemas,
+  isOrchestratedSessionKey,
+} from './escalate.mjs';
+export {
+  ASSIGN_TOOL_DEFS,
+  createAssignTools,
+  assignSystemPromptAddon,
+  assignToolSchemas,
+} from './assign.mjs';
 
 /**
  * @param {object} options
@@ -131,6 +144,8 @@ export async function runKusaAgent({
   approvalMode = null,
   onApprove = null,
   onAsk = null,
+  onAssignTurn = null,
+  onEscalateTurn = null,
   mode = null,
   modelOverride = null,
   endpointIdOverride = null,
@@ -234,6 +249,8 @@ export async function runKusaAgent({
     approvalMode,
     onApprove,
     onAsk,
+    onAssignTurn,
+    onEscalateTurn,
     mode,
     modelOverride,
     onSteer,

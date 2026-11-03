@@ -1,5 +1,53 @@
+import { useRef, useState } from 'react';
 import { AgentEndpointsPanel } from '#ui/features/settings/AgentEndpointsPanel.jsx';
 import { Choice, Field } from '#ui/shared/SettingsControls.jsx';
+
+const AVATAR_SIZE = 128;
+const AVATAR_MAX_CHARS = 48_000;
+
+/**
+ * Square-crop + JPEG-compress a local image for agentAvatar settings storage.
+ * @param {File} file
+ * @returns {Promise<string>}
+ */
+function fileToAgentAvatarDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read image'));
+    reader.onload = () => {
+      const src = String(reader.result || '');
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not decode image'));
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = AVATAR_SIZE;
+        canvas.height = AVATAR_SIZE;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Canvas unavailable'));
+          return;
+        }
+        const side = Math.min(img.naturalWidth || img.width, img.naturalHeight || img.height);
+        const sx = ((img.naturalWidth || img.width) - side) / 2;
+        const sy = ((img.naturalHeight || img.height) - side) / 2;
+        ctx.drawImage(img, sx, sy, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+        let quality = 0.88;
+        let dataUrl = canvas.toDataURL('image/jpeg', quality);
+        while (dataUrl.length > AVATAR_MAX_CHARS && quality > 0.45) {
+          quality -= 0.08;
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
+        if (dataUrl.length > AVATAR_MAX_CHARS) {
+          reject(new Error('Image is still too large after compression'));
+          return;
+        }
+        resolve(dataUrl);
+      };
+      img.src = src;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 export function SettingsPanel({
   subTab,
@@ -23,8 +71,37 @@ export function SettingsPanel({
     agentBackend: 'native',
     agentApprovalTimeoutMinutes: 2,
     agentAllowDenyRevertMinutes: 15,
+    agentAvatar: '',
   };
   const backendOpencode = s.agentBackend === 'opencode';
+  const avatarInputRef = useRef(/** @type {HTMLInputElement|null} */ (null));
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const [avatarNote, setAvatarNote] = useState('');
+  const avatarUrl = typeof s.agentAvatar === 'string' && s.agentAvatar.startsWith('data:image/')
+    ? s.agentAvatar
+    : '';
+  const avatarDisabled = !canPersist || settingsBusy || avatarBusy;
+
+  async function onAvatarFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || avatarDisabled) return;
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.type || '')) {
+      setAvatarNote('Use a PNG, JPEG, WebP, or GIF image.');
+      return;
+    }
+    setAvatarBusy(true);
+    setAvatarNote('');
+    try {
+      const dataUrl = await fileToAgentAvatarDataUrl(file);
+      onSettingsChange?.({ agentAvatar: dataUrl });
+      setAvatarNote('Avatar saved — shown in Live voice.');
+    } catch (err) {
+      setAvatarNote(err?.message || 'Could not use that image');
+    } finally {
+      setAvatarBusy(false);
+    }
+  }
 
   return (
     <div
@@ -42,6 +119,61 @@ export function SettingsPanel({
               sandboxed read/write/list/grep (also advertised over MCP). OpenCode SDK mode needs the{' '}
               <code className="text-sky-300">opencode</code> CLI on PATH.
             </p>
+
+            <div className="mb-6 flex flex-wrap items-center gap-4 rounded-xl border border-gray-800 bg-gray-900/60 p-3">
+              <div
+                className="h-14 w-14 shrink-0 overflow-hidden rounded-full border border-emerald-500/40 bg-emerald-950"
+                aria-hidden="true"
+              >
+                {avatarUrl ? (
+                  <img src={avatarUrl} alt="" className="h-full w-full object-cover" />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center text-sm font-semibold text-emerald-200">
+                    K
+                  </span>
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-gray-200">Agent avatar</p>
+                <p className="mt-0.5 text-xs text-gray-500">
+                  Center of the Live voice spectrum. Square-cropped and compressed on upload.
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <input
+                    ref={avatarInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    className="hidden"
+                    onChange={(event) => { void onAvatarFile(event); }}
+                  />
+                  <button
+                    type="button"
+                    disabled={avatarDisabled}
+                    onClick={() => avatarInputRef.current?.click()}
+                    className="rounded-md bg-emerald-700 px-2.5 py-1 text-xs font-medium text-emerald-50 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {avatarBusy ? 'Uploading…' : (avatarUrl ? 'Replace image' : 'Upload image')}
+                  </button>
+                  {avatarUrl ? (
+                    <button
+                      type="button"
+                      disabled={avatarDisabled}
+                      onClick={() => {
+                        setAvatarNote('');
+                        onSettingsChange?.({ agentAvatar: '' });
+                      }}
+                      className="rounded-md border border-gray-700 px-2.5 py-1 text-xs text-gray-300 hover:border-gray-500 hover:text-gray-100 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Clear
+                    </button>
+                  ) : null}
+                </div>
+                {avatarNote ? (
+                  <p className="mt-1.5 text-[11px] text-gray-500">{avatarNote}</p>
+                ) : null}
+              </div>
+            </div>
+
             <AgentEndpointsPanel
               defaultEndpoint={{
                 baseUrl: s.agentBaseUrl || '',

@@ -18,21 +18,23 @@
  *   /favicon.svg      Kusă mark (SVG favicon)
  *   /monitor-data.js  <workspace>/.kusa/pwa/monitor-data.js
  *   /index.json                                 same pwa/ folder, read-only
- *   /sessions/<session>/lane.json                         one session's record
- *   /sessions/<session>/events.jsonl                      that session's recent events
- *   /sessions/<session>/attachments/<file>                a file attached to that session
- *   /sessions/<harness>/<session>/…                       legacy URL shape (still resolved)
+ *   /agents/<agent>/lane.json                             one Agent's record
+ *   /agents/<agent>/events.jsonl                          that Agent's recent events
+ *   /agents/<agent>/attachments/<file>                    a file attached to that Agent
+ *   /sessions/…                                           legacy URL shape (still resolved)
  *   DELETE /sessions  JSON body { "keys": ["harness:id", ...] } — remove sessions
  *   GET/POST /settings  read/update Kusă agent + workspace settings (settings.json)
  *   POST /kusa/chat   Kusă harness prompt (JSON or SSE stream=1 / Accept: text/event-stream)
  *   GET  /kusa/chat/live?queueKey=  re-attach SSE to a running turn (survives refresh)
  *   POST /kusa/chat/options  mid-turn Mode / Rules update (takes effect on the next tool call; an Allow / Deny Rule also settles an ask that is already waiting)
  *   GET/POST /kusa/queue  composer held/steering (per-session queues.json; parked in queues.json)
- *   GET /kusa/sessions          list chat transcripts (.kusa/sessions/<id>/chat.json)
+ *   GET /kusa/agents          list chat transcripts (.kusa/agents/<id>/chat.json)
  *                                 (busy sessions include in-memory `live` while a turn runs)
- *   POST /kusa/sessions         create an empty Kusă chat (+ monitor lane)
- *   PUT /kusa/sessions          upsert one `{ session }` or many `{ sessions }`
- *   POST /kusa/sessions/migrate import legacy browser-local chats
+ *   POST /kusa/agents         create an empty Kusă chat (+ monitor lane)
+ *   PUT /kusa/agents          upsert one `{ session }` or many `{ sessions }`
+ *   POST /kusa/agents/migrate import legacy browser-local chats
+ *   GET /kusa/workflows         local orchestration workflow configs (.kusa/workflows)
+ *   GET/POST /kusa/plans        workspace plans (.kusa/plans); GET/PUT /kusa/plans/:id
  *   GET /kusa/tools   the tool set the Kusă agent advertises for a chat session
  *   GET /kusa/models  models every active endpoint has, grouped by endpoint / provider name (for the picker)
  *   GET /git          live working-copy status (git status for the workspace)
@@ -57,20 +59,16 @@
  *   GET/POST /mcp/tools  list / create custom tools; GET/PUT/DELETE /mcp/tools/:id
  *   POST /mcp/<workspace-slug>/rpc  Localhost MCP protocol for this project (when enabled)
  *   GET/POST /learnings  Trail learnings (list / add)
- *   GET /live-chat        Live Chat (Pipecat) bot status
- *   POST /live-chat/server/start    spawn the local Pipecat bot (detached)
- *   POST /live-chat/server/stop     stop the local Pipecat bot
- *   POST /live-chat/server/restart  stop then start (apply transport/TTS prefs)
- *   GET|PUT /live-chat/settings  transport + TTS prefs
- *   POST /live-chat/session      mint voice session (Strata from agent settings)
- *   POST /live-chat/transcript   bot → chat-store transcript append
- *   POST /live-chat/rtc          WebRTC SDP proxy to the bot
- *   WS  /live-chat/ws            WebSocket upgrade proxy to the bot
+ *   GET /live-chat        Live Chat browser-voice status (always up; no Pipecat bot)
+ *   GET|PUT /live-chat/settings  browser STT/TTS/VAD prefs
+ *   POST /live-chat/server/*     retired — returns 410
+ *   POST /live-chat/session|rtc  retired — returns 410
+ *   WS  /live-chat/ws            retired — closes with 410
  *
  * Binds 127.0.0.1 only. No dependencies. Everything is served with no-cache
  * headers so the page's 1 s poll always sees the latest hook write.
  */
-import { createServer, request as httpRequest } from 'node:http';
+import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -98,6 +96,8 @@ import {
   migrateChatSessions,
   nameChatSession,
   readChatSession,
+  readSessionConfig,
+  resolveSessionRef,
   saveChatSessions,
 } from '#features/chat/data/chat-store.mjs';
 import {
@@ -122,6 +122,21 @@ import {
   normalizeAttachments,
   ATTACHMENT_LIMITS,
 } from '#features/chat/data/attachments.mjs';
+import {
+  createPlan,
+  deletePlan,
+  listPlans,
+  planSummary,
+  readPlan,
+  updatePlan,
+} from '#features/chat/data/plan-store.mjs';
+import {
+  claimUnownedPlansForAgent,
+  continueWorkflowAfterPlanApproval,
+  plansBlockingAgentDelete,
+  resolveAgentDeleteKeys,
+} from '#features/agent/plans.mjs';
+import { listWorkflows, ensureWorkflowsSeeded } from '#features/workflows/store.mjs';
 import { supportsVision } from '#features/agent/index.mjs';
 import {
   buildProfileDocument,
@@ -142,15 +157,9 @@ import {
 import {
   appendLiveChatTranscript,
   collectLiveChatStatus,
-  createLiveChatSession,
   normalizeLiveChatSettings,
-  proxyLiveChatRtcOffer,
   resolveLiveChatBaseUrl,
-  restartLiveChatServer,
-  startLiveChatServer,
-  stopLiveChatServer,
 } from '#features/live-chat/index.mjs';
-import { resolveSessionRef } from '#features/chat/data/chat-store.mjs';
 import {
   collectGitStatus,
   collectTrailStatus,
@@ -166,8 +175,8 @@ import {
   pwaFile,
   refreshMonitorArtifacts,
   saveMonitorSettings,
-  SESSIONS_DIR,
-  sessionsRoot,
+  AGENTS_DIR,
+  agentsRoot,
 } from '#features/monitor/lib.mjs';
 import {
   compareSkillPublications,
@@ -351,6 +360,92 @@ export function createMonitorServer({
     }
   });
 
+  /**
+   * Subagent approvals / asks surface on the orchestrator parent so the human
+   * answers from the parent chat; the same id settles the child's waiter.
+   */
+  const parentQueueKeyForAgent = (sessionId) => {
+    const id = String(sessionId || '').trim();
+    if (!id) return null;
+    try {
+      const cfg = readSessionConfig(dataDir, id) || {};
+      const parentId = String(cfg.parentId || '').trim();
+      if (!parentId) return null;
+      const parent = readChatSession(dataDir, parentId);
+      if (parent?.key) return parent.key;
+      return laneKey(parent?.harness || 'kusa', parentId);
+    } catch {
+      return null;
+    }
+  };
+
+  const ensureParentRelayJob = (parentKey, parentId) => {
+    let job = turnJobs.get(parentKey);
+    if (job && !job.terminal) return job;
+    job = createTurnJob({
+      queueKey: parentKey,
+      sessionId: parentId,
+      harness: 'kusa',
+      prompt: '',
+    });
+    job.relayOnly = true;
+    turnJobs.set(parentKey, job);
+    return job;
+  };
+
+  const parentRelayHasPendingGates = (job) => {
+    const parts = Array.isArray(job?.live?.parts) ? job.live.parts : [];
+    return parts.some((p) => (
+      (p?.type === 'approval' && p.approval?.status === 'pending')
+      || (p?.type === 'ask' && p.ask?.status === 'pending')
+    ));
+  };
+
+  const maybeFinishParentRelayJob = (parentKey) => {
+    const job = turnJobs.get(parentKey);
+    if (!job?.relayOnly || job.terminal) return;
+    if (parentRelayHasPendingGates(job)) return;
+    finishTurnJob(parentKey, {
+      type: 'done',
+      text: 'Subagent asked for your input.',
+      relayOnly: true,
+    });
+  };
+
+  const relayChildGateEvent = (childSessionId, childQueueKey, ev) => {
+    const type = ev?.type || '';
+    if (type !== 'approval_request' && type !== 'ask_request') return;
+    const parentKey = parentQueueKeyForAgent(childSessionId);
+    if (!parentKey || parentKey === childQueueKey) return;
+    const parentId = parentKey.includes(':')
+      ? parentKey.slice(parentKey.indexOf(':') + 1)
+      : parentKey;
+    let role = '';
+    try {
+      role = String(readSessionConfig(dataDir, childSessionId)?.role || '').trim();
+    } catch { /* ignore */ }
+    const tag = role ? `Subagent · ${role}` : 'Subagent';
+    const parentJob = ensureParentRelayJob(parentKey, parentId);
+    const relayed = {
+      ...ev,
+      sourceAgentId: String(childSessionId || ''),
+      sourceQueueKey: String(childQueueKey || ''),
+      sourceRole: role,
+      relayed: true,
+      ...(typeof ev.message === 'string' && ev.message && !ev.message.startsWith('[Subagent')
+        ? { message: `[${tag}] ${ev.message}` }
+        : {}),
+      ...(typeof ev.question === 'string' && ev.question && !ev.question.startsWith('[Subagent')
+        ? { question: `[${tag}] ${ev.question}` }
+        : {}),
+    };
+    ingestTurnEvent(parentJob, relayed);
+    broadcastTurn(parentJob, type, relayed);
+    if (ev.status && ev.status !== 'pending') {
+      maybeFinishParentRelayJob(parentKey);
+    }
+  };
+
   // Composer message queue (Cursor/Copilot style). While a turn is running for a
   // session, a new prompt is NOT a second turn — it is held here under the
   // client's queueKey. The server owns both lists so the UI and the running turn
@@ -436,12 +531,287 @@ export function createMonitorServer({
   const stopRequested = new Map();
   // Live turn jobs outlive any single SSE response: a page refresh unsubscribes
   // the old stream but the agent keeps running. GET /kusa/chat/live reattaches,
-  // and GET /kusa/sessions overlays busy + live from this map.
+  // and GET /kusa/agents overlays busy + live from this map.
   /** @type {Map<string, ReturnType<typeof createTurnJob>>} */
   const turnJobs = new Map();
   // Keep a finished job briefly so a refresh that lands right after `done` can
   // still receive the terminal frame before reading the chat sidecar.
   const TURN_JOB_GRACE_MS = 120_000;
+
+  /**
+   * Background turn for a Subagent spawned by kusa_assign. Creates a live job
+   * (so GET /kusa/chat/live can attach) and runs without an HTTP response.
+   */
+  /**
+   * Start a Subagent / escalation turn. Assign fire-and-forgets; escalate sets
+   * awaitCompletion so the tool call blocks until that one turn finishes and
+   * returns the text (orchestrator resumes with control).
+   */
+  const startAssignedTurn = async ({
+    sessionId = '',
+    queueKey = '',
+    harness = 'kusa',
+    provider = 'kusa',
+    prompt = '',
+    mode = 'agent',
+    model = '',
+    signal = null,
+    awaitCompletion = false,
+    role = '',
+    parentId = '',
+  } = {}) => {
+    const text = String(prompt || '').trim();
+    const jobKey = String(queueKey || sessionId || '').trim();
+    if (!text || !jobKey) return { ok: false, error: 'prompt and queueKey required' };
+    if (turnJobs.has(jobKey) && !turnJobs.get(jobKey)?.terminal) {
+      return {
+        ok: awaitCompletion ? false : true,
+        started: false,
+        reason: 'already_running',
+        ...(awaitCompletion ? { error: 'escalation target already has a running turn' } : {}),
+      };
+    }
+
+    const settings = loadMonitorSettings(dataDir);
+    const chatProvider = resolveChatProvider(provider || harness || 'kusa');
+    const chatHarness = harness || chatProvider?.harness || 'kusa';
+    const useCaoTurn = Boolean(chatProvider && isCaoChatProvider(chatProvider.id));
+    const agentMode = normalizeAgentMode(mode);
+    const hooks = createKusaHookEmitter({
+      dataDir,
+      sessionId,
+      workspaceRoot,
+      harness: chatHarness,
+    });
+    if (hooks.enabled) {
+      try { hooks.userPrompt(text); } catch { /* ignore */ }
+    }
+
+    const turnAbort = new AbortController();
+    const onParentAbort = () => {
+      try { turnAbort.abort(); } catch { /* ignore */ }
+    };
+    if (signal) {
+      if (signal.aborted) onParentAbort();
+      else signal.addEventListener('abort', onParentAbort, { once: true });
+    }
+    const turnStartedAt = Date.now();
+    const job = createTurnJob({
+      queueKey: jobKey,
+      sessionId,
+      harness: chatHarness,
+      prompt: text,
+      promptMessageId: null,
+      mode: agentMode,
+      approvalMode: settings?.agentApprovalMode || '',
+      attachments: [],
+    });
+    activeTurns.set(jobKey, turnAbort);
+    turnJobs.set(jobKey, job);
+    try { persistTurnPrompt(dataDir, job); } catch { /* best-effort */ }
+
+    // Claim any durable held row for this prompt so a later idle flush / resume
+    // does not start the same assign twice (assign used to enqueue + start).
+    try {
+      const held = sessionHeld(jobKey);
+      let claimed = false;
+      for (const entry of held) {
+        if (entry?.paused) continue;
+        if (String(entry?.text || '').trim() !== text) continue;
+        if (takeQueued(jobKey, entry.id)) claimed = true;
+      }
+      if (claimed) persistQueues();
+    } catch { /* best-effort */ }
+
+    const claimPlansIfPlanning = () => {
+      const roleKey = String(role || '').trim().toLowerCase();
+      if (roleKey !== 'planner' && roleKey !== 'planning') return;
+      try {
+        const cfg = readSessionConfig(dataDir, sessionId) || {};
+        claimUnownedPlansForAgent(dataDir, {
+          agentId: sessionId,
+          parentId: parentId || cfg.parentId || '',
+          workflowId: cfg.workflowId || '',
+          sinceMs: turnStartedAt,
+        });
+      } catch { /* best-effort */ }
+    };
+
+    const run = async () => {
+      let streamedText = '';
+      try {
+        if (useCaoTurn) {
+          const result = await runCaoChatTurn({
+            dataDir,
+            sessionId,
+            harness: chatHarness,
+            provider: chatProvider.id,
+            workspaceRoot,
+            prompt: text,
+            model,
+            signal: turnAbort.signal,
+            onEvent: (ev) => {
+              const type = ev?.type || 'message';
+              if (type === 'done') return;
+              if (type === 'content' && typeof ev.text === 'string') streamedText = ev.text;
+              mirrorCliMonitorEvent(hooks, ev);
+              ingestTurnEvent(job, ev);
+              broadcastTurn(job, type, ev);
+            },
+          });
+          streamedText = result?.text || streamedText;
+          if (hooks.enabled) {
+            try { hooks.afterAgentResponse(streamedText); } catch { /* ignore */ }
+            try { hooks.agentStop({ stopReason: 'end_turn' }); } catch { /* ignore */ }
+          }
+          claimPlansIfPlanning();
+          const usedModel = String(result?.model || model || '').trim();
+          const terminal = {
+            type: 'done',
+            text: streamedText,
+            backend: result?.backend || 'cao',
+            provider: chatProvider.id,
+            ...(usedModel ? { model: usedModel } : {}),
+            turnId: job.turnId,
+            queued: [],
+          };
+          finishTurnJob(jobKey, terminal);
+          return { ok: true, started: true, ...terminal };
+        }
+
+        const result = await runKusaAgent({
+          workspaceRoot,
+          settings,
+          prompt: text,
+          history: [],
+          stream: true,
+          hooks,
+          mode: agentMode,
+          modelOverride: model,
+          approvalMode: settings?.agentApprovalMode,
+          signal: turnAbort.signal,
+          onApprove: (ask) => waitForApproval(ask, jobKey),
+          onAsk: (ask) => waitForAsk(ask, jobKey),
+          onAssignTurn: startAssignedTurn,
+          onEscalateTurn: startAssignedTurn,
+          onEvent: (ev) => {
+            const type = ev?.type || 'message';
+            if (type === 'done') return;
+            if (type === 'content' && typeof ev.text === 'string') streamedText = ev.text;
+            ingestTurnEvent(job, ev);
+            if (type === 'approval_request' || type === 'ask_request') {
+              relayChildGateEvent(sessionId, jobKey, ev);
+            }
+            broadcastTurn(job, type, ev);
+          },
+        });
+        if (hooks.enabled) {
+          try { hooks.afterAgentResponse(result.text || ''); } catch { /* ignore */ }
+          try { hooks.agentStop({ stopReason: 'end_turn' }); } catch { /* ignore */ }
+        }
+        claimPlansIfPlanning();
+        const terminal = {
+          type: 'done',
+          text: result.text,
+          thinking: result.thinking || '',
+          backend: result.backend,
+          mode: result.mode || agentMode,
+          model: result.model || model || settings.agentModel,
+          toolTrace: result.toolTrace || [],
+          turnId: job.turnId,
+          queued: [],
+        };
+        finishTurnJob(jobKey, terminal);
+        return { ok: true, started: true, ...terminal };
+      } catch (err) {
+        if (hooks.enabled) {
+          try { hooks.agentStop({ stopReason: 'error', status: 'error' }); } catch { /* ignore */ }
+        }
+        claimPlansIfPlanning();
+        const terminal = {
+          type: 'error',
+          message: err?.message || 'assigned turn failed',
+          text: err?.message || 'assigned turn failed',
+          turnId: job.turnId,
+          queued: [],
+        };
+        finishTurnJob(jobKey, terminal);
+        return { ok: false, started: true, ...terminal, error: terminal.message };
+      } finally {
+        activeTurns.delete(jobKey);
+        if (signal) {
+          try { signal.removeEventListener('abort', onParentAbort); } catch { /* ignore */ }
+        }
+      }
+    };
+
+    if (awaitCompletion) {
+      return run();
+    }
+    void run();
+    return { ok: true, started: true, queueKey: jobKey, turnId: job.turnId };
+  };
+
+  /**
+   * Subagents cannot flush their own queue (composer locked). After a serve
+   * --live restart, in-flight assign turns are lost but the user prompt (and
+   * sometimes a held queue row) remains — pick those up without waiting for
+   * the UI to select the child.
+   */
+  const resumeIdleSubagentTurns = () => {
+    let sessions = [];
+    try {
+      sessions = listChatSessions(dataDir);
+    } catch {
+      return;
+    }
+    for (const session of sessions) {
+      const parentId = session?.parentId || session?.options?.parentId;
+      if (!parentId || !session?.key || !session?.id) continue;
+      const jobKey = session.key;
+      if (turnJobs.has(jobKey) && !turnJobs.get(jobKey)?.terminal) continue;
+
+      const held = (queuedMessages.get(jobKey) || []).filter((entry) => entry && !entry.paused);
+      if (held.length) {
+        const entry = held[0];
+        if (!takeQueued(jobKey, entry.id)) continue;
+        try { persistQueues(); } catch { /* ignore */ }
+        void startAssignedTurn({
+          sessionId: session.id,
+          queueKey: jobKey,
+          harness: session.harness,
+          provider: session.provider || session.options?.provider || session.harness,
+          prompt: entry.text,
+          mode: entry.options?.mode || session.options?.mode || 'agent',
+          model: entry.options?.model || session.options?.model || '',
+          role: session.role || session.options?.role || '',
+          parentId,
+        });
+        continue;
+      }
+
+      const msgs = Array.isArray(session.messages) ? session.messages : [];
+      const last = msgs[msgs.length - 1];
+      const orphanPrompt = last?.role === 'user' ? String(last.text || '').trim() : '';
+      if (!orphanPrompt) continue;
+      void startAssignedTurn({
+        sessionId: session.id,
+        queueKey: jobKey,
+        harness: session.harness,
+        provider: session.provider || session.options?.provider || session.harness,
+        prompt: orphanPrompt,
+        mode: session.options?.mode || 'agent',
+        model: session.options?.model || '',
+        role: session.role || session.options?.role || '',
+        parentId,
+      });
+    }
+  };
+
+  // Boot resume: give listen a tick, then drain orphaned Subagent assigns.
+  setTimeout(() => {
+    try { resumeIdleSubagentTurns(); } catch { /* ignore */ }
+  }, 750);
 
   const pipeSse = (res, req, jobKey) => {
     const job = turnJobs.get(jobKey);
@@ -540,9 +910,42 @@ export function createMonitorServer({
           : 'image/png';
     return { file, type };
   };
-  // /sessions/<stem>/<file>  — shared sessions/ folder layout
-  // /sessions/<stem>/attachments/<file>
-  // Legacy /sessions/<harness>/<stem>/… still resolves (prefers sessions/<stem>).
+
+  // Bundled browser voice weights (npm run voice:models) — also present under
+  // ui/public/voice-models for Vite --live. Safe path segments only.
+  const voiceModelsDir = join(pageDir, 'voice-models');
+  const voiceModelsUiDir = join(here, 'ui/public/voice-models');
+  const VOICE_SEG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
+  const voiceModelType = (filePath) => {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+    if (lower.endsWith('.onnx')) return 'application/octet-stream';
+    if (lower.endsWith('.bin')) return 'application/octet-stream';
+    if (lower.endsWith('.wasm')) return 'application/wasm';
+    if (lower.endsWith('.txt')) return 'text/plain; charset=utf-8';
+    if (lower.endsWith('.md')) return 'text/markdown; charset=utf-8';
+    return 'application/octet-stream';
+  };
+  const voiceModelRoute = (pathname) => {
+    if (!pathname.startsWith('/voice-models/')) return null;
+    const rel = pathname.slice('/voice-models/'.length);
+    if (!rel || rel.includes('\0') || rel.includes('..')) return null;
+    const parts = rel.split('/').filter(Boolean);
+    if (!parts.length || parts.length > 12) return null;
+    if (!parts.every((p) => VOICE_SEG.test(p))) return null;
+    // Prefer published pageDir copy; fall back to ui/public for --live API child.
+    const candidates = [
+      join(voiceModelsDir, ...parts),
+      join(voiceModelsUiDir, ...parts),
+    ];
+    for (const file of candidates) {
+      if (existsSync(file)) return { file, type: voiceModelType(file) };
+    }
+    return null;
+  };
+  // /agents/<stem>/<file>  — shared agents/ folder layout
+  // /agents/<stem>/attachments/<file>
+  // Legacy /sessions/… still resolves (prefers agents/<stem>).
   // Every segment must be a plain name (no dots-only, no separators).
   const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
   const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -552,7 +955,7 @@ export function createMonitorServer({
     return null;
   };
   const resolveSessionDisk = (harness, stem, ...rest) => {
-    const shared = join(sessionsRoot(dataDir), stem, ...rest);
+    const shared = join(agentsRoot(dataDir), stem, ...rest);
     if (existsSync(shared)) return shared;
     if (harness) {
       const legacy = join(dataDir, harness, stem, ...rest);
@@ -562,9 +965,9 @@ export function createMonitorServer({
   };
   const sessionRoute = (pathname) => {
     const parts = pathname.split('/').filter(Boolean);
-    if (parts[0] !== 'sessions' || parts.length < 3) return null;
+    if ((parts[0] !== 'agents' && parts[0] !== 'sessions') || parts.length < 3) return null;
 
-    // New: /sessions/<stem>/attachments/<file>
+    // /agents/<stem>/attachments/<file> (or legacy /sessions/…)
     if (parts.length === 4 && parts[2] === 'attachments') {
       const stem = parts[1];
       const file = parts[3];
@@ -572,7 +975,7 @@ export function createMonitorServer({
       return {
         file: resolveSessionDisk(null, stem, 'attachments', file),
         type: 'application/octet-stream',
-        harness: SESSIONS_DIR,
+        harness: AGENTS_DIR,
         stem,
         attachment: true,
       };
@@ -592,7 +995,7 @@ export function createMonitorServer({
         attachment: true,
       };
     }
-    // New: /sessions/<stem>/<file>
+    // /agents/<stem>/<file> (or legacy /sessions/…)
     if (parts.length === 3) {
       const stem = parts[1];
       const file = parts[2];
@@ -602,7 +1005,7 @@ export function createMonitorServer({
       return {
         file: resolveSessionDisk(null, stem, file),
         type,
-        harness: SESSIONS_DIR,
+        harness: AGENTS_DIR,
         // Folder name is the session stem; short in-folder names (lane.json, …)
         // must not be mistaken for the stem.
         stem,
@@ -657,6 +1060,7 @@ export function createMonitorServer({
     } else if (
       url.pathname.startsWith('/icons/')
       || url.pathname === '/favicon.svg'
+      || url.pathname.startsWith('/voice-models/')
     ) {
       res.setHeader('Cache-Control', 'public, max-age=3600');
     } else {
@@ -1287,35 +1691,20 @@ export function createMonitorServer({
             }));
             return;
           }
-          // Start / stop / restart local Pipecat bot (detached).
-          if (section === 'server' && parts[2] === 'start' && req.method === 'POST') {
-            const result = await startLiveChatServer({
-              baseUrl,
-              settings,
-              workspaceRoot,
-              transcriptCallbackUrl: `http://127.0.0.1:${boundMcpPort}/live-chat/transcript`,
-            });
-            sendJson(res, result.ok ? 200 : (result.started ? 504 : 503), result);
-            return;
-          }
-          if (section === 'server' && parts[2] === 'stop' && req.method === 'POST') {
-            const result = await stopLiveChatServer({
+          // Pipecat bot lifecycle retired — browser-native voice needs no daemon.
+          if (section === 'server' && ['start', 'stop', 'restart'].includes(parts[2]) && req.method === 'POST') {
+            const status = await collectLiveChatStatus({
+              force: true,
               baseUrl,
               settings,
               workspaceRoot,
             });
-            sendJson(res, result.ok ? 200 : 504, result);
-            return;
-          }
-          if (section === 'server' && parts[2] === 'restart' && req.method === 'POST') {
-            const result = await restartLiveChatServer({
-              baseUrl,
-              settings,
-              workspaceRoot,
-              transcriptCallbackUrl: `http://127.0.0.1:${boundMcpPort}/live-chat/transcript`,
-              waitMs: 45_000,
+            sendJson(res, 410, {
+              ok: false,
+              retired: true,
+              error: 'Pipecat Live Chat bot is retired. Voice runs in the browser — use Dev Tools › Live Chat for providers and models.',
+              status,
             });
-            sendJson(res, result.ok ? 200 : (result.started ? 504 : 503), result);
             return;
           }
           if (section === 'settings' && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -1334,11 +1723,18 @@ export function createMonitorServer({
               sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
               return;
             }
+            const patchKeys = [
+              'transport', 'tts', 'baseUrl', 'gender', 'voice', 'expressiveness',
+              'sttProvider', 'ttsProvider', 'vadProvider', 'offlineOnly', 'language',
+              'autoSpeak', 'interruptible', 'speechRate', 'whisperModel',
+            ];
+            const patch = {};
+            for (const key of patchKeys) {
+              if (body[key] !== undefined) patch[key] = body[key];
+            }
             const next = normalizeLiveChatSettings({
               ...settings.liveChat,
-              ...(body.transport !== undefined ? { transport: body.transport } : {}),
-              ...(body.tts !== undefined ? { tts: body.tts } : {}),
-              ...(body.baseUrl !== undefined ? { baseUrl: body.baseUrl } : {}),
+              ...patch,
             });
             const saved = saveMonitorSettings(dataDir, { liveChat: next });
             sendJson(res, 200, {
@@ -1348,25 +1744,11 @@ export function createMonitorServer({
             return;
           }
           if (section === 'session' && req.method === 'POST') {
-            let body = {};
-            try {
-              const raw = await readBody(req, 64_000);
-              body = raw.trim() ? JSON.parse(raw) : {};
-            } catch (err) {
-              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
-              return;
-            }
-            const minted = await createLiveChatSession({
-              settings,
-              sessionId: body.sessionId || body.session_id || null,
-              queueKey: body.queueKey || body.queue_key || null,
-              modelOverride: body.model || null,
-              endpointIdOverride: body.endpointId || body.endpoint_id || null,
-              transport: body.transport || null,
-              tts: body.tts || null,
-              baseUrl,
+            sendJson(res, 410, {
+              error: 'Voice sessions are browser-native — no /live-chat/session mint. Use the Live button in chat.',
+              retired: true,
+              mode: 'browser',
             });
-            sendJson(res, 201, minted);
             return;
           }
           if (section === 'transcript' && req.method === 'POST') {
@@ -1407,20 +1789,11 @@ export function createMonitorServer({
             return;
           }
           if (section === 'rtc' && req.method === 'POST') {
-            let body = {};
-            try {
-              const raw = await readBody(req, 500_000);
-              body = raw.trim() ? JSON.parse(raw) : {};
-            } catch (err) {
-              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
-              return;
-            }
-            const proxied = await proxyLiveChatRtcOffer(body, { baseUrl });
-            if (!proxied.ok) {
-              sendJson(res, proxied.status || 502, { error: proxied.error || 'rtc proxy failed', ...(proxied.data || {}) });
-              return;
-            }
-            sendJson(res, 200, proxied.data);
+            sendJson(res, 410, {
+              error: 'WebRTC Live Chat transport is retired. Audio stays in the browser.',
+              retired: true,
+              mode: 'browser',
+            });
             return;
           }
           sendJson(res, section ? 405 : 404, { error: section ? 'method not allowed' : 'not found' });
@@ -1488,7 +1861,8 @@ export function createMonitorServer({
     if (req.method === 'POST' && url.pathname === '/settings') {
       let patch = {};
       try {
-        const raw = await readBody(req);
+        // Avatar data URLs need headroom beyond the default 64KB body cap.
+        const raw = await readBody(req, 200_000);
         patch = raw.trim() ? JSON.parse(raw) : {};
         if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
           sendJson(res, 400, { error: 'expected a JSON object' });
@@ -1523,6 +1897,7 @@ export function createMonitorServer({
           ...(patch.agentAllowDenyRevertMinutes !== undefined
             ? { agentAllowDenyRevertMinutes: Number(patch.agentAllowDenyRevertMinutes) }
             : {}),
+          ...(patch.agentAvatar !== undefined ? { agentAvatar: String(patch.agentAvatar ?? '') } : {}),
           // The Default endpoint's model list and the extra endpoint list pass
           // through untouched: normalizeMonitorSettings owns their shape (it
           // splits the comma-delimited field itself) and settingsToDisk owns the
@@ -1566,8 +1941,8 @@ export function createMonitorServer({
       return;
     }
 
-    // Kusă chat transcripts (sidecar files under .kusa/sessions/<id>/chat.json).
-    if (url.pathname === '/kusa/sessions' && (req.method === 'GET' || req.method === 'HEAD')) {
+    // Kusă chat transcripts (sidecar files under .kusa/agents/<id>/chat.json).
+    if ((url.pathname === '/kusa/agents' || url.pathname === '/kusa/sessions') && (req.method === 'GET' || req.method === 'HEAD')) {
       sendJson(res, 200, {
         sessions: sessionsWithActiveTurns(listChatSessions(dataDir), turnJobs),
       });
@@ -1664,7 +2039,7 @@ export function createMonitorServer({
       return;
     }
 
-    if (req.method === 'POST' && url.pathname === '/kusa/sessions') {
+    if (req.method === 'POST' && (url.pathname === '/kusa/agents' || url.pathname === '/kusa/sessions')) {
       let body = {};
       try {
         const raw = await readBody(req, 64_000);
@@ -1693,7 +2068,7 @@ export function createMonitorServer({
       return;
     }
 
-    if (req.method === 'PUT' && url.pathname === '/kusa/sessions') {
+    if (req.method === 'PUT' && (url.pathname === '/kusa/agents' || url.pathname === '/kusa/sessions')) {
       let body = {};
       try {
         const raw = await readBody(req, 2_000_000);
@@ -1724,7 +2099,155 @@ export function createMonitorServer({
       return;
     }
 
-    if (req.method === 'POST' && url.pathname === '/kusa/sessions/migrate') {
+    // Local orchestration workflows (seeded under .kusa/workflows/).
+    if (url.pathname === '/kusa/workflows' && (req.method === 'GET' || req.method === 'HEAD')) {
+      try {
+        ensureWorkflowsSeeded(dataDir);
+        const workflows = listWorkflows(dataDir).map((wf) => ({
+          id: wf.id,
+          name: wf.name,
+          label: wf.name,
+          description: wf.description,
+          provider: 'kusa',
+          roles: Object.keys(wf.roles || {}),
+        }));
+        sendJson(res, 200, { workflows });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || 'workflows list failed' });
+      }
+      return;
+    }
+
+    // Workspace plans (shared across Agents).
+    if (url.pathname === '/kusa/plans' && (req.method === 'GET' || req.method === 'HEAD')) {
+      try {
+        const plans = listPlans(dataDir).map(planSummary);
+        sendJson(res, 200, { plans });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || 'plans list failed' });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/kusa/plans') {
+      let body = {};
+      try {
+        const raw = await readBody(req, 512_000);
+        body = raw.trim() ? JSON.parse(raw) : {};
+      } catch (err) {
+        sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+        return;
+      }
+      try {
+        const plan = createPlan(dataDir, body);
+        sendJson(res, 200, { plan });
+      } catch (err) {
+        sendJson(res, err?.code === 'EINVAL' ? 400 : 500, { error: err?.message || 'create plan failed' });
+      }
+      return;
+    }
+
+    if (req.method === 'DELETE' && /^\/kusa\/plans\/[^/]+$/.test(url.pathname) && url.pathname !== '/kusa/plans/') {
+      const planId = decodeURIComponent(url.pathname.slice('/kusa/plans/'.length)).trim();
+      if (!planId || planId.includes('/')) {
+        sendJson(res, 400, { error: 'invalid plan id' });
+        return;
+      }
+      const existing = readPlan(dataDir, planId);
+      if (!existing) {
+        sendJson(res, 404, { error: 'plan not found' });
+        return;
+      }
+      const ok = deletePlan(dataDir, planId);
+      sendJson(res, ok ? 200 : 500, ok ? { ok: true, id: planId } : { error: 'delete failed' });
+      return;
+    }
+
+    // Resume an already-approved plan (Approve before continue-on-approve existed).
+    if (req.method === 'POST' && /^\/kusa\/plans\/[^/]+\/continue$/.test(url.pathname)) {
+      const planId = decodeURIComponent(url.pathname.slice('/kusa/plans/'.length).replace(/\/continue$/, '')).trim();
+      const plan = readPlan(dataDir, planId);
+      if (!plan) {
+        sendJson(res, 404, { error: 'plan not found' });
+        return;
+      }
+      if (String(plan.status || '') !== 'approved' && String(plan.status || '') !== 'executing') {
+        sendJson(res, 400, { error: `plan status is "${plan.status}" — Approve it first` });
+        return;
+      }
+      try {
+        const continued = await continueWorkflowAfterPlanApproval({
+          dataDir,
+          plan,
+          workspaceRoot,
+          startTurn: startAssignedTurn,
+        });
+        const next = readPlan(dataDir, planId) || plan;
+        sendJson(res, continued?.ok === false ? 409 : 200, { plan: next, continued });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || 'continue failed' });
+      }
+      return;
+    }
+
+    if (url.pathname.startsWith('/kusa/plans/') && url.pathname !== '/kusa/plans/') {
+      const planId = decodeURIComponent(url.pathname.slice('/kusa/plans/'.length)).trim();
+      if (!planId || planId.includes('/')) {
+        sendJson(res, 400, { error: 'invalid plan id' });
+        return;
+      }
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        const plan = readPlan(dataDir, planId);
+        if (!plan) {
+          sendJson(res, 404, { error: 'plan not found' });
+          return;
+        }
+        sendJson(res, 200, { plan });
+        return;
+      }
+      if (req.method === 'PUT') {
+        let body = {};
+        try {
+          const raw = await readBody(req, 512_000);
+          body = raw.trim() ? JSON.parse(raw) : {};
+        } catch (err) {
+          sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+          return;
+        }
+        try {
+          const before = readPlan(dataDir, planId);
+          const plan = updatePlan(dataDir, planId, body);
+          const becameApproved = String(plan?.status || '') === 'approved'
+            && String(before?.status || '') !== 'approved';
+          const forceContinue = body?.continue === true;
+          let continued = null;
+          if (becameApproved || (forceContinue && String(plan?.status || '') === 'approved')) {
+            try {
+              continued = await continueWorkflowAfterPlanApproval({
+                dataDir,
+                plan,
+                workspaceRoot,
+                startTurn: startAssignedTurn,
+              });
+              // Prefer the post-continue plan (status may flip to executing).
+              if (continued?.ok && !continued.skipped) {
+                const next = readPlan(dataDir, planId);
+                sendJson(res, 200, { plan: next || plan, continued });
+                return;
+              }
+            } catch (err) {
+              continued = { ok: false, error: err?.message || String(err) };
+            }
+          }
+          sendJson(res, 200, { plan, ...(continued ? { continued } : {}) });
+        } catch (err) {
+          sendJson(res, err?.code === 'ENOENT' ? 404 : 400, { error: err?.message || 'update plan failed' });
+        }
+        return;
+      }
+    }
+
+    if (req.method === 'POST' && (url.pathname === '/kusa/agents/migrate' || url.pathname === '/kusa/sessions/migrate')) {
       let body = {};
       try {
         const raw = await readBody(req, 2_000_000);
@@ -1748,9 +2271,10 @@ export function createMonitorServer({
 
     if (
       (req.method === 'GET' || req.method === 'HEAD')
-      && url.pathname.startsWith('/kusa/sessions/')
+      && (url.pathname.startsWith('/kusa/agents/') || url.pathname.startsWith('/kusa/sessions/'))
     ) {
-      const id = decodeURIComponent(url.pathname.slice('/kusa/sessions/'.length)).trim();
+      const idPrefix = url.pathname.startsWith('/kusa/agents/') ? '/kusa/agents/' : '/kusa/sessions/';
+      const id = decodeURIComponent(url.pathname.slice(idPrefix.length)).trim();
       if (!id || id.includes('/') || id.includes('..')) {
         sendJson(res, 400, { error: 'invalid session id' });
         return;
@@ -1770,7 +2294,9 @@ export function createMonitorServer({
       const settings = loadMonitorSettings(dataDir);
       const backend = settings?.agentBackend === 'opencode' ? 'opencode' : 'native';
       const approvalMode = normalizeApprovalMode(settings?.agentApprovalMode);
-      const groups = agentToolGroups(url.searchParams.get('mode'))
+      // Include escalate in the catalog so Tools panel discovers it; the model
+      // only receives the schema on orchestrated sessions.
+      const groups = agentToolGroups(url.searchParams.get('mode'), { orchestrated: true })
         .map((entry) => ({
           group: entry.group,
           tools: entry.schemas
@@ -2438,6 +2964,8 @@ export function createMonitorServer({
             signal: turnAbort.signal,
             onApprove: (ask) => waitForApproval(ask, jobKey),
             onAsk: (ask) => waitForAsk(ask, jobKey),
+            onAssignTurn: startAssignedTurn,
+            onEscalateTurn: startAssignedTurn,
             onEvent: (ev) => {
               const type = ev?.type || 'message';
               // Final `done` is written once below so clients get a stable payload.
@@ -2468,6 +2996,9 @@ export function createMonitorServer({
                   set.delete(id);
                   if (!set.size) asksByQueueKey.delete(jobKey);
                 }
+              }
+              if (type === 'approval_request' || type === 'ask_request') {
+                relayChildGateEvent(job.sessionId || resolvedSessionId, jobKey, ev);
               }
               broadcastTurn(job, type, ev);
             },
@@ -2548,6 +3079,8 @@ export function createMonitorServer({
           approvalMode: approvalRules || settings?.agentApprovalMode,
           onSteer: queueKey ? () => drainSteering(queueKey) : undefined,
           signal: turnAbort.signal,
+          onAssignTurn: startAssignedTurn,
+          onEscalateTurn: startAssignedTurn,
         });
         if (hooks.enabled) {
           hooks.afterAgentResponse(result.text || '');
@@ -2613,10 +3146,28 @@ export function createMonitorServer({
         return;
       }
       try {
-        const result = deleteSessions(dataDir, keys);
+        const resolved = resolveAgentDeleteKeys(dataDir, keys);
+        if (!resolved.keys.length) {
+          sendJson(res, 400, {
+            error: 'Subagents cannot be deleted on their own — delete the parent Agent instead',
+            code: 'ESUBAGENT',
+            blocked: resolved.blocked,
+          });
+          return;
+        }
+        const locked = plansBlockingAgentDelete(dataDir, resolved.keys);
+        if (locked.length) {
+          sendJson(res, 409, {
+            error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
+            code: 'EPLAN_LOCK',
+            plans: locked.map(planSummary),
+          });
+          return;
+        }
+        const result = deleteSessions(dataDir, resolved.keys);
         // Drop session-bound held + steering; workspace parked stays claimable.
         let queueDirty = false;
-        for (const key of keys) {
+        for (const key of resolved.keys) {
           const qk = String(key || '');
           if (!qk.startsWith('kusa:') || qk === WORKSPACE_QUEUE_KEY) continue;
           if (queuedMessages.delete(qk)) queueDirty = true;
@@ -2636,16 +3187,16 @@ export function createMonitorServer({
       if (route?.stem) {
         const stem = route.stem;
         const rels = new Set([
-          `${SESSIONS_DIR}/${stem}/${LANE_FILE}`,
+          `${AGENTS_DIR}/${stem}/${LANE_FILE}`,
           // Legacy stem-prefixed / harness-folder paths still referenced in older indexes.
-          `${SESSIONS_DIR}/${stem}/${stem}.json`,
-          route.harness && route.harness !== SESSIONS_DIR
+          `${AGENTS_DIR}/${stem}/${stem}.json`,
+          route.harness && route.harness !== AGENTS_DIR
             ? `${route.harness}/${stem}/${LANE_FILE}`
             : null,
-          route.harness && route.harness !== SESSIONS_DIR
+          route.harness && route.harness !== AGENTS_DIR
             ? `${route.harness}/${stem}/${stem}.json`
             : null,
-          route.harness && route.harness !== SESSIONS_DIR
+          route.harness && route.harness !== AGENTS_DIR
             ? `${route.harness}/${stem}.json`
             : null,
         ].filter(Boolean));
@@ -2663,13 +3214,31 @@ export function createMonitorServer({
             else if (lane?.id) keys = [laneKey(lane.harness || route.harness || 'kusa', lane.id)];
           } catch { /* ignore */ }
         }
-        if (!keys.length && route.harness && route.harness !== SESSIONS_DIR) {
+        if (!keys.length && route.harness && route.harness !== AGENTS_DIR) {
           keys = [laneKey(route.harness, stem)];
         }
         try {
-          const result = deleteSessions(dataDir, keys);
+          const resolved = resolveAgentDeleteKeys(dataDir, keys);
+          if (!resolved.keys.length) {
+            sendJson(res, 400, {
+              error: 'Subagents cannot be deleted on their own — delete the parent Agent instead',
+              code: 'ESUBAGENT',
+              blocked: resolved.blocked,
+            });
+            return;
+          }
+          const locked = plansBlockingAgentDelete(dataDir, resolved.keys);
+          if (locked.length) {
+            sendJson(res, 409, {
+              error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
+              code: 'EPLAN_LOCK',
+              plans: locked.map(planSummary),
+            });
+            return;
+          }
+          const result = deleteSessions(dataDir, resolved.keys);
           let queueDirty = false;
-          for (const key of keys) {
+          for (const key of resolved.keys) {
             const qk = String(key || '');
             if (!qk.startsWith('kusa:') || qk === WORKSPACE_QUEUE_KEY) continue;
             if (queuedMessages.delete(qk)) queueDirty = true;
@@ -2693,7 +3262,10 @@ export function createMonitorServer({
       res.writeHead(302, { Location: '/' }).end();
       return;
     }
-    const route = routes[url.pathname] || iconRoute(url.pathname) || sessionRoute(url.pathname);
+    const route = routes[url.pathname]
+      || iconRoute(url.pathname)
+      || voiceModelRoute(url.pathname)
+      || sessionRoute(url.pathname);
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found\n');
       return;
@@ -2717,67 +3289,25 @@ export function createMonitorServer({
     }
   };
 
-  // Proxy browser WebSocket upgrades to the Live Chat Pipecat bot.
-  server.on('upgrade', (req, socket, head) => {
+  // Live Chat WebSocket proxy retired — browser voice needs no WS to WSL.
+  server.on('upgrade', (req, socket) => {
     let pathname = '/';
-    let search = '';
     try {
       const u = new NodeURL(req.url || '/', 'http://127.0.0.1');
       pathname = u.pathname;
-      search = u.search || '';
     } catch {
       socket.destroy();
       return;
     }
-    if (pathname !== '/live-chat/ws') {
-      socket.destroy();
-      return;
-    }
-    const settings = loadMonitorSettings(dataDir);
-    const baseUrl = resolveLiveChatBaseUrl(process.env, settings);
-    let target;
-    try {
-      target = new NodeURL(`/ws${search}`, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
-    } catch {
-      socket.destroy();
-      return;
-    }
-    const headers = { ...req.headers, host: target.host };
-    delete headers['origin'];
-    const proxyReq = httpRequest({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      path: `${target.pathname}${target.search}`,
-      method: 'GET',
-      headers,
-    });
-    proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
-      const lines = [`HTTP/1.1 ${proxyRes.statusCode} Switching Protocols`];
-      for (const [key, value] of Object.entries(proxyRes.headers)) {
-        if (value == null) continue;
-        if (Array.isArray(value)) {
-          for (const v of value) lines.push(`${key}: ${v}`);
-        } else {
-          lines.push(`${key}: ${value}`);
-        }
-      }
-      lines.push('', '');
-      socket.write(lines.join('\r\n'));
-      if (proxyHead?.length) proxySocket.write(proxyHead);
-      if (head?.length) socket.write(head);
-      proxySocket.pipe(socket);
-      socket.pipe(proxySocket);
-      proxySocket.on('error', () => socket.destroy());
-      socket.on('error', () => proxySocket.destroy());
-    });
-    proxyReq.on('error', () => {
+    if (pathname === '/live-chat/ws') {
       try {
-        socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+        socket.write(
+          'HTTP/1.1 410 Gone\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n'
+          + 'Live Chat WebSocket is retired. Voice runs in the browser.\r\n',
+        );
       } catch { /* ignore */ }
-      socket.destroy();
-    });
-    proxyReq.end();
+    }
+    socket.destroy();
   });
 
   return server;

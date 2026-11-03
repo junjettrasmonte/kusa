@@ -139,6 +139,44 @@ export function isAgentErrorMessage(msg) {
   return /^Agent error:\s*/i.test(String(msg.text || ''));
 }
 
+/**
+ * Drop leaked XML tool-protocol dumps models sometimes paste into the reply
+ * body (`<tool_call>…</tool_call>` with HTML/file payloads inside). Those
+ * blocks break ReactMarkdown (raw HTML flow nodes vanish / wreck the tree);
+ * the real tool call already lives in `parts` as a ToolCallRow.
+ *
+ * Unclosed tags (mid-stream) are stripped from the open tag through EOF so
+ * partial HTML never reaches the renderer.
+ * @param {string} text
+ */
+export function stripLeakedToolCalls(text) {
+  let s = String(text || '');
+  if (!s.includes('<tool_call') && !s.includes('</tool_call')) return s;
+  // Closed blocks (non-greedy; nested HTML inside is fine).
+  s = s.replace(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call\s*>/gi, '');
+  // Streaming / truncated: open tag with no closer yet.
+  s = s.replace(/<tool_call\b[^>]*>[\s\S]*$/gi, '');
+  s = s.replace(/<\/tool_call\s*>/gi, '');
+  return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+/**
+ * Light markdown → spoken prose for Live Chat TTS (final assistant text only).
+ * @param {string} text
+ * @param {number} [max=4000]
+ */
+export function stripMarkdownForSpeech(text, max = 4000) {
+  const cleaned = stripLeakedToolCalls(String(text || ''))
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[#>*_~]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cleaned.length <= max) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, max - 1))}…`;
+}
+
 /** Cursor CAO turns that failed because workspace trust was never granted. */
 const CURSOR_TRUST_RE =
   /Workspace Trust Required|Do you trust the contents of this directory|trust this workspace|ECAO_TRUST|workspace trust is usually blocking/i;

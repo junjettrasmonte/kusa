@@ -87,19 +87,21 @@ export async function runCursorStreamTurn({
     onJson: (ev) => applyCursorStreamEvent(state, ev, emit),
   });
 
-  if (state.cliSessionId || model) {
+  const resolvedModel = String(state.model || model || '').trim();
+  const parentId = String(opts.parentId || session?.parentId || '').trim() || null;
+  if (state.cliSessionId || resolvedModel) {
     try {
       writeSessionConfig(dataDir, sessionId, {
         provider: 'cursor',
         kind: session?.kind || opts.kind || 'standard',
-        ...(model ? { model } : {}),
+        ...(resolvedModel ? { model: resolvedModel } : {}),
         ...(state.cliSessionId
           ? {
             cursorCliSessionId: state.cliSessionId,
             cliSessionId: state.cliSessionId,
           }
           : {}),
-      }, harness);
+      }, harness, parentId);
     } catch { /* best-effort */ }
   }
 
@@ -137,5 +139,10 @@ export async function runCursorStreamTurn({
   const text = state.content.trim() || state.sawResultText.trim() || '(empty response)';
   emit({ type: 'content', text, delta: '' });
   emit({ type: 'done', text });
-  return { text, cliSessionId: state.cliSessionId, backend: 'cursor-cli' };
+  return {
+    text,
+    cliSessionId: state.cliSessionId,
+    backend: 'cursor-cli',
+    ...(resolvedModel ? { model: resolvedModel } : {}),
+  };
 }

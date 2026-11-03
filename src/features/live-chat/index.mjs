@@ -1,11 +1,10 @@
 /**
- * Live Chat (Pipecat) — status probe and HTTP client for the local voice bot
- * (default http://127.0.0.1:7860). kusa serve probes health, proxies WS/RTC,
- * and can spawn the bot detached via `startLiveChatServer` (same pattern as CAO).
+ * Live Chat — browser-native offline voice prefs + retired Pipecat helpers.
  *
- * Uses Node's built-in fetch (no undici package). Node does not apply
- * HTTP(S)_PROXY to fetch unless NODE_USE_ENV_PROXY=1, so localhost probes
- * stay direct in typical WSL/corporate proxy setups.
+ * Voice STT/TTS/VAD now run in the PWA. Settings are stored in monitor
+ * `liveChat`. Pipecat bot spawn / WS / RTC helpers remain exported for
+ * compatibility but status reports `mode: 'browser'` and `serverUp: true`
+ * so the Live button no longer waits on an external bot.
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -20,30 +19,56 @@ import { laneKey } from '#features/monitor/lib.mjs';
 import { pkgRoot } from '#shared/lib/pkg.mjs';
 import { spawnDetached } from '#shared/lib/spawn-detached.mjs';
 
+import {
+  expressivenessSpeed,
+  normalizeLiveChatExpressiveness,
+  normalizeLiveChatGender,
+  resolveVoiceId,
+} from '#features/live-chat/voices.mjs';
+
 export const DEFAULT_LIVE_CHAT_BASE_URL = 'http://127.0.0.1:7860';
 export const LIVE_CHAT_TRANSPORTS = ['websocket', 'webrtc'];
 export const LIVE_CHAT_TTS = ['piper', 'kokoro'];
+export const LIVE_CHAT_STT_PROVIDERS = ['whisper', 'webSpeech', 'mock'];
+export const LIVE_CHAT_TTS_PROVIDERS = ['kokoro', 'browserSpeech', 'mock'];
+export const LIVE_CHAT_VAD_PROVIDERS = ['silero', 'energy', 'mock'];
+export const DEFAULT_WHISPER_MODEL = 'onnx-community/whisper-tiny.en';
+export {
+  LIVE_CHAT_EXPRESSIVENESS,
+  LIVE_CHAT_GENDERS,
+  KOKORO_VOICES,
+  PIPER_VOICES,
+  expressivenessSpeed,
+  filterVoicesByGender,
+  normalizeLiveChatExpressiveness,
+  normalizeLiveChatGender,
+  resolveVoiceId,
+  voicesForEngine,
+} from '#features/live-chat/voices.mjs';
 
 const LIVE_CHAT_TIMEOUT_MS = 4000;
 const LIVE_CHAT_STATUS_CACHE_MS = 2000;
 let liveChatStatusCache = { at: 0, baseUrl: '', value: null };
 
 export const LIVE_CHAT_INSTALL_STEPS = [
-  'Install uv: https://docs.astral.sh/uv/',
-  'cd extensions/live-chat && uv sync',
-  'Optional TTS extras: uv sync --extra piper  (and/or --extra kokoro)',
-  'Set STRATA_BASE_URL (and STRATA_API_KEY / STRATA_MODEL as needed)',
-  'Start the bot: uv run python -m live_chat',
-  'Confirm health: curl http://127.0.0.1:7860/health',
-  'Reload this dashboard (or reopen the Live Chat tab)',
+  'Open a chat session and click Live — voice runs in the browser',
+  'First use downloads Whisper / Kokoro / Silero models (Dev Tools › Live Chat)',
+  'Prefer Chrome/Edge with WebGPU for faster local inference; WASM works as fallback',
+  'Enable Offline-only in Live Chat settings to block cloud SpeechRecognition / SpeechSynthesis',
 ];
 
-export const LIVE_CHAT_SERVER_STEPS = [
-  'In a terminal from extensions/live-chat, start the bot and leave it running: uv run python -m live_chat',
-  'Confirm health: curl http://127.0.0.1:7860/health',
-  'Optional — set LIVE_CHAT_BASE_URL if the bot is not on 127.0.0.1:7860',
-  'Reload this dashboard (or reopen the Live Chat tab)',
-];
+export const LIVE_CHAT_SERVER_STEPS = LIVE_CHAT_INSTALL_STEPS;
+
+function pickProvider(raw, allowed, fallback) {
+  const v = String(raw ?? '').trim();
+  return allowed.includes(v) ? v : fallback;
+}
+
+function normalizeSpeechRate(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(2, Math.max(0.5, n));
+}
 
 export function resolveLiveChatBaseUrl(env = process.env, settings = null) {
   const fromSettings = settings?.liveChat?.baseUrl;
@@ -68,32 +93,74 @@ export function normalizeLiveChatTts(raw) {
 
 /**
  * Normalize the liveChat block stored in monitor settings.
+ * Migrates legacy Pipecat prefs (`tts: piper|kokoro`, transport) into browser providers.
  * @param {unknown} raw
  */
 export function normalizeLiveChatSettings(raw = {}) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const baseUrl = typeof src.baseUrl === 'string' ? src.baseUrl.trim().replace(/\/+$/, '') : '';
+  // Legacy engine field — map piper → kokoro for browser TTS.
+  const legacyTts = normalizeLiveChatTts(src.tts);
+  const ttsProvider = pickProvider(
+    src.ttsProvider,
+    LIVE_CHAT_TTS_PROVIDERS,
+    legacyTts === 'kokoro' || !src.ttsProvider ? 'kokoro' : 'kokoro',
+  );
+  const sttProvider = pickProvider(src.sttProvider, LIVE_CHAT_STT_PROVIDERS, 'whisper');
+  const vadProvider = pickProvider(src.vadProvider, LIVE_CHAT_VAD_PROVIDERS, 'silero');
+  const gender = normalizeLiveChatGender(src.gender);
+  const expressiveness = normalizeLiveChatExpressiveness(src.expressiveness);
+  const voiceEngine = ttsProvider === 'kokoro' ? 'kokoro' : 'kokoro';
+  const voice = resolveVoiceId(voiceEngine, {
+    gender,
+    preferred: typeof src.voice === 'string' ? src.voice : '',
+  });
+  // Only tiny is bundled in the PWA; clamp legacy base selections.
+  const whisperRaw = typeof src.whisperModel === 'string' ? src.whisperModel.trim() : '';
+  const whisperModel = whisperRaw.includes('whisper-base')
+    ? DEFAULT_WHISPER_MODEL
+    : (whisperRaw || DEFAULT_WHISPER_MODEL);
+  const language = typeof src.language === 'string' && src.language.trim()
+    ? src.language.trim()
+    : 'en';
   return {
+    // Legacy fields retained for older UI/tests; unused by browser voice path.
     transport: normalizeLiveChatTransport(src.transport),
-    tts: normalizeLiveChatTts(src.tts),
+    tts: ttsProvider === 'kokoro' ? 'kokoro' : legacyTts,
     baseUrl,
+    gender,
+    voice,
+    expressiveness,
+    // Browser-native providers
+    sttProvider,
+    ttsProvider,
+    vadProvider,
+    offlineOnly: src.offlineOnly !== false,
+    language,
+    autoSpeak: src.autoSpeak !== false,
+    interruptible: src.interruptible !== false,
+    speechRate: normalizeSpeechRate(src.speechRate),
+    whisperModel,
+    mode: 'browser',
   };
 }
 
 export function emptyLiveChatStatus(error = null) {
+  const failed = Boolean(error);
   return {
-    ok: false,
+    ok: !failed,
     checkedAt: Date.now(),
-    installed: false,
-    serverUp: false,
+    installed: !failed,
+    serverUp: !failed,
+    mode: 'browser',
     baseUrl: DEFAULT_LIVE_CHAT_BASE_URL,
-    transport: 'websocket',
-    tts: 'piper',
+    transport: 'browser',
+    tts: 'kokoro',
     model: null,
-    strataConfigured: false,
-    wsPath: '/ws',
-    rtcPath: '/rtc',
-    version: null,
+    modelConfigured: !failed,
+    wsPath: null,
+    rtcPath: null,
+    version: 'browser',
     error: error || null,
     steps: LIVE_CHAT_INSTALL_STEPS,
     root: null,
@@ -263,14 +330,24 @@ function signalPid(pid, signal = 'SIGTERM') {
   }
 }
 
-function strataEnvFromSettings(settings) {
+function llmEnvFromSettings(settings) {
   if (!settings || typeof settings !== 'object') return {};
   try {
     const endpoint = resolveAgentEndpoint(settings);
     const env = {};
-    if (endpoint?.baseUrl) env.STRATA_BASE_URL = String(endpoint.baseUrl).replace(/\/+$/, '');
-    if (endpoint?.apiKey) env.STRATA_API_KEY = String(endpoint.apiKey);
-    if (endpoint?.model) env.STRATA_MODEL = String(endpoint.model);
+    if (endpoint?.baseUrl) {
+      const base = String(endpoint.baseUrl).replace(/\/+$/, '');
+      env.LLM_BASE_URL = base;
+      env.STRATA_BASE_URL = base; // alias for older bot processes
+    }
+    if (endpoint?.apiKey) {
+      env.LLM_API_KEY = String(endpoint.apiKey);
+      env.STRATA_API_KEY = String(endpoint.apiKey);
+    }
+    if (endpoint?.model) {
+      env.LLM_MODEL = String(endpoint.model);
+      env.STRATA_MODEL = String(endpoint.model);
+    }
     return env;
   } catch {
     return {};
@@ -295,14 +372,24 @@ async function spawnLiveChatProcess({
   transcriptCallbackUrl = null,
 }) {
   const prefs = normalizeLiveChatSettings(settings?.liveChat);
+  const engine = normalizeLiveChatTts(tts || prefs.tts);
+  const voice = resolveVoiceId(engine, {
+    gender: prefs.gender,
+    preferred: prefs.voice,
+  });
   const env = {
     ...process.env,
-    ...strataEnvFromSettings(settings),
+    ...llmEnvFromSettings(settings),
     LIVE_CHAT_HOST: host,
     LIVE_CHAT_PORT: String(port),
     TRANSPORT: normalizeLiveChatTransport(transport || prefs.transport),
-    TTS_ENGINE: normalizeLiveChatTts(tts || prefs.tts),
+    TTS_ENGINE: engine,
+    TTS_SPEED: String(expressivenessSpeed(prefs.expressiveness)),
+    TTS_EXPRESSIVENESS: prefs.expressiveness,
+    TTS_GENDER: prefs.gender,
   };
+  if (engine === 'kokoro') env.KOKORO_VOICE = voice;
+  else env.PIPER_VOICE = voice;
   if (transcriptCallbackUrl) {
     env.LIVE_CHAT_TRANSCRIPT_URL = transcriptCallbackUrl;
   }
@@ -506,7 +593,7 @@ async function stopLiveChatServerUnlocked({
 }
 
 /**
- * Stop then start so TRANSPORT / TTS_ENGINE (and Strata) match current settings.
+ * Stop then start so TRANSPORT / TTS_ENGINE (and Kusă model) match current settings.
  */
 export function restartLiveChatServer(opts = {}) {
   if (!liveChatStartInFlight) {
@@ -595,7 +682,8 @@ export async function collectLiveChatStatus({
   settings = null,
   workspaceRoot = null,
 } = {}) {
-  // Explicit baseUrl wins (tests / callers); otherwise settings → env → default.
+  // Browser-native voice: no Pipecat health probe. Status stays "up" so the
+  // Live button works without a separate bot process.
   const resolved = (typeof baseUrl === 'string' && baseUrl.trim()
     ? baseUrl.trim().replace(/\/+$/, '')
     : null)
@@ -612,12 +700,56 @@ export async function collectLiveChatStatus({
 
   const prefs = normalizeLiveChatSettings(settings?.liveChat);
   const install = probeLiveChatInstall(workspaceRoot);
+  const value = {
+    ok: true,
+    checkedAt: now,
+    installed: true,
+    serverUp: true,
+    mode: 'browser',
+    baseUrl: resolved,
+    root: install.root,
+    transport: 'browser',
+    tts: prefs.ttsProvider || prefs.tts,
+    sttProvider: prefs.sttProvider,
+    ttsProvider: prefs.ttsProvider,
+    vadProvider: prefs.vadProvider,
+    offlineOnly: prefs.offlineOnly,
+    model: null,
+    modelConfigured: true,
+    wsPath: null,
+    rtcPath: null,
+    version: 'browser',
+    error: null,
+    steps: [...LIVE_CHAT_INSTALL_STEPS],
+    retiredPipecat: true,
+  };
+  liveChatStatusCache = { at: now, baseUrl: resolved, value };
+  return value;
+}
+
+/** @deprecated Pipecat health path — kept for tests that import the old shape. */
+export async function collectLiveChatStatusLegacy({
+  force = false,
+  baseUrl = null,
+  settings = null,
+  workspaceRoot = null,
+} = {}) {
+  const resolved = (typeof baseUrl === 'string' && baseUrl.trim()
+    ? baseUrl.trim().replace(/\/+$/, '')
+    : null)
+    || resolveLiveChatBaseUrl(process.env, settings);
+  const now = Date.now();
+  const prefs = normalizeLiveChatSettings(settings?.liveChat);
+  const install = probeLiveChatInstall(workspaceRoot);
   const health = await liveChatFetch('/health', { baseUrl: resolved });
   if (!health.ok) {
-    const value = {
+    return {
       ...emptyLiveChatStatus(health.error || (install.installed
         ? 'Live Chat bot is not reachable'
         : 'Live Chat bot not installed')),
+      ok: false,
+      serverUp: false,
+      mode: 'pipecat',
       baseUrl: resolved,
       installed: install.installed,
       root: install.root,
@@ -625,37 +757,106 @@ export async function collectLiveChatStatus({
       tts: prefs.tts,
       steps: install.installed ? [...LIVE_CHAT_SERVER_STEPS] : [...LIVE_CHAT_INSTALL_STEPS],
     };
-    liveChatStatusCache = { at: now, baseUrl: resolved, value };
-    return value;
   }
 
   const data = health.data || {};
-  const value = {
+  return {
     ok: true,
     checkedAt: now,
     installed: true,
+    mode: 'pipecat',
+    force,
     serverUp: data.serverUp !== false,
     baseUrl: resolved,
     root: install.root,
     transport: normalizeLiveChatTransport(data.transport || prefs.transport),
     tts: normalizeLiveChatTts(data.tts || prefs.tts),
     model: typeof data.model === 'string' ? data.model : null,
-    strataConfigured: Boolean(data.strataConfigured),
+    modelConfigured: Boolean(data.modelConfigured ?? data.strataConfigured),
     wsPath: typeof data.wsPath === 'string' ? data.wsPath : '/ws',
     rtcPath: typeof data.rtcPath === 'string' ? data.rtcPath : '/rtc',
     version: typeof data.version === 'string' ? data.version : null,
     error: null,
     steps: [],
   };
-  liveChatStatusCache = { at: now, baseUrl: resolved, value };
-  return value;
+}
+
+/** Soft caps so mint payloads stay small enough for spoken context. */
+export const LIVE_CHAT_HISTORY_MAX_MESSAGES = 40;
+export const LIVE_CHAT_HISTORY_MAX_CHARS = 12_000;
+
+/**
+ * Resolve a chat session the same way transcript append does (id, then queueKey).
+ */
+export function resolveLiveChatChatSession(dir, {
+  sessionId = null,
+  harness = KUSA_HARNESS,
+  queueKey = null,
+} = {}) {
+  if (!dir) return null;
+  let id = typeof sessionId === 'string' ? sessionId.trim() : '';
+  let lane = harness || KUSA_HARNESS;
+  if ((!id || !readChatSession(dir, id, lane)) && typeof queueKey === 'string' && queueKey.includes(':')) {
+    const prefix = queueKey.slice(0, queueKey.indexOf(':'));
+    const rest = queueKey.slice(queueKey.indexOf(':') + 1);
+    if (rest) {
+      id = rest;
+      lane = prefix || lane;
+    }
+  }
+  if (!id) return null;
+  let session = readChatSession(dir, id, lane);
+  if (!session) {
+    session = readChatSession(dir, id, null);
+  }
+  return session || null;
 }
 
 /**
- * Mint a voice session on the bot, injecting Strata credentials from settings.
+ * Pack prior chat turns as OpenAI-style {role, content} for the live voice LLM.
+ * Newest-preserving: drop oldest first when over message/char caps.
+ */
+export function liveChatHistoryMessages(dir, {
+  sessionId = null,
+  harness = KUSA_HARNESS,
+  queueKey = null,
+  maxMessages = LIVE_CHAT_HISTORY_MAX_MESSAGES,
+  maxChars = LIVE_CHAT_HISTORY_MAX_CHARS,
+} = {}) {
+  const session = resolveLiveChatChatSession(dir, { sessionId, harness, queueKey });
+  const raw = Array.isArray(session?.messages) ? session.messages : [];
+  /** @type {Array<{ role: string, content: string }>} */
+  const turns = [];
+  for (const m of raw) {
+    if (!m || typeof m.text !== 'string') continue;
+    const text = m.text.trim();
+    if (!text) continue;
+    // Skip failed / stopped rows — they add noise without helping spoken context.
+    if (m.error === true) continue;
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    turns.push({ role, content: text });
+  }
+  const msgCap = Math.max(1, Number(maxMessages) || LIVE_CHAT_HISTORY_MAX_MESSAGES);
+  const charCap = Math.max(500, Number(maxChars) || LIVE_CHAT_HISTORY_MAX_CHARS);
+  let sliced = turns.length > msgCap ? turns.slice(turns.length - msgCap) : turns;
+  let total = sliced.reduce((n, t) => n + t.content.length, 0);
+  while (sliced.length > 1 && total > charCap) {
+    total -= sliced[0].content.length;
+    sliced = sliced.slice(1);
+  }
+  if (sliced.length === 1 && sliced[0].content.length > charCap) {
+    sliced = [{ ...sliced[0], content: sliced[0].content.slice(-charCap) }];
+  }
+  return sliced;
+}
+
+/**
+ * Mint a voice session on the bot, injecting Kusă agent credentials from settings
+ * and (when `dir` is set) prior chat turns so the voice LLM has session context.
  */
 export async function createLiveChatSession({
   settings,
+  dir = null,
   sessionId = null,
   queueKey = null,
   modelOverride = null,
@@ -674,6 +875,9 @@ export async function createLiveChatSession({
       : {}),
   };
   const endpoint = resolveAgentEndpoint(scoped);
+  const history = dir
+    ? liveChatHistoryMessages(dir, { sessionId, queueKey })
+    : [];
   const body = {
     sessionId: sessionId || undefined,
     queueKey: queueKey || undefined,
@@ -682,6 +886,7 @@ export async function createLiveChatSession({
     apiKey: endpoint.apiKey || undefined,
     transport: normalizeLiveChatTransport(transport || prefs.transport),
     tts: normalizeLiveChatTts(tts || prefs.tts),
+    ...(history.length ? { messages: history } : {}),
   };
   const res = await liveChatFetch('/session', {
     baseUrl: resolvedBase,
@@ -702,6 +907,7 @@ export async function createLiveChatSession({
     botBaseUrl: resolvedBase,
     transport: normalizeLiveChatTransport(res.data?.transport || body.transport),
     tts: normalizeLiveChatTts(res.data?.tts || body.tts),
+    historyMessages: history.length,
   };
 }
 
@@ -718,24 +924,10 @@ export function appendLiveChatTranscript(dir, {
 } = {}) {
   const trimmed = String(text || '').trim();
   if (!trimmed) return null;
-  let id = typeof sessionId === 'string' ? sessionId.trim() : '';
-  let lane = harness || KUSA_HARNESS;
-  if ((!id || !readChatSession(dir, id, lane)) && typeof queueKey === 'string' && queueKey.includes(':')) {
-    const prefix = queueKey.slice(0, queueKey.indexOf(':'));
-    const rest = queueKey.slice(queueKey.indexOf(':') + 1);
-    if (rest) {
-      id = rest;
-      lane = prefix || lane;
-    }
-  }
-  if (!id) return null;
-  let session = readChatSession(dir, id, lane);
-  // Wrong harness guess — try any chat harness folder.
-  if (!session) {
-    session = readChatSession(dir, id, null);
-    if (session?.harness) lane = session.harness;
-  }
-  if (!session) return null;
+  const session = resolveLiveChatChatSession(dir, { sessionId, harness, queueKey });
+  if (!session?.id) return null;
+  const lane = session.harness || harness || KUSA_HARNESS;
+  const id = session.id;
   const message = {
     id: `voice-${at}-${Math.random().toString(36).slice(2, 8)}`,
     role: role === 'assistant' ? 'assistant' : 'user',

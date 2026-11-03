@@ -22,9 +22,9 @@ def main() -> None:
     from .server import run
 
     cfg = LiveChatConfig.from_env()
-    if not cfg.strata_base_url:
+    if not cfg.llm_base_url:
         print(
-            "warning: STRATA_BASE_URL is empty — LLM turns will fail until set",
+            "warning: LLM_BASE_URL is empty — set the Kusă agent endpoint (any OpenAI-compatible provider)",
             file=sys.stderr,
         )
     run(cfg)

@@ -81,7 +81,7 @@ describe('kusa agent session naming', () => {
 
     // The name is not turn data: it lives in the settings sidecar, and
     // normalizeChatSession prefers it over anything the transcript suggests.
-    const sidecar = readFileSync(join(dir, 'sessions', 'sess-1', 'session.json'), 'utf8');
+    const sidecar = readFileSync(join(dir, 'agents', 'sess-1', 'agent.json'), 'utf8');
     assert.match(sidecar, /"name": "Fix the slow CSV parser"/);
     const renamed = readChatSession(dir, sessionKey);
     assert.equal(renamed.title, 'Fix the slow CSV parser');
@@ -163,7 +163,7 @@ describe('kusa agent session naming', () => {
     const applied = await tool.call('kusa_name_session', { name: 'Phantom' });
     assert.equal(applied.ok, false);
     assert.match(applied.error, /no session ghost-1 to name/);
-    assert.equal(existsSync(join(dir, 'sessions', 'ghost-1')), false);
+    assert.equal(existsSync(join(dir, 'agents', 'ghost-1')), false);
   });
 
   it('the agent loop dispatches the tool through the session family', async () => {

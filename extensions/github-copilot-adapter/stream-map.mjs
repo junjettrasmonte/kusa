@@ -7,9 +7,28 @@ function dataOf(ev) {
   return ev?.data && typeof ev.data === 'object' ? ev.data : {};
 }
 
+/** Pick a model id from a Copilot stream event when present. */
+export function modelFromCopilotEvent(ev, data = null) {
+  const bag = data && typeof data === 'object' ? data : {};
+  const root = ev && typeof ev === 'object' ? ev : {};
+  for (const raw of [
+    bag.model,
+    bag.modelId,
+    bag.model_id,
+    root.model,
+    root.modelId,
+    root.model_id,
+  ]) {
+    const s = String(raw || '').trim();
+    if (s) return s;
+  }
+  return '';
+}
+
 export function emptyCopilotStreamState(cliSessionId = '') {
   return {
     cliSessionId: String(cliSessionId || '').trim(),
+    model: '',
     thinking: '',
     content: '',
     turnError: null,
@@ -25,6 +44,8 @@ export function emptyCopilotStreamState(cliSessionId = '') {
 export function applyCopilotStreamEvent(state, ev, emit = () => {}) {
   const type = String(ev?.type || '');
   const data = dataOf(ev);
+  const reportedModel = modelFromCopilotEvent(ev, data);
+  if (reportedModel) state.model = reportedModel;
 
   if (type === 'session.start') {
     const sid = String(

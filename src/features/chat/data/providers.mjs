@@ -133,7 +133,7 @@ export const CHAT_PROVIDERS = new Proxy(
   },
 );
 
-/** Provider ids shown under Standard Session in the Agents + menu. */
+/** Provider ids shown under Standard Agent in the Agents + menu. */
 export function standardProviderIds() {
   return listChatProviders().filter((p) => p.standard).map((p) => p.id);
 }
@@ -197,6 +197,8 @@ export function isExternalOwnedHarness(harness) {
  */
 export function isExternalChatSession(session) {
   if (!session || typeof session !== 'object') return false;
+  // Kusă-spawned Subagents (including Cursor planners) are always promptable here.
+  if (session.parentId || session.options?.parentId) return false;
   if (session.external === true) return true;
   if (session.external === false) return false;
   // Monitor-only IDE rows (no chat ownership record yet).

@@ -33,7 +33,13 @@ const PROVIDER_COLOR = {
 
 const PROVIDER_ICON_SIZE = 'h-[18px] w-[18px]';
 
+function isSubagentSession(session) {
+  return Boolean(session?.parentId || session?.options?.parentId);
+}
+
+/** Top-level orchestrated parents only — Subagents keep their own provider mark. */
 function isOrchestratedSession(session) {
+  if (isSubagentSession(session)) return false;
   const kind = String(session?.kind || session?.options?.kind || '').toLowerCase();
   return kind === 'orchestrated' || Boolean(session?.options?.workflowId || session?.workflowId);
 }
@@ -151,6 +157,7 @@ function filterSummaryLabel(filter) {
 const EXTERNAL_OWNED_HARNESS_FALLBACK = new Set(['cursor']);
 
 function isExternalSession(session) {
+  if (session?.parentId || session?.options?.parentId) return false;
   if (session?.external === true) return true;
   if (session?.external === false) return false;
   const harness = session?.harness
@@ -168,17 +175,25 @@ function SessionProviderIcon({ session, className = '' }) {
   const color = `${PROVIDER_COLOR[statusKey] || PROVIDER_COLOR.idle}${className ? ` ${className}` : ''}`;
   const external = isExternalSession(session);
   const orchestrated = isOrchestratedSession(session);
+  // Prefer provider/harness on the row (Subagents carry cursor/kusa/… even when
+  // they inherit a parent workflowId).
   const harness = session?.harness
+    || (typeof session?.provider === 'string' && session.provider.trim()
+      ? session.provider.trim()
+      : null)
+    || (typeof session?.options?.provider === 'string' && session.options.provider.trim()
+      ? session.options.provider.trim()
+      : null)
     || (typeof session?.key === 'string' && session.key.includes(':')
       ? session.key.slice(0, session.key.indexOf(':'))
       : 'kusa');
   const baseTitle = orchestrated
-    ? 'Orchestrated · multiple agents'
+    ? 'Orchestrated · chat group'
     : (HARNESS_NAMES[harness] || harness);
   const title = external ? `${baseTitle} · external (Cursor UI)` : baseTitle;
   const mark = orchestrated ? (
     <LucideIcon
-      name="network"
+      name="messages-square"
       className={`${PROVIDER_ICON_SIZE} ${color}`}
       title={external ? null : title}
     />
@@ -216,7 +231,7 @@ function SessionProviderIcon({ session, className = '' }) {
 const VIEW_ICONS = {
   // lucide `bot` (icons/bot.svg), paths verbatim from upstream. 18×18 box on
   // lucide’s 24×24 grid at stroke 2 → 1.5px ink, matching the neighbouring view icons.
-  sessions: (
+  agents: (
     <svg className="h-[18px] w-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 8V4H8" />
       <rect width="16" height="12" x="4" y="8" rx="2" />
@@ -256,7 +271,12 @@ function matchesFilter(session, filter) {
     if (!f.providers.includes(sessionProviderFilterId(session))) return false;
   }
   if (f.kinds?.length) {
-    const kind = isOrchestratedSession(session) ? 'orchestrated' : 'standard';
+    // Subagents stay off the sidebar (merged into the parent transcript). Treat
+    // them as orchestrated for filter math so they still contribute to parent
+    // busy/activity lookups when Orchestrated is selected.
+    const kind = (isOrchestratedSession(session) || isSubagentSession(session))
+      ? 'orchestrated'
+      : 'standard';
     if (!f.kinds.includes(kind)) return false;
   }
   if (f.statuses?.length) {
@@ -293,9 +313,9 @@ function FilterIcon({ className = 'h-4 w-4' }) {
 }
 
 function initialSidebarView() {
-  const saved = readLocal('monitor.sidebarView', 'sessions');
+  const saved = readLocal('monitor.sidebarView', 'agents');
   const current = SIDEBAR_VIEW_MIGRATED[saved] ?? saved;
-  return SIDEBAR_VIEW_IDS.includes(current) ? current : 'sessions';
+  return SIDEBAR_VIEW_IDS.includes(current) ? current : 'agents';
 }
 
 function ViewButton({ id, on, onSelect }) {
@@ -382,7 +402,7 @@ export function Sidebar({
   const newSessionRef = useRef(null);
   const filterActive = isSessionFilterActive(sessionFilter);
   const filterLabel = filterSummaryLabel(sessionFilter);
-  const sessionsView = view === 'sessions';
+  const sessionsView = view === 'agents';
 
   function selectView(next) {
     if (!SIDEBAR_VIEW_IDS.includes(next) || next === view) return;
@@ -391,7 +411,7 @@ export function Sidebar({
     setFilterOpen(false);
     setNewSessionOpen(false);
     setNewSessionSub(null);
-    if (next !== 'sessions' && selectMode) {
+    if (next !== 'agents' && selectMode) {
       onSelectModeChange?.(false);
       onClearChecked?.();
     }
@@ -435,22 +455,43 @@ export function Sidebar({
     if (!newSessionOpen || newSessionSub !== 'orchestrated') return undefined;
     let cancelled = false;
     setWorkflowsLoading(true);
-    fetch('/cao/workflows', { headers: { Accept: 'application/json' } })
-      .then(async (res) => {
-        if (!res.ok) return [];
-        const body = await res.json().catch(() => ({}));
-        const list = Array.isArray(body?.workflows) ? body.workflows : Array.isArray(body) ? body : [];
-        return list.map((w) => ({
-          id: String(w?.name || w?.id || '').trim(),
-          label: String(w?.name || w?.id || w?.title || '').trim(),
-          provider: typeof w?.provider === 'string' ? w.provider : null,
-        })).filter((w) => w.id);
-      })
-      .then((list) => {
-        if (!cancelled) setWorkflows(list);
-      })
-      .catch(() => {
-        if (!cancelled) setWorkflows([]);
+    // Prefer local `.kusa/workflows` (seeded plan-execute); fall back to CAO.
+    Promise.all([
+      fetch('/kusa/workflows', { headers: { Accept: 'application/json' } })
+        .then(async (res) => {
+          if (!res.ok) return [];
+          const body = await res.json().catch(() => ({}));
+          const list = Array.isArray(body?.workflows) ? body.workflows : [];
+          return list.map((w) => ({
+            id: String(w?.id || w?.name || '').trim(),
+            label: String(w?.label || w?.name || w?.id || '').trim(),
+            provider: typeof w?.provider === 'string' ? w.provider : 'kusa',
+          })).filter((w) => w.id);
+        })
+        .catch(() => []),
+      fetch('/cao/workflows', { headers: { Accept: 'application/json' } })
+        .then(async (res) => {
+          if (!res.ok) return [];
+          const body = await res.json().catch(() => ({}));
+          const list = Array.isArray(body?.workflows) ? body.workflows : Array.isArray(body) ? body : [];
+          return list.map((w) => ({
+            id: String(w?.name || w?.id || '').trim(),
+            label: String(w?.name || w?.id || w?.title || '').trim(),
+            provider: typeof w?.provider === 'string' ? w.provider : null,
+          })).filter((w) => w.id);
+        })
+        .catch(() => []),
+    ])
+      .then(([local, cao]) => {
+        if (cancelled) return;
+        const seen = new Set();
+        const merged = [];
+        for (const w of [...local, ...cao]) {
+          if (seen.has(w.id)) continue;
+          seen.add(w.id);
+          merged.push(w);
+        }
+        setWorkflows(merged);
       })
       .finally(() => {
         if (!cancelled) setWorkflowsLoading(false);
@@ -458,9 +499,11 @@ export function Sidebar({
     return () => { cancelled = true; };
   }, [newSessionOpen, newSessionSub]);
 
-  // Flat Agents list: every chat + monitor-only session, newest rank first.
-  // Dedup by session id (and key) so a kusa hook shadow of a cursor/copilot
+  // Agents list: every chat + monitor-only agent, newest rank first.
+  // Dedup by id (and key) so a kusa hook shadow of a cursor/copilot
   // chat cannot appear twice after we stopped grouping by provider.
+  // Subagents (parentId set) stay off the list entirely — their work
+  // surfaces inside the parent's merged transcript, not as sidebar rows.
   const filteredSessions = useMemo(() => {
     const byId = new Map();
     const seenKeys = new Set();
@@ -480,18 +523,54 @@ export function Sidebar({
       .sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
   }, [harnesses, chatSessions, sessionFilter]);
 
+  // Child busy/thinking/live bubbles up so the single orchestrated row still pulses.
+  const childActivityByParent = useMemo(() => {
+    const map = new Map();
+    for (const s of chatSessions || []) {
+      if (!isSubagentSession(s)) continue;
+      const parentId = s.parentId || s.options?.parentId;
+      if (!parentId) continue;
+      const status = s.status;
+      const live = Boolean(s.live);
+      const rank = status === 'busy' || live ? 3
+        : status === 'thinking' ? 2
+          : sessionNeedsAttention(s) ? 1
+            : 0;
+      const prev = map.get(parentId);
+      if (!prev || rank > prev.rank) {
+        map.set(parentId, {
+          rank,
+          status: live && status !== 'busy' && status !== 'thinking' ? 'busy' : status,
+          live: s.live || prev?.live || null,
+          parts: s.live?.parts || prev?.parts || null,
+        });
+      }
+    }
+    return map;
+  }, [chatSessions]);
+
+  // Open rows split Standard / Orchestrated (same hr + label pattern as Archived).
   // Archived rows sit in their own block under an hr when the filter includes them.
   const openSessions = useMemo(
-    () => filteredSessions.filter((s) => sessionStatusBucket(s) !== 'archived'),
+    () => filteredSessions.filter((s) => sessionStatusBucket(s) !== 'archived' && !isSubagentSession(s)),
     [filteredSessions],
   );
+  const standardSessions = useMemo(
+    () => openSessions.filter((s) => !isOrchestratedSession(s)),
+    [openSessions],
+  );
+  const orchestratedSessions = useMemo(
+    () => openSessions.filter((s) => isOrchestratedSession(s)),
+    [openSessions],
+  );
   const archivedSessions = useMemo(
-    () => filteredSessions.filter((s) => sessionStatusBucket(s) === 'archived'),
+    () => filteredSessions.filter((s) => sessionStatusBucket(s) === 'archived' && !isSubagentSession(s)),
     [filteredSessions],
   );
 
+  // Select-all / bulk delete only cover top-level Agents — Subagents go with their parent.
   const visibleKeys = useMemo(
-    () => filteredSessions.map((s) => s.key),
+    () => filteredSessions.filter((s) => !isSubagentSession(s)).map((s) => s.key),
     [filteredSessions],
   );
 
@@ -531,14 +610,21 @@ export function Sidebar({
     );
     const active = s.key === selected;
     const checked = checkedKeys?.has(s.key);
-    const canRemove = (isChatRow || canDelete) && !deleteGate;
     const label = sessionLabel(s);
     const titled = Boolean(sessionTitle(s));
 
     const external = isExternalSession(s);
+    const canRemove = (isChatRow || canDelete) && !deleteGate;
+    const childActivity = childActivityByParent.get(s.id);
+    const rowStatus = (() => {
+      if (!childActivity || childActivity.rank < 2) return s.status;
+      if (s.status === 'busy' || s.status === 'thinking') return s.status;
+      return childActivity.status === 'thinking' ? 'thinking' : 'busy';
+    })();
+    const rowParts = s.live?.parts || childActivity?.parts || null;
     const rowTitle = external
-      ? (titled ? `${label} · external (Cursor UI)` : 'External session · Cursor UI')
-      : (titled ? `Session ${shortId(s.id)}` : 'unknown');
+      ? (titled ? `${label} · external (Cursor UI)` : 'External agent · Cursor UI')
+      : (titled ? `Agent ${shortId(s.id)}` : 'unknown');
 
     if (collapsed) {
       return (
@@ -546,7 +632,7 @@ export function Sidebar({
           key={s.key}
           type="button"
           title={external ? `${label} · external (Cursor UI)` : label}
-          aria-label={external ? `${label} (external session)` : label}
+          aria-label={external ? `${label} (external agent)` : label}
           aria-current={active ? 'true' : undefined}
           className={`flex w-full items-center justify-center px-0 py-2 hover:bg-gray-800 ${active ? 'bg-gray-800' : ''}`}
           onClick={() => {
@@ -554,7 +640,7 @@ export function Sidebar({
             onToggleCollapsed?.();
           }}
         >
-          <SessionProviderIcon session={s} />
+          <SessionProviderIcon session={{ ...s, status: rowStatus }} />
         </button>
       );
     }
@@ -572,18 +658,20 @@ export function Sidebar({
             aria-label={`Select ${label}`}
             onChange={() => onToggleChecked?.([s.key])}
           />
-        ) : null}
+        ) : (
+          <span className="mr-0.5 inline-block h-5 w-5 shrink-0" aria-hidden="true" />
+        )}
         <button
           type="button"
           title={rowTitle}
           className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
           onClick={() => onSelectLane(s.key)}
         >
-          <SessionProviderIcon session={s} />
+          <SessionProviderIcon session={{ ...s, status: rowStatus }} />
           <span className={`min-w-0 flex-1 truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
           {!isExternalSession(s) ? (
             <span className="shrink-0">
-              <SessionIndicator status={s.status} parts={s.live?.parts} />
+              <SessionIndicator status={rowStatus} parts={rowParts} />
             </span>
           ) : null}
         </button>
@@ -697,7 +785,7 @@ export function Sidebar({
           <div className="ml-auto flex items-center gap-0.5">
             <div className="relative" ref={newSessionRef}>
               <ToolIconButton
-                label="New session"
+                label="New agent"
                 active={newSessionOpen}
                 aria-haspopup="menu"
                 aria-expanded={newSessionOpen}
@@ -712,7 +800,7 @@ export function Sidebar({
               {newSessionOpen && (
                 <div
                   role="menu"
-                  aria-label="New session"
+                  aria-label="New agent"
                   className="absolute right-0 top-full z-30 mt-1 min-w-[12rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
                 >
                   {!newSessionSub ? (
@@ -723,7 +811,7 @@ export function Sidebar({
                         className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
                         onClick={() => setNewSessionSub('standard')}
                       >
-                        <span>Standard Session</span>
+                        <span>Standard Agent</span>
                         <span className="text-gray-500">›</span>
                       </button>
                       <button
@@ -732,7 +820,10 @@ export function Sidebar({
                         className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
                         onClick={() => setNewSessionSub('orchestrated')}
                       >
-                        <span>Orchestrated Session</span>
+                        <span className="flex items-center gap-2">
+                          <LucideIcon name="messages-square" className="h-3.5 w-3.5 text-gray-400" />
+                          Orchestrated Agent
+                        </span>
                         <span className="text-gray-500">›</span>
                       </button>
                     </>
@@ -744,7 +835,7 @@ export function Sidebar({
                         className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
                         onClick={() => setNewSessionSub(null)}
                       >
-                        ‹ Standard Session
+                        ‹ Standard Agent
                       </button>
                       {CHAT_PROVIDER_GROUPS.map((group) => (
                         <button
@@ -771,7 +862,7 @@ export function Sidebar({
                         className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
                         onClick={() => setNewSessionSub(null)}
                       >
-                        ‹ Orchestrated Session
+                        ‹ Orchestrated Agent
                       </button>
                       {workflowsLoading ? (
                         <p className="px-3 py-2 text-[11px] text-gray-500">Loading workflows…</p>
@@ -797,7 +888,7 @@ export function Sidebar({
                         ))
                       ) : (
                         <p className="px-3 py-2 text-[11px] text-gray-500">
-                          No workflows yet. A manage page will come later.
+                          No workflows yet. Seeded plan-execute appears after serve starts.
                         </p>
                       )}
                     </>
@@ -948,12 +1039,25 @@ export function Sidebar({
           {!filteredSessions.length ? (
             collapsed ? null : (
               <p className="px-3 py-2 text-[11px] text-gray-600 sidebar-label">
-                No sessions yet. Use + to start one.
+                No agents yet. Use + to start one.
               </p>
             )
           ) : (
             <>
-              {openSessions.map((s) => renderSessionRow(s))}
+              {standardSessions.map((s) => renderSessionRow(s))}
+              {orchestratedSessions.length ? (
+                <>
+                  {!collapsed && standardSessions.length ? (
+                    <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
+                  ) : null}
+                  {!collapsed ? (
+                    <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
+                      Orchestrated
+                    </p>
+                  ) : null}
+                  {orchestratedSessions.map((s) => renderSessionRow(s))}
+                </>
+              ) : null}
               {archivedSessions.length ? (
                 <>
                   {!collapsed && openSessions.length ? (

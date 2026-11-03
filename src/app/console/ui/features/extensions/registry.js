@@ -49,7 +49,7 @@ export const BUILTIN_EXTENSIONS = [
     builtin: true,
     installed: true,
     description:
-      'Voice live chat via Pipecat (Silero → Whisper → Strata → Piper/Kokoro). WebSocket or WebRTC transport.',
+      'Voice live chat via Pipecat (Silero → Whisper → Kusă model → Piper/Kokoro). WebSocket or WebRTC transport.',
     detail:
       'Run the local Pipecat bot from extensions/live-chat, then use the empty-composer Live voice button. This panel shows server status and transport/TTS preferences. Requires the bot process up (LIVE_CHAT_BASE_URL).',
     nav: {

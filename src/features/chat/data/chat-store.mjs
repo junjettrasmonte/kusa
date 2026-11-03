@@ -1,7 +1,7 @@
 /**
- * Provider chat transcripts under `.kusa/sessions/<id>/chat.json`.
+ * Provider chat transcripts under `.kusa/agents/<id>/chat.json`.
  *
- * Every session owns a folder under the shared `sessions/` tree that holds its
+ * Every Agent owns a folder under the shared `agents/` tree that holds its
  * monitor lane, events, chat transcript, settings sidecar, and an
  * `attachments/` subfolder for files that rode on messages. Harness/provider is
  * a field on the record (and in lane keys), not a disk folder. Monitor lanes
@@ -31,13 +31,17 @@ import { normalizeApprovalMode } from '#features/agent/approval.mjs';
 import {
   CHAT_FILE,
   ensureSessionDirs,
+  findNestedSubagentFiles,
   laneFiles,
   laneKey,
   laneListedInSidebar,
+  agentsRoot,
   migrateFlatSessionFiles,
   migrateHarnessSessionsToShared,
+  reclaimDetachedSubagents,
   sessionRankAt,
-  sessionsRoot,
+  SUBAGENTS_DIR,
+  subagentFiles,
 } from '#features/monitor/lib.mjs';
 import {
   CHAT_HARNESSES,
@@ -48,6 +52,7 @@ import {
   normalizeSessionKind,
   providerForHarness,
   resolveChatProvider,
+  SESSION_KIND_ORCHESTRATED,
   SESSION_KIND_STANDARD,
 } from './providers.mjs';
 import './load-builtin-adapters.mjs';
@@ -64,6 +69,7 @@ export {
   normalizeSessionKind,
   providerForHarness,
   resolveChatProvider,
+  SESSION_KIND_ORCHESTRATED,
   SESSION_KIND_STANDARD,
 } from './providers.mjs';
 // Local import is used above; re-export the same helper for callers.
@@ -98,6 +104,31 @@ export function chatSessionFiles(dir, harness, sessionId) {
   return migrateFlatSessionFiles(dir, { harness: name, id: sessionId });
 }
 
+/**
+ * Walk agents/&lt;id&gt;/subagents/… (any depth) for a nested Subagent folder matching sessionId.
+ * @returns {object | null}
+ */
+export function findNestedSessionFiles(dir, sessionId) {
+  const nested = findNestedSubagentFiles(dir, sessionId);
+  return nested ? ensureSessionDirs(nested) : null;
+}
+
+/**
+ * Top-level session folder, or nested Subagent folder when `parentId` is set /
+ * when the id only exists under some parent's `subagents/`.
+ * Nested always wins over a detached top-level twin of the same id.
+ */
+export function resolveSessionFiles(dir, harness, sessionId, { parentId = null } = {}) {
+  const name = typeof harness === 'string' && harness.trim() ? harness.trim() : KUSA_HARNESS;
+  const id = String(sessionId || '').trim();
+  if (parentId) {
+    return ensureSessionDirs(subagentFiles(dir, parentId, { harness: name, id }));
+  }
+  const nested = findNestedSessionFiles(dir, id);
+  if (nested) return nested;
+  return chatSessionFiles(dir, name, id);
+}
+
 /** @deprecated use chatSessionFiles — kept for callers that still assume Kusă. */
 function kusaSessionFiles(dir, sessionId) {
   return chatSessionFiles(dir, KUSA_HARNESS, sessionId);
@@ -105,7 +136,7 @@ function kusaSessionFiles(dir, sessionId) {
 
 /**
  * Resolve a session id (or `harness:id` key) to `{ harness, id }`.
- * Disk layout is shared (`sessions/<id>/`); harness comes from the key prefix
+ * Disk layout is shared (`agents/<id>/`); harness comes from the key prefix
  * when present, otherwise from the lane/chat/config record on disk.
  */
 export function resolveSessionRef(dir, sessionIdOrKey) {
@@ -124,7 +155,7 @@ export function resolveSessionRef(dir, sessionIdOrKey) {
   if (!id) return null;
   // Touch migration so a bare id still finds a just-upgraded folder.
   try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
-  const files = chatSessionFiles(dir, harnessHint || KUSA_HARNESS, id);
+  const files = resolveSessionFiles(dir, harnessHint || KUSA_HARNESS, id);
   const chat = existsSync(files.chat) ? readJsonSafe(files.chat) : null;
   const config = existsSync(files.config) ? readJsonSafe(files.config) : null;
   const lane = existsSync(files.json) ? readJsonSafe(files.json) : null;
@@ -135,20 +166,25 @@ export function resolveSessionRef(dir, sessionIdOrKey) {
   const harness = harnessHint
     || (CHAT_HARNESSES.includes(fromRecord) ? fromRecord : null)
     || KUSA_HARNESS;
-  return { harness, id };
+  const parentId = typeof config?.parentId === 'string' && config.parentId.trim()
+    ? config.parentId.trim()
+    : (typeof files.parentId === 'string' && files.parentId ? files.parentId : null);
+  return { harness, id, parentId };
 }
 
 /** Absolute path for a session's chat sidecar. */
-export function chatFilePath(dir, sessionId, harness = null) {
+export function chatFilePath(dir, sessionId, harness = null, parentId = null) {
   const ref = harness
-    ? { harness, id: String(sessionId || '').trim() }
+    ? { harness, id: String(sessionId || '').trim(), parentId }
     : resolveSessionRef(dir, sessionId);
   if (!ref?.id) return chatSessionFiles(dir, KUSA_HARNESS, '').chat;
-  return chatSessionFiles(dir, ref.harness, ref.id).chat;
+  return resolveSessionFiles(dir, ref.harness, ref.id, {
+    parentId: parentId || ref.parentId,
+  }).chat;
 }
 
 /**
- * Per-session settings sidecar: `.kusa/sessions/<id>/session.json`.
+ * Per-Agent settings sidecar: `.kusa/agents/<id>/agent.json`.
  *
  * A chat owns its composer picks (Mode / Rule / Model), and a chat transcript
  * is the wrong place to keep them: the turn path rewrites the transcript on
@@ -156,22 +192,26 @@ export function chatFilePath(dir, sessionId, harness = null) {
  * so a pick stored inside it only survives as long as the last writer happens
  * to carry it — one writer that rebuilds the record drops the pick and the next
  * refresh reopens the chat on a Settings default. Settings are not turn data,
- * so they get their own file inside the session folder: written only when a
+ * so they get their own file inside the Agent folder: written only when a
  * pick is made, never touched by a turn write, and hand-editable like any
- * other file here. Flat `<id>.session.json` leftovers (and the short-lived
- * in-folder `<id>.session.json` name) are migrated on read/write.
+ * other file here. Flat `<id>.session.json` leftovers and legacy `session.json`
+ * are migrated to `agent.json` on read/write.
  */
-export const SESSION_CONFIG_FILE = 'session.json';
-/** @deprecated use SESSION_CONFIG_FILE — kept for callers matching `*.session.json`. */
+export const AGENT_CONFIG_FILE = 'agent.json';
+/** @deprecated use {@link AGENT_CONFIG_FILE} */
+export const SESSION_CONFIG_FILE = AGENT_CONFIG_FILE;
+/** @deprecated legacy suffix — migrated into {@link AGENT_CONFIG_FILE}. */
 export const SESSION_CONFIG_SUFFIX = '.session.json';
 
 /** Absolute path for a session's settings sidecar. */
-export function sessionConfigPath(dir, sessionId, harness = null) {
+export function sessionConfigPath(dir, sessionId, harness = null, parentId = null) {
   const ref = harness
-    ? { harness, id: String(sessionId || '').trim() }
+    ? { harness, id: String(sessionId || '').trim(), parentId }
     : resolveSessionRef(dir, sessionId);
   if (!ref?.id) return chatSessionFiles(dir, KUSA_HARNESS, '').config;
-  return chatSessionFiles(dir, ref.harness, ref.id).config;
+  return resolveSessionFiles(dir, ref.harness, ref.id, {
+    parentId: parentId || ref.parentId,
+  }).config;
 }
 
 /**
@@ -197,6 +237,7 @@ function normalizeMessage(m, { dir = null, sessionId = '', harness = KUSA_HARNES
     parts: Array.isArray(m.parts) ? m.parts : undefined,
     at: Number.isFinite(m.at) ? m.at : Date.now(),
     ...(m.backend != null ? { backend: m.backend } : {}),
+    ...(typeof m.model === 'string' && m.model.trim() ? { model: m.model.trim().slice(0, 200) } : {}),
     ...(typeof m.turnId === 'string' && m.turnId ? { turnId: m.turnId } : {}),
     ...(m.stopped === true ? { stopped: true } : {}),
     ...(m.steered === true ? { steered: true } : {}),
@@ -278,7 +319,7 @@ function normalizeSessionName(raw) {
  * so a hand-edited sidecar cannot smuggle a rule the agent does not implement.
  * Allow / Deny are stored as-is: they are sticky, so a refresh reopens the chat
  * on the rule the user chose and nothing re-derives a fallback from a window.
- * The record lives in the settings sidecar (`session.json`), not in the
+ * The record lives in the settings sidecar (`agent.json`), not in the
  * transcript — see `sessionConfigPath`.
  */
 function normalizeSessionOptions(raw) {
@@ -321,6 +362,33 @@ function normalizeSessionOptions(raw) {
   }
   if (typeof raw.workflowId === 'string' && raw.workflowId.trim()) {
     out.workflowId = raw.workflowId.trim().slice(0, 200);
+  }
+  if (typeof raw.parentId === 'string' && raw.parentId.trim()) {
+    out.parentId = raw.parentId.trim().slice(0, 120);
+  }
+  if (typeof raw.role === 'string' && raw.role.trim()) {
+    out.role = raw.role.trim().toLowerCase().slice(0, 60);
+  }
+  if (typeof raw.planId === 'string' && raw.planId.trim()) {
+    out.planId = raw.planId.trim().slice(0, 120);
+  }
+  if (Array.isArray(raw.subagents)) {
+    out.subagents = raw.subagents
+      .map((row) => {
+        if (!row || typeof row !== 'object') return null;
+        const childId = String(row.id || '').trim().slice(0, 120);
+        if (!childId) return null;
+        return {
+          id: childId,
+          role: String(row.role || '').trim().toLowerCase().slice(0, 60),
+          provider: String(row.provider || '').trim().slice(0, 80),
+          key: String(row.key || '').trim().slice(0, 200),
+          planId: String(row.planId || '').trim().slice(0, 120),
+          createdAt: Number.isFinite(row.createdAt) ? row.createdAt : Date.now(),
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 40);
   }
   // Opaque CLI resume ids written by provider adapters (Cursor / Copilot).
   for (const key of ['cliSessionId', 'cursorCliSessionId', 'copilotCliSessionId']) {
@@ -371,7 +439,7 @@ export function normalizeChatSession(raw, opts = {}) {
     ? raw.messages.map((m) => normalizeMessage(m, messageOpts)).filter(Boolean)
     : [];
   // Composer sidecar picks only — provider/kind live on the session record so a
-  // brand-new chat does not invent a session.json full of defaults.
+  // brand-new chat does not invent an agent.json full of defaults.
   // `external` marks IDE-owned chats (adapter hooks). Kusă-created CLI sessions
   // write false; lane-only externalOwned harness chats hydrate as true.
   const external = raw.external === true;
@@ -417,6 +485,11 @@ export function normalizeChatSession(raw, opts = {}) {
     opencodeSessionId: typeof raw.opencodeSessionId === 'string' ? raw.opencodeSessionId : null,
     // The session's own composer picks — null means "never picked, use Settings".
     options: options || null,
+    /** Nested Subagent linkage (also on options). */
+    parentId: options?.parentId || null,
+    role: options?.role || null,
+    planId: options?.planId || null,
+    subagents: Array.isArray(options?.subagents) ? options.subagents : [],
     messages,
     live: null,
   };
@@ -427,8 +500,19 @@ export function normalizeChatSession(raw, opts = {}) {
  * is different from "picked the default": no file means Settings fills the pick
  * in, so a session that was never opened keeps inheriting Settings.
  */
-export function readSessionConfig(dir, sessionId, harness = null) {
-  return normalizeSessionOptions(readJsonSafe(sessionConfigPath(dir, sessionId, harness)));
+export function readSessionConfig(dir, sessionId, harness = null, parentId = null) {
+  const path = sessionConfigPath(dir, sessionId, harness, parentId);
+  // Migrate legacy session.json → agent.json before reading the canonical path.
+  try {
+    const folder = dirname(path);
+    ensureSessionDirs({
+      dir: folder,
+      attachments: join(folder, 'attachments'),
+      subagents: join(folder, SUBAGENTS_DIR),
+      config: path,
+    });
+  } catch { /* ignore */ }
+  return normalizeSessionOptions(readJsonSafe(path));
 }
 
 /**
@@ -438,17 +522,18 @@ export function readSessionConfig(dir, sessionId, harness = null) {
  * an empty merge writes no file at all — nothing here invents a pick, which is
  * what keeps a turn write from clearing a Rule the user chose.
  */
-export function writeSessionConfig(dir, sessionId, over = {}, harness = null) {
+export function writeSessionConfig(dir, sessionId, over = {}, harness = null, parentId = null) {
   const ref = harness
-    ? { harness, id: String(sessionId || '').trim() }
+    ? { harness, id: String(sessionId || '').trim(), parentId }
     : resolveSessionRef(dir, sessionId);
   const id = ref?.id || String(sessionId || '').trim();
   const h = ref?.harness || KUSA_HARNESS;
+  const nestedParent = parentId || ref?.parentId || over?.parentId || null;
   const merged = normalizeSessionOptions({
-    ...(readSessionConfig(dir, id, h) || {}),
+    ...(readSessionConfig(dir, id, h, nestedParent) || {}),
     ...(over || {}),
   });
-  const path = sessionConfigPath(dir, id, h);
+  const path = sessionConfigPath(dir, id, h, nestedParent);
   if (!merged) {
     // Nothing is left to store: a cleared pick (an authored name, a model…) must
     // not linger on disk, or the next read would resurrect it. No file is the
@@ -460,6 +545,8 @@ export function writeSessionConfig(dir, sessionId, over = {}, harness = null) {
     }
     return null;
   }
+  const files = resolveSessionFiles(dir, h, id, { parentId: nestedParent });
+  ensureSessionDirs(files);
   atomicWriteFile(path, `${JSON.stringify(merged, null, 2)}\n`);
   return merged;
 }
@@ -574,7 +661,8 @@ export function chatSessionFromLane(lane) {
 
 function listLaneFiles(dir) {
   try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
-  const folder = sessionsRoot(dir);
+  try { reclaimDetachedSubagents(dir); } catch { /* ignore */ }
+  const folder = agentsRoot(dir);
   if (!existsSync(folder)) return [];
   let entries = [];
   try {
@@ -585,19 +673,84 @@ function listLaneFiles(dir) {
   const out = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (findNestedSubagentFiles(dir, entry.name)) continue;
     const files = migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: entry.name });
-    if (!existsSync(files.json)) continue;
-    const raw = readJsonSafe(files.json);
-    if (!raw?.id) continue;
-    const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
-    out.push({ ...raw, harness });
+    if (existsSync(files.json)) {
+      const raw = readJsonSafe(files.json);
+      if (raw?.id) {
+        const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
+        out.push({ ...raw, harness });
+      }
+    }
+    const walkLanes = (parentFolder, parentId) => {
+      const subRoot = join(parentFolder, SUBAGENTS_DIR);
+      if (!existsSync(subRoot)) return;
+      let kids = [];
+      try {
+        kids = readdirSync(subRoot, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const kid of kids) {
+        if (!kid.isDirectory()) continue;
+        const nested = ensureSessionDirs(subagentFiles(dir, parentId, { id: kid.name }));
+        if (existsSync(nested.json)) {
+          const raw = readJsonSafe(nested.json);
+          if (raw?.id) {
+            const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
+            out.push({ ...raw, harness, parentId });
+          }
+        }
+        walkLanes(nested.dir, kid.name);
+      }
+    };
+    walkLanes(join(folder, entry.name), entry.name);
+  }
+  return out;
+}
+
+function listNestedChatFiles(dir, parentStem, parentFolder = null) {
+  const folder = parentFolder || join(agentsRoot(dir), parentStem);
+  const subRoot = join(folder, SUBAGENTS_DIR);
+  if (!existsSync(subRoot)) return [];
+  let entries = [];
+  try {
+    entries = readdirSync(subRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const files = ensureSessionDirs(subagentFiles(dir, parentStem, { id: entry.name }));
+    if (existsSync(files.chat)) {
+      const raw = readJsonSafe(files.chat);
+      const config = existsSync(files.config) ? readJsonSafe(files.config) : null;
+      const harnessHint = CHAT_HARNESSES.includes(raw?.harness)
+        ? raw.harness
+        : (CHAT_HARNESSES.includes(config?.provider) ? resolveChatProvider(config.provider)?.harness : null);
+      const session = normalizeChatSession({
+        ...raw,
+        options: { ...(raw?.options || {}), ...(config || {}), parentId: config?.parentId || parentStem },
+      }, {
+        dir,
+        hydrate: true,
+        harness: harnessHint || undefined,
+      });
+      if (session) out.push(session);
+    }
+    // Escalations (and deeper nests) under this Subagent.
+    for (const grand of listNestedChatFiles(dir, entry.name, files.dir)) {
+      out.push(grand);
+    }
   }
   return out;
 }
 
 function listChatFiles(dir) {
   try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
-  const folder = sessionsRoot(dir);
+  try { reclaimDetachedSubagents(dir); } catch { /* ignore */ }
+  const folder = agentsRoot(dir);
   if (!existsSync(folder)) return [];
   let entries = [];
   try {
@@ -608,16 +761,23 @@ function listChatFiles(dir) {
   const out = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    // A top-level twin of a nested Subagent must never list as its own Agent.
+    if (findNestedSubagentFiles(dir, entry.name)) continue;
     const files = migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: entry.name });
-    if (!existsSync(files.chat)) continue;
-    const raw = readJsonSafe(files.chat);
-    const harnessHint = CHAT_HARNESSES.includes(raw?.harness) ? raw.harness : null;
-    const session = normalizeChatSession(raw, {
-      dir,
-      hydrate: true,
-      harness: harnessHint || undefined,
-    });
-    if (session) out.push(session);
+    if (existsSync(files.chat)) {
+      const raw = readJsonSafe(files.chat);
+      const harnessHint = CHAT_HARNESSES.includes(raw?.harness) ? raw.harness : null;
+      const session = normalizeChatSession(raw, {
+        dir,
+        hydrate: true,
+        harness: harnessHint || undefined,
+      });
+      if (session) out.push(session);
+    }
+    // Nested Subagents under this parent Agent folder.
+    for (const child of listNestedChatFiles(dir, entry.name)) {
+      out.push(child);
+    }
   }
   return out;
 }
@@ -675,8 +835,36 @@ export function listChatSessions(dir) {
   // page refresh: the dashboard re-reads the sidecar, and no transcript writer
   // on the turn path can have cleared it.
   for (const session of sessions) {
-    const config = readSessionConfig(dir, session.id, session.harness);
-    if (config) session.options = config;
+    const config = readSessionConfig(dir, session.id, session.harness, session.parentId || session.options?.parentId);
+    if (config) {
+      session.options = config;
+      session.parentId = config.parentId || session.parentId || null;
+      session.role = config.role || session.role || null;
+      session.planId = config.planId || session.planId || null;
+      session.subagents = Array.isArray(config.subagents) ? config.subagents : (session.subagents || []);
+    }
+  }
+  // Rebuild parent.subagents[] from live children so the sidebar nest stays accurate.
+  const childrenByParent = new Map();
+  for (const session of sessions) {
+    const parentId = session.parentId || session.options?.parentId;
+    if (!parentId) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push({
+      id: session.id,
+      key: session.key,
+      role: session.role || session.options?.role || '',
+      provider: session.provider || '',
+      planId: session.planId || session.options?.planId || '',
+      createdAt: session.createdAt,
+    });
+  }
+  for (const session of sessions) {
+    const kids = childrenByParent.get(session.id);
+    if (kids?.length) {
+      session.subagents = kids;
+      if (session.options) session.options = { ...session.options, subagents: kids };
+    }
   }
   // Adapter enrichers (e.g. Cursor IDE composer titles) overlay provider-specific
   // metadata so the Agents list picks them up on the next /kusa/sessions poll.
@@ -725,20 +913,29 @@ export function writeChatSession(dir, session) {
     throw err;
   }
   const harness = slim.harness || KUSA_HARNESS;
-  const stored = readSessionConfig(dir, slim.id, harness);
   const incoming = normalizeSessionOptions(session.options) || {};
+  const parentId = incoming.parentId
+    || resolveSessionRef(dir, slim.id)?.parentId
+    || null;
+  const stored = readSessionConfig(dir, slim.id, harness, parentId);
   const merged = writeSessionConfig(dir, slim.id, {
     ...(stored || {}),
     ...incoming,
-  }, harness);
+  }, harness, parentId);
   const { options: _picks, ...transcript } = slim;
-  atomicWriteFile(chatFilePath(dir, slim.id, harness), `${JSON.stringify(transcript, null, 2)}\n`);
-  // Keep attachments/ and sub-sessions/ present once the session folder exists.
-  ensureSessionDirs(chatSessionFiles(dir, harness, slim.id));
+  const files = resolveSessionFiles(dir, harness, slim.id, {
+    parentId: merged?.parentId || parentId,
+  });
+  ensureSessionDirs(files);
+  atomicWriteFile(files.chat, `${JSON.stringify(transcript, null, 2)}\n`);
   // Hand back a hydrated view so the dashboard / agent still see dataUrls —
   // the on-disk transcript stays slim.
   const hydrated = normalizeChatSession(transcript, { dir, hydrate: true, harness }) || slim;
-  return { ...hydrated, options: merged };
+  return {
+    ...hydrated,
+    options: merged,
+    parentId: merged?.parentId || parentId || null,
+  };
 }
 
 /** Create an empty chat + monitor lane (sessionStart hook). */
@@ -758,12 +955,16 @@ export function createChatSession(dir, {
     return existing;
   }
   const sessionKind = normalizeSessionKind(kind);
+  const orchestrated = sessionKind === SESSION_KIND_ORCHESTRATED
+    || (typeof workflowId === 'string' && Boolean(workflowId.trim()));
   const createOptions = {
     ...(meta.id !== 'kusa' ? { provider: meta.id } : {}),
     ...(sessionKind !== SESSION_KIND_STANDARD ? { kind: sessionKind } : {}),
     ...(typeof workflowId === 'string' && workflowId.trim()
       ? { workflowId: workflowId.trim(), kind: sessionKind, provider: meta.id }
       : {}),
+    // Orchestrated parents own the Orchestrator actor role in the workflow.
+    ...(orchestrated ? { role: 'orchestrator' } : {}),
   };
   const session = writeChatSession(dir, {
     key: laneKey(harness, sessionId),
@@ -786,6 +987,85 @@ export function createChatSession(dir, {
     harness,
   });
   if (hooks.enabled) hooks.sessionStart();
+  return session;
+}
+
+/**
+ * Create a Subagent nested under a parent Agent at
+ * `.kusa/agents/<parent>/subagents/<child>/`.
+ */
+export function createSubagent(dir, {
+  parentId,
+  id,
+  workspaceRoot = process.cwd(),
+  provider = 'kusa',
+  role = '',
+  workflowId = null,
+  planId = null,
+  mode = null,
+  createdAt,
+} = {}) {
+  const parent = String(parentId || '').trim();
+  if (!parent) {
+    const err = new Error('parentId is required');
+    err.code = 'EINVAL';
+    throw err;
+  }
+  const meta = resolveChatProvider(provider) || CHAT_PROVIDERS.kusa;
+  const harness = meta.harness;
+  const sessionId = (typeof id === 'string' && id.trim()) ? id.trim() : newId();
+  const now = Number.isFinite(createdAt) ? createdAt : Date.now();
+  const createOptions = {
+    provider: meta.id,
+    parentId: parent,
+    ...(role ? { role: String(role).trim().toLowerCase() } : {}),
+    ...(typeof workflowId === 'string' && workflowId.trim() ? { workflowId: workflowId.trim() } : {}),
+    ...(typeof planId === 'string' && planId.trim() ? { planId: planId.trim() } : {}),
+    ...(mode ? { mode: String(mode).trim().toLowerCase() } : {}),
+  };
+  const session = writeChatSession(dir, {
+    key: laneKey(harness, sessionId),
+    id: sessionId,
+    harness,
+    provider: meta.id,
+    kind: SESSION_KIND_STANDARD,
+    external: false,
+    status: 'idle',
+    attempts: 0,
+    createdAt: now,
+    messages: [],
+    options: createOptions,
+  });
+
+  // Index the child on the parent Agent's sidecar.
+  const parentConfig = readSessionConfig(dir, parent) || {};
+  const existingKids = Array.isArray(parentConfig.subagents) ? parentConfig.subagents : [];
+  if (!existingKids.some((row) => row?.id === sessionId)) {
+    writeSessionConfig(dir, parent, {
+      ...parentConfig,
+      subagents: [
+        ...existingKids,
+        {
+          id: sessionId,
+          key: session.key,
+          role: createOptions.role || '',
+          provider: meta.id,
+          planId: createOptions.planId || '',
+          createdAt: now,
+        },
+      ],
+    });
+  }
+
+  const hooks = createKusaHookEmitter({
+    dataDir: dir,
+    sessionId,
+    workspaceRoot,
+    harness,
+  });
+  // Nested chat/config already on disk — persist must resolve under subagents/.
+  if (hooks.enabled) hooks.sessionStart();
+  try { reclaimDetachedSubagents(dir); } catch { /* ignore */ }
   return session;
 }
 

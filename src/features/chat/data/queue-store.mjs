@@ -2,7 +2,7 @@
  * Composer queue persistence.
  *
  * Held (unparked) prompts and steering live per session in
- * `.kusa/sessions/<stem>/queues.json` — only that chat can flush or send them.
+ * `.kusa/agents/<stem>/queues.json` — only that chat can flush or send them.
  * Parked prompts live under {@link WORKSPACE_QUEUE_KEY} in the shared
  * `.kusa/queues.json` so any session can resume or send them.
  *
@@ -24,7 +24,8 @@ import {
   laneKey,
   migrateFlatSessionFiles,
   migrateHarnessSessionsToShared,
-  sessionsRoot,
+  agentsRoot,
+  SUBAGENTS_DIR,
 } from '#features/monitor/lib.mjs';
 import { parseSessionKey } from './task-store.mjs';
 import { normalizeAttachments } from './attachments.mjs';
@@ -157,9 +158,51 @@ function sessionKeyForFolder(sessionFolder, stem) {
   const queues = readJsonSafe(join(sessionFolder, QUEUES_FILE));
   if (queues?.key && typeof queues.key === 'string') return queues.key;
 
+  // Nested Subagent folders often have agent.json (provider) without lane.json.
+  const config = readJsonSafe(join(sessionFolder, 'agent.json'))
+    || readJsonSafe(join(sessionFolder, 'session.json'));
+  const provider = typeof config?.provider === 'string' ? config.provider.trim() : '';
+  if (provider && (chat?.id || stem)) {
+    return laneKey(provider, chat?.id || stem);
+  }
+
   if (lane?.id) return laneKey('kusa', lane.id);
   if (chat?.id) return laneKey('kusa', chat.id);
   return laneKey('kusa', stem);
+}
+
+/**
+ * Ingest one session folder's queues.json into the Maps (top-level Agent or
+ * nested Subagent under `subagents/`).
+ */
+function ingestSessionQueueFolder(queued, steering, sessionFolder, stem) {
+  const path = join(sessionFolder, QUEUES_FILE);
+  if (!existsSync(path)) return;
+  const raw = readJsonSafe(path);
+  const held = normalizeList(raw?.queued);
+  const steer = normalizeList(raw?.steering);
+  if (!held.length && !steer.length) return;
+  const key = sessionKeyForFolder(sessionFolder, stem);
+  if (held.length) queued.set(key, held);
+  if (steer.length) steering.set(key, steer);
+}
+
+/** Walk `agents/<parent>/subagents/…` (any depth) for nested queue files. */
+function walkNestedSubagentQueueFolders(queued, steering, parentFolder) {
+  const subRoot = join(parentFolder, SUBAGENTS_DIR);
+  if (!existsSync(subRoot)) return;
+  let children = [];
+  try {
+    children = readdirSync(subRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const child of children) {
+    if (!child.isDirectory()) continue;
+    const childFolder = join(subRoot, child.name);
+    ingestSessionQueueFolder(queued, steering, childFolder, child.name);
+    walkNestedSubagentQueueFolders(queued, steering, childFolder);
+  }
 }
 
 /**
@@ -236,7 +279,7 @@ export function loadQueues(dir) {
 
   migrateLegacySharedQueues(dir);
 
-  const root = sessionsRoot(dir);
+  const root = agentsRoot(dir);
   let children = [];
   try {
     children = readdirSync(root, { withFileTypes: true });
@@ -247,15 +290,9 @@ export function loadQueues(dir) {
     if (!child.isDirectory()) continue;
     const stem = child.name;
     const sessionFolder = join(root, stem);
-    const path = join(sessionFolder, QUEUES_FILE);
-    if (!existsSync(path)) continue;
-    const raw = readJsonSafe(path);
-    const held = normalizeList(raw?.queued);
-    const steer = normalizeList(raw?.steering);
-    if (!held.length && !steer.length) continue;
-    const key = sessionKeyForFolder(sessionFolder, stem);
-    if (held.length) queued.set(key, held);
-    if (steer.length) steering.set(key, steer);
+    ingestSessionQueueFolder(queued, steering, sessionFolder, stem);
+    // Assign durability lives on nested Subagents — load those queues too.
+    walkNestedSubagentQueueFolders(queued, steering, sessionFolder);
   }
 
   // Shared parked list (array shape after migration).
@@ -396,7 +433,7 @@ function loadQueuesForSaveScan(dir) {
   const sharedPath = queuesFilePath(dir);
   if (existsSync(sharedPath)) keys.add(WORKSPACE_QUEUE_KEY);
 
-  const root = sessionsRoot(dir);
+  const root = agentsRoot(dir);
   let children = [];
   try {
     children = readdirSync(root, { withFileTypes: true });
@@ -407,8 +444,23 @@ function loadQueuesForSaveScan(dir) {
     if (!child.isDirectory()) continue;
     const stem = child.name;
     const sessionFolder = join(root, stem);
-    if (!existsSync(join(sessionFolder, QUEUES_FILE))) continue;
-    keys.add(sessionKeyForFolder(sessionFolder, stem));
+    if (existsSync(join(sessionFolder, QUEUES_FILE))) {
+      keys.add(sessionKeyForFolder(sessionFolder, stem));
+    }
+    const subRoot = join(sessionFolder, SUBAGENTS_DIR);
+    if (!existsSync(subRoot)) continue;
+    let nested = [];
+    try {
+      nested = readdirSync(subRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of nested) {
+      if (!entry.isDirectory()) continue;
+      const nestedFolder = join(subRoot, entry.name);
+      if (!existsSync(join(nestedFolder, QUEUES_FILE))) continue;
+      keys.add(sessionKeyForFolder(nestedFolder, entry.name));
+    }
   }
   return keys;
 }

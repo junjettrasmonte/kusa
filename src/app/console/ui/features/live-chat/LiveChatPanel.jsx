@@ -1,367 +1,357 @@
 /**
- * Developer Tools › Live Chat — Pipecat bot status and transport/TTS prefs.
- * When the bot is down and extensions/live-chat is ready, SetupGuide offers
- * Start (POST /live-chat/server/start). Prefs go through PUT /live-chat/settings.
- * Restart (POST /live-chat/server/restart) reloads TRANSPORT / TTS_ENGINE from prefs.
+ * Dev Tools › Live Chat — browser-native voice providers, models, and offline prefs.
+ * No Pipecat bot start/stop.
  */
-import { useCallback, useEffect, useState } from 'react';
-import { stamp } from '#ui/shared/lib/format.js';
-import { IconButton, RefreshIcon } from '#ui/shared/IconButton.jsx';
-import { SetupGuide } from '#ui/shared/SetupGuide.jsx';
-import { Choice, Field } from '#ui/shared/SettingsControls.jsx';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  filterVoicesByGender,
+  KOKORO_VOICES,
+  LIVE_CHAT_GENDERS,
+} from '#features/live-chat/voices.mjs';
+import {
+  detectVoiceCapabilities,
+  PROVIDER_LABELS,
+  VOICE_MODEL_CATALOG,
+  VoiceModelManager,
+} from './voiceClient.js';
 
-function emptyStatus() {
-  return {
-    ok: false,
-    checkedAt: null,
-    installed: false,
-    serverUp: false,
-    baseUrl: 'http://127.0.0.1:7860',
-    transport: 'websocket',
-    tts: 'piper',
-    model: null,
-    strataConfigured: false,
-    version: null,
-    error: null,
-    steps: [],
-  };
-}
-
-async function api(path, { method = 'GET', body = null } = {}) {
+async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, {
     method,
-    headers: body != null
-      ? { Accept: 'application/json', 'Content-Type': 'application/json' }
-      : { Accept: 'application/json' },
-    body: body != null ? JSON.stringify(body) : undefined,
+    headers: {
+      Accept: 'application/json',
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data?.error || `HTTP ${res.status}`);
-    err.status = res.status;
     err.data = data;
     throw err;
   }
   return data;
 }
 
-function StatusChip({ label, value, ok }) {
+function emptyPrefs() {
+  return {
+    sttProvider: 'whisper',
+    ttsProvider: 'kokoro',
+    vadProvider: 'silero',
+    offlineOnly: true,
+    language: 'en',
+    autoSpeak: true,
+    interruptible: true,
+    speechRate: 1,
+    whisperModel: 'onnx-community/whisper-tiny.en',
+    gender: 'any',
+    voice: 'af_heart',
+    expressiveness: 'balanced',
+  };
+}
+
+function prefsFromApi(raw) {
+  const base = emptyPrefs();
+  if (!raw || typeof raw !== 'object') return base;
+  return {
+    ...base,
+    ...raw,
+    offlineOnly: raw.offlineOnly !== false,
+    autoSpeak: raw.autoSpeak !== false,
+    interruptible: raw.interruptible !== false,
+  };
+}
+
+function Select({ label, value, onChange, options, disabled }) {
   return (
-    <div className="rounded-lg border border-gray-800 bg-gray-950/60 px-3 py-2">
-      <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">{label}</div>
-      <div className={`mt-0.5 truncate text-sm ${ok ? 'text-emerald-300' : 'text-amber-300'}`}>
-        {value}
-      </div>
-    </div>
+    <label className="flex flex-col gap-1 text-[11px] text-gray-400">
+      <span>{label}</span>
+      <select
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        className="rounded-md border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
+      >
+        {options.map((opt) => (
+          <option key={opt.id} value={opt.id}>{opt.label}</option>
+        ))}
+      </select>
+    </label>
   );
 }
 
 export function LiveChatPanel({ canPersist = false }) {
-  const [status, setStatus] = useState(emptyStatus);
-  const [prefs, setPrefs] = useState({ transport: 'websocket', tts: 'piper', baseUrl: '' });
+  const [prefs, setPrefs] = useState(emptyPrefs);
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState(null);
   const [saveNote, setSaveNote] = useState('');
-  const [starting, setStarting] = useState(false);
-  const [restarting, setRestarting] = useState(false);
-  const [startNote, setStartNote] = useState('');
+  const [caps, setCaps] = useState(null);
+  const [models, setModels] = useState([]);
+  const [modelNote, setModelNote] = useState('');
+  const modelManager = useMemo(() => new VoiceModelManager(VOICE_MODEL_CATALOG), []);
+
+  const voiceOptions = useMemo(() => {
+    return filterVoicesByGender(KOKORO_VOICES, prefs.gender);
+  }, [prefs.gender]);
 
   const refresh = useCallback(async () => {
     if (!canPersist) return;
     setBusy(true);
     try {
-      const [nextStatus, nextPrefs] = await Promise.all([
-        api('/live-chat'),
-        api('/live-chat/settings'),
-      ]);
-      setStatus(nextStatus || emptyStatus());
-      setPrefs({
-        transport: nextPrefs?.transport === 'webrtc' ? 'webrtc' : 'websocket',
-        tts: nextPrefs?.tts === 'kokoro' ? 'kokoro' : 'piper',
-        baseUrl: typeof nextPrefs?.baseUrl === 'string' ? nextPrefs.baseUrl : '',
-      });
+      const nextPrefs = await api('/live-chat/settings');
+      setPrefs(prefsFromApi(nextPrefs));
       setLoadError(null);
+      await modelManager.refresh();
+      setModels(modelManager.listModels());
     } catch (err) {
       setLoadError(err?.message || String(err));
-      setStatus(emptyStatus());
     } finally {
       setBusy(false);
     }
-  }, [canPersist]);
-
-  const startBot = useCallback(async () => {
-    if (!canPersist || starting || restarting) return;
-    setStarting(true);
-    setStartNote('');
-    try {
-      const result = await api('/live-chat/server/start', { method: 'POST' });
-      if (result?.status) setStatus(result.status);
-      else await refresh();
-      setStartNote(result?.alreadyUp
-        ? 'Live Chat bot was already up. Use Restart to apply transport/TTS changes.'
-        : 'Live Chat bot started.');
-    } catch (err) {
-      const data = err?.data;
-      if (data?.status) setStatus(data.status);
-      else await refresh();
-      setStartNote(data?.error || err?.message || 'Could not start Live Chat bot');
-    } finally {
-      setStarting(false);
-    }
-  }, [canPersist, starting, restarting, refresh]);
-
-  const restartBot = useCallback(async () => {
-    if (!canPersist || starting || restarting) return;
-    setRestarting(true);
-    setStartNote('');
-    setSaveNote('');
-    try {
-      const result = await api('/live-chat/server/restart', { method: 'POST' });
-      if (result?.status) setStatus(result.status);
-      else await refresh();
-      const tts = result?.status?.tts || prefs.tts;
-      const transport = result?.status?.transport || prefs.transport;
-      setStartNote(result?.ok
-        ? `Live Chat bot restarted (${transport} / ${tts}).`
-        : (result?.error || 'Restart finished with errors — check status.'));
-    } catch (err) {
-      const data = err?.data;
-      if (data?.status) setStatus(data.status);
-      else await refresh();
-      setStartNote(data?.error || err?.message || 'Could not restart Live Chat bot');
-    } finally {
-      setRestarting(false);
-    }
-  }, [canPersist, starting, restarting, refresh, prefs.tts, prefs.transport]);
+  }, [canPersist, modelManager]);
 
   useEffect(() => {
-    refresh();
-    if (!canPersist) return undefined;
-    const id = setInterval(refresh, 8000);
-    return () => clearInterval(id);
-  }, [canPersist, refresh]);
+    void refresh();
+    void detectVoiceCapabilities().then(setCaps).catch(() => setCaps(null));
+  }, [refresh]);
 
-  async function savePrefs(patch) {
-    if (!canPersist || busy) return;
-    setBusy(true);
+  const savePrefs = useCallback(async (patch = {}) => {
+    if (!canPersist) return;
     setSaveNote('');
+    const nextLocal = { ...prefs, ...patch };
+    setPrefs(nextLocal);
     try {
-      const next = await api('/live-chat/settings', {
+      const saved = await api('/live-chat/settings', {
         method: 'PUT',
-        body: { ...prefs, ...patch },
+        body: nextLocal,
       });
-      setPrefs({
-        transport: next?.transport === 'webrtc' ? 'webrtc' : 'websocket',
-        tts: next?.tts === 'kokoro' ? 'kokoro' : 'piper',
-        baseUrl: typeof next?.baseUrl === 'string' ? next.baseUrl : '',
-      });
-      setSaveNote('Saved. Click Restart bot to apply transport/TTS on the running process.');
-      await refresh();
+      setPrefs(prefsFromApi(saved));
+      setSaveNote('Saved.');
     } catch (err) {
       setSaveNote(err?.message || 'Save failed');
-    } finally {
-      setBusy(false);
     }
-  }
+  }, [canPersist, prefs]);
 
-  if (!canPersist) {
-    return (
-      <div className="p-4 text-sm text-gray-500">
-        Open the console over HTTP (<code className="text-sky-300">kusa serve</code>) to manage Live Chat.
-      </div>
-    );
-  }
+  const downloadModel = useCallback(async (id) => {
+    setModelNote(`Downloading ${id}…`);
+    try {
+      await modelManager.download(id);
+      setModels(modelManager.listModels());
+      setModelNote(`Ready: ${id}`);
+    } catch (err) {
+      setModelNote(err?.message || String(err));
+      setModels(modelManager.listModels());
+    }
+  }, [modelManager]);
 
-  const s = status;
-  const prefsMismatch = Boolean(
-    s.serverUp
-    && (
-      (s.tts && s.tts !== prefs.tts)
-      || (s.transport && s.transport !== prefs.transport)
-    ),
-  );
-  const botBusy = starting || restarting;
+  const removeModel = useCallback(async (id) => {
+    await modelManager.remove(id);
+    setModels(modelManager.listModels());
+    setModelNote(`Removed marker for ${id}`);
+  }, [modelManager]);
+
+  const sttOptions = Object.entries(PROVIDER_LABELS.stt).map(([id, label]) => ({ id, label }));
+  const ttsOptions = Object.entries(PROVIDER_LABELS.tts).map(([id, label]) => ({ id, label }));
+  const vadOptions = Object.entries(PROVIDER_LABELS.vad).map(([id, label]) => ({ id, label }));
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
-      <section>
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <h1 className="text-lg font-semibold text-gray-100">Live Chat</h1>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-500">
-              {s.checkedAt ? `Checked ${stamp(s.checkedAt)}` : 'Not checked yet'}
-              {' · live'}
-            </span>
-            <IconButton label="Refresh" icon={RefreshIcon} disabled={busy || botBusy} onClick={refresh} />
-          </div>
-        </div>
-        <p className="mb-3 text-xs text-gray-500">
-          Voice pipeline via{' '}
-          <a
-            className="text-sky-300 hover:underline"
-            href="https://github.com/pipecat-ai/pipecat"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Pipecat
-          </a>
-          {' '}(Silero → Faster Whisper → Strata → Piper/Kokoro). Start the bot from{' '}
-          <code className="text-sky-300">extensions/live-chat</code>, then use the empty-composer{' '}
-          <strong className="font-medium text-gray-300">Live voice</strong> button in a chat session.
-          Proxied at <code className="text-sky-300">{s.baseUrl}</code>.
+    <div className="space-y-4 text-sm text-gray-300">
+      <div>
+        <h2 className="text-base font-semibold text-gray-100">Live Chat — browser voice</h2>
+        <p className="mt-1 text-xs text-gray-500">
+          Microphone, STT, VAD and TTS run in the PWA. Agent turns still use this chat’s
+          Kusă model and tools via <code className="text-gray-400">/kusa/chat</code>.
+          No separate voice bot or WebRTC to WSL.
         </p>
-        {loadError ? (
-          <p className="mb-3 text-xs text-amber-400">Live check failed: {loadError}</p>
-        ) : null}
+      </div>
 
-        <div className="mb-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 text-sm">
-          <StatusChip label="Server" value={s.serverUp ? 'up' : 'down'} ok={s.serverUp} />
-          <StatusChip
-            label="Transport"
-            value={s.transport || prefs.transport}
-            ok={s.serverUp && (!s.transport || s.transport === prefs.transport)}
+      {loadError ? (
+        <p className="text-xs text-amber-400">{loadError}</p>
+      ) : null}
+
+      <section className="space-y-2 rounded-lg border border-gray-800 bg-gray-950/50 p-3">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Providers</h3>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Select
+            label="Speech-to-text"
+            value={prefs.sttProvider}
+            disabled={!canPersist || busy}
+            options={sttOptions}
+            onChange={(sttProvider) => void savePrefs({ sttProvider })}
           />
-          <StatusChip
-            label="TTS"
-            value={s.tts || prefs.tts}
-            ok={s.serverUp && (!s.tts || s.tts === prefs.tts)}
+          <Select
+            label="Text-to-speech"
+            value={prefs.ttsProvider}
+            disabled={!canPersist || busy}
+            options={ttsOptions}
+            onChange={(ttsProvider) => void savePrefs({ ttsProvider })}
           />
-          <StatusChip
-            label="Strata"
-            value={s.strataConfigured ? (s.model || 'configured') : 'not set'}
-            ok={Boolean(s.strataConfigured)}
+          <Select
+            label="Voice activity"
+            value={prefs.vadProvider}
+            disabled={!canPersist || busy}
+            options={vadOptions}
+            onChange={(vadProvider) => void savePrefs({ vadProvider })}
           />
         </div>
-
-        {s.serverUp ? (
-          <div className="mb-4 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              className={`rounded-md px-3 py-1.5 text-sm font-medium ${
-                prefsMismatch
-                  ? 'bg-amber-600 text-white hover:bg-amber-500'
-                  : 'bg-gray-800 text-gray-100 hover:bg-gray-700'
-              } disabled:opacity-50`}
-              disabled={busy || botBusy}
-              onClick={() => { void restartBot(); }}
-            >
-              {restarting ? 'Restarting…' : 'Restart bot'}
-            </button>
-            {prefsMismatch ? (
-              <span className="text-xs text-amber-400">
-                Running {s.transport}/{s.tts} — prefs are {prefs.transport}/{prefs.tts}. Restart to apply.
-              </span>
-            ) : (
-              <span className="text-xs text-gray-500">
-                Reloads the process with saved transport/TTS (and Strata) settings.
-              </span>
-            )}
-          </div>
-        ) : null}
-
-        {!s.ok ? (
-          <SetupGuide
-            title={s.installed ? 'Start the Live Chat bot' : 'Install Live Chat'}
-            summary={s.error}
-            steps={s.steps?.length ? s.steps : [
-              'cd extensions/live-chat && uv sync',
-              'export STRATA_BASE_URL=…',
-              'uv run python -m live_chat',
-              'curl http://127.0.0.1:7860/health',
-            ]}
-            action={s.installed ? {
-              label: 'Start Live Chat bot',
-              busyLabel: 'Starting Live Chat bot…',
-              busy: starting,
-              disabled: busy || restarting,
-              onClick: startBot,
-            } : null}
-            footnote={
-              startNote
-                || 'After installing or starting the bot, click Refresh — this panel polls /live-chat while open.'
-            }
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Select
+            label="Gender filter"
+            value={prefs.gender}
+            disabled={!canPersist || busy}
+            options={LIVE_CHAT_GENDERS.map((g) => ({ id: g, label: g }))}
+            onChange={(gender) => {
+              const catalog = filterVoicesByGender(KOKORO_VOICES, gender);
+              const keep = catalog.some((v) => v.id === prefs.voice)
+                ? prefs.voice
+                : (catalog[0]?.id || 'af_heart');
+              void savePrefs({ gender, voice: keep });
+            }}
           />
-        ) : null}
+          <Select
+            label="TTS voice"
+            value={prefs.voice}
+            disabled={!canPersist || busy}
+            options={voiceOptions.map((v) => ({ id: v.id, label: v.label }))}
+            onChange={(voice) => void savePrefs({ voice })}
+          />
+          <Select
+            label="Whisper model"
+            value={prefs.whisperModel?.includes('whisper-tiny')
+              ? 'onnx-community/whisper-tiny.en'
+              : (prefs.whisperModel || 'onnx-community/whisper-tiny.en')}
+            disabled={!canPersist || busy || prefs.sttProvider !== 'whisper'}
+            options={[
+              { id: 'onnx-community/whisper-tiny.en', label: 'Tiny EN (bundled)' },
+            ]}
+            onChange={(whisperModel) => void savePrefs({ whisperModel })}
+          />
+        </div>
+        <label className="flex flex-col gap-1 text-[11px] text-gray-400">
+          <span>Speech rate ({prefs.speechRate})</span>
+          <input
+            type="range"
+            min="0.5"
+            max="2"
+            step="0.05"
+            value={prefs.speechRate}
+            disabled={!canPersist || busy}
+            onChange={(e) => setPrefs((p) => ({ ...p, speechRate: Number(e.target.value) }))}
+            onMouseUp={() => void savePrefs({ speechRate: prefs.speechRate })}
+            onTouchEnd={() => void savePrefs({ speechRate: prefs.speechRate })}
+            className="accent-emerald-500"
+          />
+        </label>
+        <div className="flex flex-wrap gap-4 text-[11px] text-gray-400">
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={prefs.offlineOnly}
+              disabled={!canPersist || busy}
+              onChange={(e) => void savePrefs({ offlineOnly: e.target.checked })}
+            />
+            Offline-only (no cloud Speech APIs)
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={prefs.autoSpeak}
+              disabled={!canPersist || busy}
+              onChange={(e) => void savePrefs({ autoSpeak: e.target.checked })}
+            />
+            Auto-speak replies
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={prefs.interruptible}
+              disabled={!canPersist || busy}
+              onChange={(e) => void savePrefs({ interruptible: e.target.checked })}
+            />
+            Interruptible speech
+          </label>
+        </div>
+        {saveNote ? <p className="text-[11px] text-emerald-400/90">{saveNote}</p> : null}
+      </section>
 
-        {s.ok && startNote ? (
-          <p className="mb-3 text-xs text-gray-400">{startNote}</p>
+      <section className="space-y-2 rounded-lg border border-gray-800 bg-gray-950/50 p-3">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Browser capabilities</h3>
+        {caps ? (
+          <ul className="grid grid-cols-2 gap-1 text-[11px] text-gray-400 sm:grid-cols-4">
+            {[
+              ['WebGPU', caps.webgpu],
+              ['WASM', caps.wasm],
+              ['Mic', caps.getUserMedia],
+              ['AudioWorklet', caps.audioWorklet],
+              ['SpeechRecognition', caps.speechRecognition],
+              ['SpeechSynthesis', caps.speechSynthesis],
+              ['OPFS', caps.opfs],
+              ['IndexedDB', caps.indexedDB],
+            ].map(([label, ok]) => (
+              <li key={label} className={ok ? 'text-emerald-400/90' : 'text-gray-600'}>
+                {ok ? '✓' : '·'} {label}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-[11px] text-gray-600">Detecting…</p>
+        )}
+        {caps?.webgpuError && !caps.webgpu ? (
+          <p className="text-[11px] text-gray-600">WebGPU: {caps.webgpuError}</p>
         ) : null}
       </section>
 
-      <section className="rounded-xl border border-gray-800 bg-gray-950/40 p-4">
-        <h2 className="mb-2 text-base font-semibold text-gray-100">Preferences</h2>
-        <p className="mb-3 text-xs text-gray-500">
-          Saved for session mint and for bot spawn/restart (
-          <code className="text-sky-300">TRANSPORT</code> / <code className="text-sky-300">TTS_ENGINE</code>
-          ). Use <strong className="font-medium text-gray-300">Restart bot</strong> after changing these.
+      <section className="space-y-2 rounded-lg border border-gray-800 bg-gray-950/50 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Models</h3>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void refresh()}
+            className="rounded-md px-2 py-1 text-[11px] text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+          >
+            Refresh
+          </button>
+        </div>
+        <ul className="space-y-2">
+          {models.map((m) => (
+            <li
+              key={m.id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-gray-800/80 px-2 py-1.5 text-[11px]"
+            >
+              <div>
+                <div className="text-gray-200">{m.label}</div>
+                <div className="text-gray-600">{m.id} · {m.status}</div>
+              </div>
+              <div className="flex gap-1">
+                {m.status !== 'ready' ? (
+                  <button
+                    type="button"
+                    className="rounded-md bg-emerald-600/20 px-2 py-1 text-emerald-300 hover:bg-emerald-600/30"
+                    onClick={() => void downloadModel(m.id)}
+                  >
+                    Check bundle
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="rounded-md px-2 py-1 text-gray-500 hover:bg-gray-800"
+                    onClick={() => void removeModel(m.id)}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+        {modelNote ? <p className="text-[11px] text-gray-500">{modelNote}</p> : null}
+        <p className="text-[11px] text-gray-600">
+          Weights are bundled into the PWA under <code className="text-gray-400">/voice-models/</code>.
+          From the repo: <code className="text-gray-400">npm run voice:models</code>
+          (also runs before <code className="text-gray-400">npm run build</code>).
+          Offline-only mode will not fall back to cloud Speech APIs or Hugging Face.
         </p>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div>
-            <span className="mb-1 block text-sm text-gray-300">Transport</span>
-            <div className="flex flex-wrap gap-2">
-              <Choice
-                label="WebSocket"
-                active={prefs.transport === 'websocket'}
-                disabled={busy || botBusy}
-                onClick={() => {
-                  setPrefs((p) => ({ ...p, transport: 'websocket' }));
-                  void savePrefs({ transport: 'websocket' });
-                }}
-              />
-              <Choice
-                label="WebRTC"
-                active={prefs.transport === 'webrtc'}
-                disabled={busy || botBusy}
-                onClick={() => {
-                  setPrefs((p) => ({ ...p, transport: 'webrtc' }));
-                  void savePrefs({ transport: 'webrtc' });
-                }}
-              />
-            </div>
-          </div>
-          <div>
-            <span className="mb-1 block text-sm text-gray-300">TTS</span>
-            <div className="flex flex-wrap gap-2">
-              <Choice
-                label="Piper"
-                active={prefs.tts === 'piper'}
-                disabled={busy || botBusy}
-                onClick={() => {
-                  setPrefs((p) => ({ ...p, tts: 'piper' }));
-                  void savePrefs({ tts: 'piper' });
-                }}
-              />
-              <Choice
-                label="Kokoro"
-                active={prefs.tts === 'kokoro'}
-                disabled={busy || botBusy}
-                onClick={() => {
-                  setPrefs((p) => ({ ...p, tts: 'kokoro' }));
-                  void savePrefs({ tts: 'kokoro' });
-                }}
-              />
-            </div>
-          </div>
-        </div>
-        <div className="mt-3">
-          <Field
-            label="Bot base URL override (optional)"
-            value={prefs.baseUrl}
-            placeholder="http://127.0.0.1:7860"
-            disabled={busy || botBusy}
-            onCommit={(baseUrl) => {
-              setPrefs((p) => ({ ...p, baseUrl }));
-              void savePrefs({ baseUrl });
-            }}
-          />
-        </div>
-        {saveNote ? <p className="mt-2 text-[11px] text-gray-500">{saveNote}</p> : null}
       </section>
     </div>
   );

@@ -2,8 +2,8 @@ import { DrawerCloseIcon, DrawerDockIcon } from './ChatGlyphs.jsx';
 
 /**
  * Shared machinery for the composer's popup lists — the Prompt Queue, the Task
- * List, and Attachments. All three are the same control in three parts, so only
- * the rows differ:
+ * List, Attachments, and Live Chat. All are the same control in three parts, so
+ * only the rows (or Live Chat's spectrum) differ:
  *
  *   1. PopupToggle — a named toolbar switch (glyph + name + count). A list that
  *      tracks progress may pass a done/total fraction instead of a bare count,
@@ -55,34 +55,42 @@ export function PopupToggle({
   // change landing inside a running beat restarts it instead of being ignored
   // (a CSS animation only restarts when its animation-name changes).
   pulseClass = '',
+  // Live Chat (and similar) drawers stay openable with nothing "listed" —
+  // when true, the chip is never disabled for emptiness.
+  available = null,
 }) {
   // A list that measures progress (the Task List) passes `progress` as a
   // done/total fraction; the chip then shows the number the user actually wants
   // to watch move, and `count` only decides whether there is anything to show.
   // A queue passes no fraction and keeps its plain item count.
+  const canOpen = available != null ? Boolean(available) : count > 0;
   const shown = progress || count;
-  const detail = progress ? `${progress} ${progressNoun}` : `${count} ${noun}`;
-  const active = count > 0 && expanded;
+  const detail = progress
+    ? `${progress} ${progressNoun}`
+    : count > 0
+      ? `${count} ${noun}`
+      : label;
+  const active = canOpen && expanded;
   return (
     <button
       type="button"
-      disabled={count === 0}
+      disabled={!canOpen}
       onClick={() => onToggle?.()}
-      aria-expanded={count > 0 ? expanded : false}
+      aria-expanded={canOpen ? expanded : false}
       aria-pressed={active}
       title={
-        count === 0
+        !canOpen
           ? `${label} is empty`
           : expanded
-            ? `${label} — hide the list (${detail})`
-            : `${label} — show the list (${detail})`
+            ? `${label} — hide (${detail})`
+            : `${label} — show (${detail})`
       }
       aria-label={
-        count === 0
+        !canOpen
           ? `${label} is empty`
           : expanded
-            ? `${label}, hide the list, ${detail}`
-            : `${label}, show the list, ${detail}`
+            ? `${label}, hide, ${detail}`
+            : `${label}, show, ${detail}`
       }
       className={`inline-flex h-6 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-gray-500 ${
         active
@@ -168,7 +176,7 @@ export function PopupList({
         ) : null}
       </div>
       <div
-        className="mt-0.5 min-h-0 flex-1 overflow-y-auto"
+        className="mt-0.5 flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto"
         role="list"
         aria-label={ariaLabel}
       >

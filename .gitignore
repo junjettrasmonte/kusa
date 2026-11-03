@@ -7,4 +7,14 @@ src/data/*
 .DS_Store
 *.tgz
 
+# Predownloaded browser voice weights (npm run voice:models) — keep README/MANIFEST.
+src/app/console/ui/public/voice-models/**/*.onnx
+src/app/console/ui/public/voice-models/**/*.bin
+src/app/console/ui/public/voice-models/**/*.wasm
+src/app/console/ui/public/voice-models/**/*.json
+src/app/console/ui/public/voice-models/**/*.txt
+!src/app/console/ui/public/voice-models/README.md
+!src/app/console/ui/public/voice-models/MANIFEST.json
+src/app/console/voice-models/
+
 # Trail graph cache is ignored via .trail/.gitignore (run `trail build`).

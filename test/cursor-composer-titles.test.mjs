@@ -113,9 +113,9 @@ describe('cursor-composer-titles', () => {
         },
       ],
     });
-    // Lane-only session (no chat sidecar) under the shared sessions/ layout.
+    // Lane-only session (no chat sidecar) under the shared agents/ layout.
     const laneId = 'dddd4444-bbbb-cccc-dddd-eeeeeeeeeeee';
-    const laneDir = join(dataDir, 'sessions', laneId);
+    const laneDir = join(dataDir, 'agents', laneId);
     mkdirSync(laneDir, { recursive: true });
     writeFileSync(
       join(laneDir, `${laneId}.json`),

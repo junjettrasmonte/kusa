@@ -1,5 +1,6 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { stripLeakedToolCalls } from '#ui/shared/lib/chatText.js';
 
 const components = {
   h1: ({ children }) => <h1 className="mt-4 mb-2 text-base font-semibold text-gray-100 first:mt-0">{children}</h1>,
@@ -69,7 +70,10 @@ export function looksLikeMarkdown(text) {
  * @param {string} [props.className]
  */
 export function MarkdownBody({ text, truncated, variant = 'panel', className }) {
-  const body = truncated ? `${text}\n\n… truncated` : String(text ?? '');
+  // Chat replies may carry leaked <tool_call> XML+HTML; strip before md parse
+  // so raw HTML flow nodes cannot blank out the rest of the transcript.
+  const raw = variant === 'chat' ? stripLeakedToolCalls(text) : String(text ?? '');
+  const body = truncated ? `${raw}\n\n… truncated` : raw;
   const shell = className || (
     variant === 'chat'
       ? 'markdown-body chat-md text-sm text-gray-200'

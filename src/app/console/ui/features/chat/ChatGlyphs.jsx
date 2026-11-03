@@ -184,6 +184,35 @@ export function TaskIcon({ expanded = true, className = 'text-gray-500' }) {
   );
 }
 
+/** Workspace Plan drawer glyph — lucide clipboard-list. */
+export function PlanIcon({ expanded = true, className = 'text-gray-500' }) {
+  return (
+    <svg
+      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect width="8" height="4" x="8" y="2" rx="1" ry="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      {expanded ? (
+        <>
+          <path d="M12 11h4" />
+          <path d="M12 16h4" />
+          <path d="M8 11h.01" />
+          <path d="M8 16h.01" />
+        </>
+      ) : (
+        <path d="M12 11h4" />
+      )}
+    </svg>
+  );
+}
+
 /**
  * Attachments toggle glyph — same paperclip wire as PaperclipIcon / the
  * composer AttachmentIcon, at PopupToggle size. Expanded shows the clip alone
@@ -205,6 +234,30 @@ export function AttachmentsIcon({ expanded = true, className = 'text-gray-500' }
       <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
       {expanded ? null : <path d="M19 3v4" />}
       {expanded ? null : <path d="M17 5h4" />}
+    </svg>
+  );
+}
+
+/** Live Chat drawer toggle — waveform bars (matches composer VoiceIcon). */
+export function LiveChatIcon({ expanded = true, className = 'text-gray-500' }) {
+  return (
+    <svg
+      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M2 12h2" />
+      <path d="M6 8v8" />
+      <path d="M10 5v14" />
+      <path d="M14 8v8" />
+      <path d="M18 10v4" />
+      <path d="M22 12h-2" />
+      {expanded ? null : <path d="M12 2v2" />}
     </svg>
   );
 }

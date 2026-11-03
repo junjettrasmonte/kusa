@@ -7,7 +7,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { normalizeAttachments } from './attachments.mjs';
-import { readChatSession, writeChatSession } from './chat-store.mjs';
+import { readChatSession, writeChatSession, writeSessionConfig } from './chat-store.mjs';
 
 function newMessageId() {
   try {
@@ -205,6 +205,9 @@ export function ingestTurnEvent(job, ev) {
       timeoutDefaultAllowed: ev.timeoutDefaultAllowed === true,
       autoSettled: ev.autoSettled === true,
       reason: ev.reason || null,
+      relayed: ev.relayed === true,
+      sourceAgentId: ev.sourceAgentId || null,
+      sourceRole: ev.sourceRole || null,
     };
     job.live.parts = applyApprovalToParts(job.live.parts, approval);
     const mirrors = mirrorsFromParts(job.live.parts);
@@ -230,6 +233,9 @@ export function ingestTurnEvent(job, ev) {
       timeoutMs: Number(ev.timeoutMs) > 0 ? Number(ev.timeoutMs) : null,
       timeoutStartsAt: Number(ev.timeoutStartsAt) > 0 ? Number(ev.timeoutStartsAt) : null,
       reason: ev.reason || null,
+      relayed: ev.relayed === true,
+      sourceAgentId: ev.sourceAgentId || null,
+      sourceRole: ev.sourceRole || null,
     };
     job.live.parts = applyAskToParts(job.live.parts, ask);
     const mirrors = mirrorsFromParts(job.live.parts);
@@ -396,6 +402,10 @@ export function persistTurnCompletion(dataDir, job, terminal) {
   if (!session) return null;
 
   const parts = Array.isArray(job.live?.parts) ? job.live.parts : [];
+  // Relay-only parent jobs exist to surface Subagent gates — skip empty shells.
+  if (job.relayOnly && !parts.some((p) => p?.type === 'approval' || p?.type === 'ask')) {
+    return null;
+  }
   const mirrors = mirrorsFromParts(parts);
   let tools = mirrors.tools;
   if (Array.isArray(terminal?.toolTrace) && terminal.toolTrace.length && !tools.length) {
@@ -418,17 +428,23 @@ export function persistTurnCompletion(dataDir, job, terminal) {
     || ((typeof terminal?.thinking === 'string' && terminal.thinking) ? terminal.thinking : '')
     || job.live?.thinking
     || '';
+  const relayFallback = job.relayOnly
+    ? 'Subagent asked for your input.'
+    : '';
 
+  const usedModel = String(terminal?.model || '').trim();
   const assistantMsg = {
     id: newMessageId(),
     role: 'assistant',
-    text: textOut || (thinkingOut || tools.length ? '' : '(empty response)'),
+    text: textOut
+      || (thinkingOut || tools.length ? '' : (relayFallback || '(empty response)')),
     thinking: thinkingOut || '',
     tools,
     parts: parts.length ? parts : undefined,
     at: Date.now(),
     turnId: job.turnId,
     backend: terminal?.backend || null,
+    ...(usedModel ? { model: usedModel } : {}),
     ...(terminal?.type === 'stopped' || terminal?.stopped ? { stopped: true } : {}),
     ...(terminal?.type === 'error' ? {
       error: true,
@@ -464,6 +480,20 @@ export function persistTurnCompletion(dataDir, job, terminal) {
     messages[existingIdx] = { ...messages[existingIdx], ...assistantMsg, id: messages[existingIdx].id };
   } else {
     messages.push(assistantMsg);
+  }
+
+  // Stamp the model this turn actually ran so orchestrated peers (Cursor /
+  // Copilot Subagents included) show it next to the role in the group chat.
+  if (usedModel) {
+    try {
+      writeSessionConfig(
+        dataDir,
+        session.id,
+        { model: usedModel },
+        session.harness,
+        session.parentId || session.options?.parentId || null,
+      );
+    } catch { /* best-effort */ }
   }
 
   return writeChatSession(dataDir, {

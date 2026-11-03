@@ -856,16 +856,34 @@ export function defaultMonitorSettings() {
     agentApprovalTimeoutMinutes: 2,
     /** Minutes the composer Allow / Deny rules stay before reverting to ask-deny. */
     agentAllowDenyRevertMinutes: 15,
+    /**
+     * Optional agent avatar as a small image data URL (png/jpeg/webp/gif).
+     * Shown at the center of the Live voice spectrum; assigned in Settings → Agent.
+     */
+    agentAvatar: '',
     /** Console login gate (local password+TOTP, OIDC, or SAML). */
     auth: defaultAuthSettings(),
     /**
-     * Live Chat (Pipecat) prefs — transport + TTS for the voice extension.
-     * The bot process is external; baseUrl overrides LIVE_CHAT_BASE_URL when set.
+     * Live Chat — browser-native voice prefs (STT/TTS/VAD providers).
+     * Legacy transport/tts/baseUrl fields are retained for migration.
      */
     liveChat: {
-      transport: 'websocket',
-      tts: 'piper',
+      transport: 'browser',
+      tts: 'kokoro',
       baseUrl: '',
+      gender: 'any',
+      voice: 'af_heart',
+      expressiveness: 'balanced',
+      sttProvider: 'whisper',
+      ttsProvider: 'kokoro',
+      vadProvider: 'silero',
+      offlineOnly: true,
+      language: 'en',
+      autoSpeak: true,
+      interruptible: true,
+      speechRate: 1,
+      whisperModel: 'onnx-community/whisper-tiny.en',
+      mode: 'browser',
     },
   };
 }
@@ -888,6 +906,25 @@ function normalizeAllowDenyRevertMinutes(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 15;
   return Math.min(240, Math.max(1, Math.floor(n)));
+}
+
+/** Cap for agent avatar data URLs (~36KB binary after base64). */
+const MAX_AGENT_AVATAR_CHARS = 48_000;
+const AGENT_AVATAR_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i;
+
+/**
+ * Agent avatar for Live voice (and Settings preview). Empty clears; invalid
+ * or oversized values are dropped so settings.json cannot grow unbounded.
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function normalizeAgentAvatar(raw) {
+  if (raw == null) return '';
+  const value = String(raw).trim();
+  if (!value) return '';
+  if (value.length > MAX_AGENT_AVATAR_CHARS) return '';
+  if (!AGENT_AVATAR_RE.test(value)) return '';
+  return value;
 }
 
 /**
@@ -990,13 +1027,59 @@ export function approvalTimeoutMsFromSettings(settings = {}) {
 
 /** Live Chat prefs — keep in sync with src/features/live-chat/index.mjs. */
 function normalizeLiveChatBlock(raw = {}) {
+  // Delegate to the feature normalizer so browser + legacy fields stay aligned.
+  // Inline import avoided: monitor/lib is a hub; duplicate the browser fields here
+  // with the same rules as normalizeLiveChatSettings.
   const src = raw && typeof raw === 'object' ? raw : {};
-  const transport = String(src.transport ?? '').trim().toLowerCase();
-  const tts = String(src.tts ?? '').trim().toLowerCase();
+  const sttAllowed = ['whisper', 'webSpeech', 'mock'];
+  const ttsAllowed = ['kokoro', 'browserSpeech', 'mock'];
+  const vadAllowed = ['silero', 'energy', 'mock'];
+  const legacyTts = String(src.tts ?? '').trim().toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+  const ttsProvider = ttsAllowed.includes(String(src.ttsProvider ?? '').trim())
+    ? String(src.ttsProvider).trim()
+    : 'kokoro';
+  const sttProvider = sttAllowed.includes(String(src.sttProvider ?? '').trim())
+    ? String(src.sttProvider).trim()
+    : 'whisper';
+  const vadProvider = vadAllowed.includes(String(src.vadProvider ?? '').trim())
+    ? String(src.vadProvider).trim()
+    : 'silero';
+  const genderRaw = String(src.gender ?? '').trim().toLowerCase();
+  const gender = genderRaw === 'female' || genderRaw === 'male' ? genderRaw : 'any';
+  const expressRaw = String(src.expressiveness ?? '').trim().toLowerCase();
+  const expressiveness = (
+    expressRaw === 'calm' || expressRaw === 'expressive' ? expressRaw : 'balanced'
+  );
+  const preferred = typeof src.voice === 'string' ? src.voice.trim() : '';
+  const fallback = gender === 'male' ? 'am_adam' : 'af_heart';
+  const voice = preferred || fallback;
+  const rate = Number(src.speechRate);
+  const speechRate = Number.isFinite(rate) ? Math.min(2, Math.max(0.5, rate)) : 1;
+  const transportRaw = String(src.transport ?? '').trim().toLowerCase();
+  const transport = transportRaw === 'webrtc' || transportRaw === 'websocket'
+    ? transportRaw
+    : 'browser';
   return {
-    transport: transport === 'webrtc' ? 'webrtc' : 'websocket',
-    tts: tts === 'kokoro' ? 'kokoro' : 'piper',
+    transport,
+    tts: ttsProvider === 'kokoro' ? 'kokoro' : legacyTts,
     baseUrl: typeof src.baseUrl === 'string' ? src.baseUrl.trim().replace(/\/+$/, '') : '',
+    gender,
+    voice,
+    expressiveness,
+    sttProvider,
+    ttsProvider,
+    vadProvider,
+    offlineOnly: src.offlineOnly !== false,
+    language: typeof src.language === 'string' && src.language.trim() ? src.language.trim() : 'en',
+    autoSpeak: src.autoSpeak !== false,
+    interruptible: src.interruptible !== false,
+    speechRate,
+    whisperModel: (() => {
+      const raw = typeof src.whisperModel === 'string' ? src.whisperModel.trim() : '';
+      if (!raw || raw.includes('whisper-base')) return 'onnx-community/whisper-tiny.en';
+      return raw;
+    })(),
+    mode: 'browser',
   };
 }
 
@@ -1036,6 +1119,7 @@ function normalizeMonitorSettings(raw = {}) {
     agentApprovalMode: normalizeApprovalMode(raw.agentApprovalMode),
     agentApprovalTimeoutMinutes: normalizeApprovalTimeoutMinutes(raw.agentApprovalTimeoutMinutes),
     agentAllowDenyRevertMinutes: normalizeAllowDenyRevertMinutes(raw.agentAllowDenyRevertMinutes),
+    agentAvatar: normalizeAgentAvatar(raw.agentAvatar),
     auth: normalizeAuth(raw.auth),
     liveChat: normalizeLiveChatBlock(raw.liveChat),
   };
@@ -1848,7 +1932,7 @@ function syncAliases(state) {
 
 export function emptyState(config, origin = 'hooks') {
   const state = {
-    schemaVersion: 3, // 3 = pwa/index.json + sessions/<stem>/lane.json
+    schemaVersion: 3, // 3 = pwa/index.json + agents/<stem>/lane.json
     origin,
     harness: 'github-copilot',
     harnessesSeen: [],
@@ -3233,50 +3317,69 @@ function applyCopilotEvent(state, event, clocks) {
  *     index.html, monitor-data.js     rendered console + poll payload
  *     console.{js,css}, favicon.svg   copied from the package build
  *     manifest.webmanifest, sw.js, icons/   PWA install shell
- *   sessions/<session>/               one folder per session (all related files)
+ *   agents/<agent>/                   one folder per Agent (all related files)
  *     lane.json                       counters, tools, warnings (harness in the JSON)
- *     events.jsonl                    that session's recent event metadata
+ *     events.jsonl                    that Agent's recent event metadata
  *     chat.json                       chat transcript sidecar
- *     session.json                    composer Mode / Rule / Model picks
- *     tasks.json                      that session's Task List (plan/todo rows)
- *     queues.json                     that session's held/steering composer prompts
- *     attachments/                    files attached to messages in this session
- *     sub-sessions/                   reserved for nested sub-sessions (later)
+ *     agent.json                      composer Mode / Rule / Model picks
+ *     tasks.json                      that Agent's Task List (plan/todo rows)
+ *     queues.json                     that Agent's held/steering composer prompts
+ *     attachments/                    files attached to messages in this Agent
+ *     subagents/                      nested Subagents (orchestrated children)
  *   queues.json                       workspace-shared parked (paused) prompts only
  *
- * Provider/harness is a field on the session record (and in lane keys), not a
- * disk folder. Older trees under `<harness>/<session>/`, stem-prefixed names
- * inside the session folder (`<session>.json`, …), shared `kusa/queues.json`,
+ * Provider/harness is a field on the Agent record (and in lane keys), not a
+ * disk folder. Older trees under `<harness>/<id>/`, `sessions/<id>/`,
+ * stem-prefixed names inside the Agent folder, shared `kusa/queues.json`,
  * and root-level `index.json` / dashboard copies are migrated into this layout
  * on the next read/write.
  */
 
 const SAFE_NAME = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
-/** Canonical short names inside `sessions/<stem>/` (stem is only the folder). */
+/** Canonical short names inside `agents/<stem>/` (stem is only the folder). */
 export const LANE_FILE = 'lane.json';
 export const CHAT_FILE = 'chat.json';
 export const EVENTS_FILE = 'events.jsonl';
 /** Legacy stem-prefixed events suffix (`<stem>.events.jsonl`). */
 const EVENTS_SUFFIX = '.events.jsonl';
 const ATTACHMENTS_DIR = 'attachments';
-const SUB_SESSIONS_DIR = 'sub-sessions';
-/** Shared folder for every session under the data dir. */
-export const SESSIONS_DIR = 'sessions';
-/** Top-level data dirs that are not old per-harness session parents. */
-const RESERVED_DATA_DIRS = new Set([SESSIONS_DIR, PWA_DIR, 'skills']);
-/** Composer picks for a Kusă session — lives inside the session folder. */
-const SESSION_CONFIG_FILE = 'session.json';
+/** Nested Subagents under an orchestrated parent Agent. */
+export const SUBAGENTS_DIR = 'subagents';
+/** Pre-rename nested folder; migrated into {@link SUBAGENTS_DIR} on ensure. */
+const LEGACY_SUB_SESSIONS_DIR = 'sub-sessions';
+/** Shared folder for every Agent under the data dir. */
+export const AGENTS_DIR = 'agents';
+/** @deprecated use {@link AGENTS_DIR} — pre-rename disk folder name. */
+export const SESSIONS_DIR = AGENTS_DIR;
+/** Pre-rename shared Agent folder; migrated into {@link AGENTS_DIR} on boot. */
+const LEGACY_SESSIONS_DIR = 'sessions';
+/** Top-level data dirs that are not old per-harness Agent parents. */
+const RESERVED_DATA_DIRS = new Set([
+  AGENTS_DIR,
+  LEGACY_SESSIONS_DIR,
+  PWA_DIR,
+  'skills',
+  'plans',
+  'workflows',
+]);
+/** Composer picks for a Kusă Agent — lives inside the Agent folder. */
+export const AGENT_CONFIG_FILE = 'agent.json';
+/** @deprecated use {@link AGENT_CONFIG_FILE} */
+const SESSION_CONFIG_FILE = AGENT_CONFIG_FILE;
+/** Pre-rename composer sidecar; migrated into {@link AGENT_CONFIG_FILE} on ensure. */
+const LEGACY_AGENT_CONFIG_FILE = 'session.json';
 const LANE_ALIASES = ['session', 'tools', 'recent', 'warnings', 'subagents', 'agentErrors', 'attemptTimes', 'repeatWarnedAt', 'summary'];
 /**
  * Shared sidecars that may still sit under a legacy harness root (`kusa/`)
- * until migration moves parked queues to `<dataDir>/queues.json` and per-session
- * tasks into each session folder.
+ * until migration moves parked queues to `<dataDir>/queues.json` and per-Agent
+ * tasks into each Agent folder.
  */
 const HARNESS_ROOT_FILES = new Set(['tasks.json', 'queues.json']);
-/** JSON sidecars in a session folder that are not the monitor lane record. */
+/** JSON sidecars in an Agent folder that are not the monitor lane record. */
 const SESSION_NON_LANE_JSON = new Set([
   CHAT_FILE,
-  SESSION_CONFIG_FILE,
+  AGENT_CONFIG_FILE,
+  LEGACY_AGENT_CONFIG_FILE,
   'tasks.json',
   'queues.json',
 ]);
@@ -3298,61 +3401,318 @@ export function sessionFileStem(sessionId) {
   return `h-${createHash('sha256').update(id).digest('hex').slice(0, 16)}`;
 }
 
-/** Absolute `<dataDir>/sessions` root. */
-export function sessionsRoot(dir) {
-  return join(dir, SESSIONS_DIR);
+/**
+ * Rename `.kusa/sessions/` → `.kusa/agents/` when the legacy folder is present.
+ * Merges leftover children into `agents/` if both exist.
+ */
+export function migrateSessionsDirToAgents(dir) {
+  if (!dir) return;
+  const legacy = join(dir, LEGACY_SESSIONS_DIR);
+  const next = join(dir, AGENTS_DIR);
+  if (!existsSync(legacy)) return;
+  if (!existsSync(next)) {
+    try { renameSync(legacy, next); } catch { /* next mkdir creates canonical */ }
+    return;
+  }
+  let children = [];
+  try { children = readdirSync(legacy, { withFileTypes: true }); } catch { return; }
+  for (const child of children) {
+    const from = join(legacy, child.name);
+    const to = join(next, child.name);
+    if (existsSync(to)) continue;
+    try { renameSync(from, to); } catch { /* ignore */ }
+  }
+  try {
+    const left = readdirSync(legacy);
+    if (!left.length) rmSync(legacy, { recursive: true, force: true });
+  } catch { /* ignore */ }
 }
 
-/** Legacy folder for one harness under the data dir (pre-shared-sessions layout). */
+/** Absolute `<dataDir>/agents` root. */
+export function agentsRoot(dir) {
+  return join(dir, AGENTS_DIR);
+}
+
+/** @deprecated use {@link agentsRoot} */
+export function sessionsRoot(dir) {
+  return agentsRoot(dir);
+}
+
+/** Legacy folder for one harness under the data dir (pre-shared-agents layout). */
 function harnessDir(dir, harness) {
   const name = String(harness || 'github-copilot');
   return join(dir, SAFE_NAME.test(name) ? name : sessionFileStem(name));
 }
 
 /**
- * Absolute folder that owns every file for one session:
- * `<dataDir>/sessions/<stem>/`.
+ * Absolute folder that owns every file for one Agent:
+ * `<dataDir>/agents/<stem>/`.
  */
-export function sessionDir(dir, lane) {
+export function agentDir(dir, lane) {
   const stem = sessionFileStem(lane?.id);
-  return join(sessionsRoot(dir), stem);
+  return join(agentsRoot(dir), stem);
+}
+
+/** @deprecated use {@link agentDir} */
+export function sessionDir(dir, lane) {
+  return agentDir(dir, lane);
 }
 
 /**
- * `{ dir, json, events, chat, config, tasks, queues, attachments, subSessions }`
+ * `{ dir, json, events, chat, config, tasks, queues, attachments, subagents }`
  * paths for a lane. Everything for one session lives under `dir`; `attachments`
  * holds composer files; `tasks` is that session's Task List; `queues` is that
  * session's held/steering prompts (parked prompts stay in the shared
- * `queues.json`); `subSessions` is reserved for nested sub-sessions later.
+ * `queues.json`); `subagents` holds nested Subagent folders for orchestrated parents.
  */
 export function laneFiles(dir, lane) {
-  const folder = sessionDir(dir, lane);
+  let parentId = String(lane?.parentId || '').trim();
+  if (parentId) {
+    return subagentFiles(dir, parentId, lane);
+  }
+  // Subagents must stay under their parent — never open a detached twin at
+  // agents/<childId>/ when agents/<parent>/subagents/<childId>/ exists.
+  const nested = findNestedSubagentFiles(dir, lane?.id);
+  if (nested) return nested;
+  // agent.json (or legacy session.json) may declare parentId on a wrongly top-level folder.
+  const folder = agentDir(dir, lane);
+  if (!parentId) {
+    const cfgPath = existsSync(join(folder, AGENT_CONFIG_FILE))
+      ? join(folder, AGENT_CONFIG_FILE)
+      : join(folder, LEGACY_AGENT_CONFIG_FILE);
+    if (existsSync(cfgPath)) {
+      try {
+        const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+        parentId = String(cfg?.parentId || '').trim();
+      } catch { /* ignore */ }
+    }
+  }
+  if (parentId && parentId !== sessionFileStem(lane?.id)) {
+    return subagentFiles(dir, parentId, lane);
+  }
   return {
     dir: folder,
     json: join(folder, LANE_FILE),
     events: join(folder, EVENTS_FILE),
     chat: join(folder, CHAT_FILE),
-    config: join(folder, SESSION_CONFIG_FILE),
+    config: join(folder, AGENT_CONFIG_FILE),
     tasks: join(folder, 'tasks.json'),
     queues: join(folder, 'queues.json'),
     attachments: join(folder, ATTACHMENTS_DIR),
-    subSessions: join(folder, SUB_SESSIONS_DIR),
+    subagents: join(folder, SUBAGENTS_DIR),
+    /** @deprecated use `subagents` — kept for older call sites during rename */
+    subSessions: join(folder, SUBAGENTS_DIR),
   };
 }
 
-/** Ensure the session folder and its reserved subfolders exist on disk. */
+/** Ensure the Agent folder and its reserved subfolders exist on disk. */
 export function ensureSessionDirs(files) {
   if (!files?.dir) return files;
   mkdirSync(files.dir, { recursive: true });
   mkdirSync(files.attachments, { recursive: true });
-  mkdirSync(files.subSessions, { recursive: true });
+  // Rename reserved `sub-sessions/` → `subagents/` once when present.
+  const legacySub = join(files.dir, LEGACY_SUB_SESSIONS_DIR);
+  if (existsSync(legacySub) && !existsSync(files.subagents)) {
+    try { renameSync(legacySub, files.subagents); } catch { /* next mkdir creates canonical */ }
+  }
+  mkdirSync(files.subagents, { recursive: true });
+  // Rename `session.json` → `agent.json` once when present.
+  const legacyCfg = join(files.dir, LEGACY_AGENT_CONFIG_FILE);
+  const nextCfg = files.config || join(files.dir, AGENT_CONFIG_FILE);
+  if (existsSync(legacyCfg) && legacyCfg !== nextCfg) {
+    renameOrDrop(legacyCfg, nextCfg);
+  }
   return files;
 }
 
 /**
+ * Files shape for a child under an already-resolved parent folder
+ * (top-level Agent or a nested Subagent). Used so discovery can recurse
+ * without calling {@link subagentFiles} (which looks the parent up again).
+ */
+function subagentFilesAt(parentFolder, parentId, childId) {
+  const folder = join(parentFolder, SUBAGENTS_DIR, sessionFileStem(childId));
+  return {
+    dir: folder,
+    json: join(folder, LANE_FILE),
+    events: join(folder, EVENTS_FILE),
+    chat: join(folder, CHAT_FILE),
+    config: join(folder, AGENT_CONFIG_FILE),
+    tasks: join(folder, 'tasks.json'),
+    queues: join(folder, 'queues.json'),
+    attachments: join(folder, ATTACHMENTS_DIR),
+    subagents: join(folder, SUBAGENTS_DIR),
+    subSessions: join(folder, SUBAGENTS_DIR),
+    parentId: String(parentId || ''),
+  };
+}
+
+/**
+ * Absolute folder for one Subagent nested under a parent Agent.
+ * When the parent is itself a Subagent, nests under that parent's real folder
+ * (`…/subagents/<parent>/subagents/<child>/`) instead of inventing a detached
+ * top-level twin at `agents/<parentId>/`.
+ */
+export function subagentDir(dir, parentId, childId) {
+  return subagentFiles(dir, parentId, { id: childId }).dir;
+}
+
+/**
+ * Same shape as {@link laneFiles}, but rooted under a parent's `subagents/` folder.
+ */
+export function subagentFiles(dir, parentId, childLane) {
+  const nestedParent = findNestedSubagentFiles(dir, parentId);
+  const parentFolder = nestedParent?.dir || agentDir(dir, { id: parentId });
+  return subagentFilesAt(parentFolder, parentId, childLane?.id);
+}
+
+/**
+ * Locate a Subagent folder under any ancestor's `subagents/` by child id
+ * (direct kids and deeper nests such as escalations under an Executor).
+ * Returns null when the id is only a top-level Agent (or missing).
+ */
+export function findNestedSubagentFiles(dir, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!dir || !id) return null;
+  const stem = sessionFileStem(id);
+  const root = agentsRoot(dir);
+  if (!existsSync(root)) return null;
+
+  const walk = (parentFolder, parentId) => {
+    const subRoot = join(parentFolder, SUBAGENTS_DIR);
+    if (!existsSync(subRoot)) return null;
+    let children = [];
+    try {
+      children = readdirSync(subRoot, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const child of children) {
+      if (!child.isDirectory()) continue;
+      if (child.name === stem || child.name === id) {
+        return subagentFilesAt(parentFolder, parentId, id);
+      }
+      const deeper = walk(join(subRoot, child.name), child.name);
+      if (deeper) return deeper;
+    }
+    return null;
+  };
+
+  let parents = [];
+  try {
+    parents = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const parent of parents) {
+    if (!parent.isDirectory()) continue;
+    // Never treat `agents/<id>/subagents/<id>` as a nest of itself.
+    if (parent.name === stem) continue;
+    const hit = walk(join(root, parent.name), parent.name);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+const SESSION_FOLDER_FILES = [
+  LANE_FILE,
+  EVENTS_FILE,
+  CHAT_FILE,
+  AGENT_CONFIG_FILE,
+  LEGACY_AGENT_CONFIG_FILE,
+  'tasks.json',
+  'queues.json',
+];
+
+function mergeSessionFolderInto(fromDir, toFiles) {
+  if (!fromDir || !toFiles?.dir || fromDir === toFiles.dir) return;
+  ensureSessionDirs(toFiles);
+  for (const name of SESSION_FOLDER_FILES) {
+    const from = join(fromDir, name);
+    const toName = name === LEGACY_AGENT_CONFIG_FILE ? AGENT_CONFIG_FILE : name;
+    const to = join(toFiles.dir, toName);
+    if (!existsSync(from)) continue;
+    if (!existsSync(to)) {
+      try { renameSync(from, to); } catch {
+        try { copyFileSync(from, to); } catch { /* ignore */ }
+      }
+      continue;
+    }
+    if (name === CHAT_FILE) {
+      try {
+        const a = statSync(from).size;
+        const b = statSync(to).size;
+        if (a > b) copyFileSync(from, to);
+      } catch { /* ignore */ }
+    }
+  }
+  // Attachments: copy any missing files into the nested attachments folder.
+  const fromAtt = join(fromDir, ATTACHMENTS_DIR);
+  if (existsSync(fromAtt)) {
+    mkdirSync(toFiles.attachments, { recursive: true });
+    let files = [];
+    try { files = readdirSync(fromAtt); } catch { files = []; }
+    for (const name of files) {
+      const src = join(fromAtt, name);
+      const dest = join(toFiles.attachments, name);
+      if (existsSync(dest)) continue;
+      try { copyFileSync(src, dest); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Keep Subagents under `agents/<parent>/subagents/<id>/`:
+ * - Relocate a top-level folder whose agent.json declares `parentId`
+ * - Remove top-level twins when the nested copy already exists
+ */
+export function reclaimDetachedSubagents(dir) {
+  if (!dir) return { removed: [] };
+  const root = agentsRoot(dir);
+  if (!existsSync(root)) return { removed: [] };
+  let entries = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return { removed: [] };
+  }
+  const removed = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const topDir = join(root, entry.name);
+    let nested = findNestedSubagentFiles(dir, entry.name);
+    if (!nested?.dir) {
+      // Top-level folder that belongs under a parent (config says so).
+      let parentId = '';
+      try {
+        const cfgPath = existsSync(join(topDir, AGENT_CONFIG_FILE))
+          ? join(topDir, AGENT_CONFIG_FILE)
+          : join(topDir, LEGACY_AGENT_CONFIG_FILE);
+        if (existsSync(cfgPath)) {
+          const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+          parentId = String(cfg?.parentId || '').trim();
+        }
+      } catch { /* ignore */ }
+      if (!parentId || parentId === entry.name) continue;
+      nested = subagentFiles(dir, parentId, { id: entry.name });
+      if (!nested?.dir || nested.dir === topDir) continue;
+    }
+    if (topDir === nested.dir || !existsSync(topDir)) continue;
+    try {
+      mergeSessionFolderInto(topDir, nested);
+      rmSync(topDir, { recursive: true, force: true });
+      removed.push(entry.name);
+    } catch {
+      /* best-effort */
+    }
+  }
+  return { removed };
+}
+
+/**
  * Move a legacy `<harness>/<stem>/` folder (or flat files beside it) into
- * `sessions/<stem>/`. Idempotent. Always ensures `attachments/` and
- * `sub-sessions/` exist once the session folder is in play.
+ * `agents/<stem>/`. Idempotent. Always ensures `attachments/` and
+ * `subagents/` exist once the Agent folder is in play.
  */
 export function migrateFlatSessionFiles(dir, lane) {
   if (!dir || !lane?.id) return laneFiles(dir, lane);
@@ -3361,14 +3721,14 @@ export function migrateFlatSessionFiles(dir, lane) {
   const oldFolder = join(oldHarness, stem);
   const files = laneFiles(dir, lane);
 
-  // Whole session folder under the old harness root → sessions/<stem>/.
+  // Whole Agent folder under the old harness root → agents/<stem>/.
   if (existsSync(oldFolder) && oldFolder !== files.dir) {
-    mkdirSync(sessionsRoot(dir), { recursive: true });
+    mkdirSync(agentsRoot(dir), { recursive: true });
     if (!existsSync(files.dir)) {
       try {
         renameSync(oldFolder, files.dir);
       } catch {
-        /* leave it; flat-file pass / next write still targets sessions/ */
+        /* leave it; flat-file pass / next write still targets agents/ */
       }
     }
   }
@@ -3380,7 +3740,7 @@ export function migrateFlatSessionFiles(dir, lane) {
     chat: join(oldHarness, `${stem}.chat.json`),
     config: join(oldHarness, `${stem}.session.json`),
   };
-  // Stem-prefixed names inside the session folder (pre-short-name layout).
+  // Stem-prefixed names inside the Agent folder (pre-short-name layout).
   const legacyInFolder = {
     json: join(files.dir, `${stem}.json`),
     events: join(files.dir, `${stem}${EVENTS_SUFFIX}`),
@@ -3412,11 +3772,13 @@ export function migrateFlatSessionFiles(dir, lane) {
 
 /**
  * One-shot layout upgrade: move every legacy `<harness>/<stem>/` tree into
- * `sessions/<stem>/`, and hoist shared parked queues / legacy tasks to the
- * data-dir root. Safe to call on every boot.
+ * `agents/<stem>/`, rename `sessions/` → `agents/`, and hoist shared parked
+ * queues / legacy tasks to the data-dir root. Safe to call on every boot.
  */
 export function migrateHarnessSessionsToShared(dir) {
   if (!dir || !existsSync(dir)) return;
+
+  try { migrateSessionsDirToAgents(dir); } catch { /* ignore */ }
 
   const legacySharedQueues = join(dir, 'kusa', 'queues.json');
   const sharedQueues = join(dir, 'queues.json');
@@ -3429,7 +3791,7 @@ export function migrateHarnessSessionsToShared(dir) {
     try { renameSync(legacySharedTasks, sharedTasks); } catch { /* ignore */ }
   }
 
-  mkdirSync(sessionsRoot(dir), { recursive: true });
+  mkdirSync(agentsRoot(dir), { recursive: true });
   let entries = [];
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const entry of entries) {
@@ -3460,13 +3822,15 @@ export function migrateHarnessSessionsToShared(dir) {
     } catch { /* ignore */ }
   }
 
-  // Stem-prefixed files already under sessions/<stem>/ → short canonical names.
+  // Stem-prefixed files already under agents/<stem>/ → short canonical names.
   let sessionEntries = [];
-  try { sessionEntries = readdirSync(sessionsRoot(dir), { withFileTypes: true }); } catch { return; }
+  try { sessionEntries = readdirSync(agentsRoot(dir), { withFileTypes: true }); } catch { return; }
   for (const entry of sessionEntries) {
     if (!entry.isDirectory()) continue;
     migrateFlatSessionFiles(dir, { harness: 'kusa', id: entry.name });
   }
+  // Fold any detached Subagent twins back under their parent's subagents/.
+  try { reclaimDetachedSubagents(dir); } catch { /* ignore */ }
 }
 
 /** Best-effort remove of an entire session folder (and any leftover flat files). */
@@ -3491,9 +3855,11 @@ export function removeSessionFiles(dir, lane, { dropChat = true } = {}) {
     flatPaths.push(
       join(harness, `${stem}.chat.json`),
       join(harness, `${stem}.session.json`),
-      join(harness, SESSION_CONFIG_FILE),
+      join(harness, AGENT_CONFIG_FILE),
+      join(harness, LEGACY_AGENT_CONFIG_FILE),
       join(harness, stem, `${stem}.chat.json`),
-      join(harness, stem, SESSION_CONFIG_FILE),
+      join(harness, stem, AGENT_CONFIG_FILE),
+      join(harness, stem, LEGACY_AGENT_CONFIG_FILE),
     );
   }
   for (const path of flatPaths) {
@@ -3630,8 +3996,8 @@ function readState(dir, config, origin) {
   const legacy = readLegacyState(dir, config, origin);
   if (legacy) return legacy;
 
-  // Promote legacy <harness>/<stem>/ trees into sessions/<stem>/ first so the
-  // scan below only has to walk the shared folder (plus any stubborn leftovers).
+  // Promote legacy <harness>/<stem>/ and sessions/<stem>/ trees into
+  // agents/<stem>/ first so the scan below only has to walk the shared folder.
   try { migrateHarnessSessionsToShared(dir); } catch { /* best-effort */ }
 
   const indexPath = indexJsonPath(dir);
@@ -3649,7 +4015,7 @@ function readState(dir, config, origin) {
   }
   for (const alias of LANE_ALIASES) delete state[alias];
 
-  // Every session lane lives under sessions/<stem>/lane.json. Folder and file
+  // Every Agent lane lives under agents/<stem>/lane.json. Folder and file
   // names are not trusted; the harness and id come from the record itself.
   const loadLaneFile = (path, label) => {
     try {
@@ -3672,25 +4038,65 @@ function readState(dir, config, origin) {
     || file.endsWith('.session.json')
   );
 
-  const sessionsFolder = sessionsRoot(dir);
+  const agentsFolder = agentsRoot(dir);
   let sessionEntries = [];
-  try { sessionEntries = readdirSync(sessionsFolder, { withFileTypes: true }); } catch { /* none yet */ }
+  try { sessionEntries = readdirSync(agentsFolder, { withFileTypes: true }); } catch { /* none yet */ }
   for (const child of sessionEntries) {
     if (!child.isDirectory()) continue;
+    // Detached twin of a nested Subagent — reclaim should have removed it;
+    // never load it as a top-level Agent lane.
+    if (findNestedSubagentFiles(dir, child.name)) continue;
     const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id: child.name });
     if (existsSync(files.json)) {
-      loadLaneFile(files.json, `${SESSIONS_DIR}/${child.name}/${LANE_FILE}`);
-      continue;
+      loadLaneFile(files.json, `${AGENTS_DIR}/${child.name}/${LANE_FILE}`);
+    } else {
+      // Migration missed a stem-prefixed leftover — load it directly.
+      const sessionFolder = join(agentsFolder, child.name);
+      let sessionFiles = [];
+      try { sessionFiles = readdirSync(sessionFolder); } catch { sessionFiles = []; }
+      for (const file of sessionFiles) {
+        if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
+        if (isNonLaneJson(file) || !isLaneJsonName(file, child.name)) continue;
+        loadLaneFile(join(sessionFolder, file), `${AGENTS_DIR}/${child.name}/${file}`);
+      }
     }
-    // Migration missed a stem-prefixed leftover — load it directly.
-    const sessionFolder = join(sessionsFolder, child.name);
-    let sessionFiles = [];
-    try { sessionFiles = readdirSync(sessionFolder); } catch { continue; }
-    for (const file of sessionFiles) {
-      if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
-      if (isNonLaneJson(file) || !isLaneJsonName(file, child.name)) continue;
-      loadLaneFile(join(sessionFolder, file), `${SESSIONS_DIR}/${child.name}/${file}`);
-    }
+    // Nested Subagents under this parent (any depth: assign kids + escalations).
+    const loadNestedTree = (parentFolder, parentId, relPrefix) => {
+      const subRoot = join(parentFolder, SUBAGENTS_DIR);
+      if (!existsSync(subRoot)) return;
+      let nestedEntries = [];
+      try { nestedEntries = readdirSync(subRoot, { withFileTypes: true }); } catch { return; }
+      for (const nested of nestedEntries) {
+        if (!nested.isDirectory()) continue;
+        const nestedFiles = ensureSessionDirs(subagentFilesAt(parentFolder, parentId, nested.name));
+        const stampParent = (path) => {
+          loadLaneFile(path, `${relPrefix}/${SUBAGENTS_DIR}/${nested.name}/${LANE_FILE}`);
+          try {
+            const lane = normalizeLane(readJsonFile(path));
+            if (lane?.key && state.sessions[lane.key]) {
+              state.sessions[lane.key].parentId = parentId;
+            }
+          } catch { /* ignore */ }
+        };
+        if (existsSync(nestedFiles.json)) {
+          stampParent(nestedFiles.json);
+        } else {
+          let nestedSessionFiles = [];
+          try { nestedSessionFiles = readdirSync(nestedFiles.dir); } catch { nestedSessionFiles = []; }
+          for (const file of nestedSessionFiles) {
+            if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
+            if (isNonLaneJson(file) || !isLaneJsonName(file, nested.name)) continue;
+            stampParent(join(nestedFiles.dir, file));
+          }
+        }
+        loadNestedTree(
+          nestedFiles.dir,
+          nested.name,
+          `${relPrefix}/${SUBAGENTS_DIR}/${nested.name}`,
+        );
+      }
+    };
+    loadNestedTree(join(agentsFolder, child.name), child.name, `${AGENTS_DIR}/${child.name}`);
   }
 
   // Leftover legacy harness folders (migration failed mid-way) — still read them.

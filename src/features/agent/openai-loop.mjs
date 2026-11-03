@@ -17,6 +17,12 @@ import {
 } from '#features/trail/agent/trail.mjs';
 import { agentModeLabel, agentModeSystemPromptAddon, normalizeAgentMode } from './modes.mjs';
 import { taskSystemPromptAddon } from './tasks.mjs';
+import { planSystemPromptAddon } from './plans.mjs';
+import { assignSystemPromptAddon } from './assign.mjs';
+import {
+  escalateSystemPromptAddon,
+  isOrchestratedSessionKey,
+} from './escalate.mjs';
 import { sessionNameSystemPromptAddon } from './session-name.mjs';
 import { supportsVision } from './model-capabilities.mjs';
 import {
@@ -627,6 +633,8 @@ export async function runOpenAiAgentLoop({
   approvalMode = null,
   onApprove = null,
   onAsk = null,
+  onAssignTurn = null,
+  onEscalateTurn = null,
   mode = null,
   modelOverride = null,
   onSteer = null,
@@ -676,12 +684,24 @@ export async function runOpenAiAgentLoop({
     // until POST /kusa/ask answers it. Absent, the ask refuses immediately.
     onAsk,
     askEvent: (ask) => onEvent?.({ type: 'ask_request', ...ask }),
+    onAssignTurn,
+    onEscalateTurn,
   });
-  let toolSchemas = openaiToolSchemasWithTrail(agentMode);
+  const orchestrated = isOrchestratedSessionKey(hooks?.dataDir || '', hooks?.sessionKey || '');
+  let toolSchemas = openaiToolSchemasWithTrail(agentMode, { orchestrated });
   const buildSystemPrompt = (modeNow, approvalNow) => {
     const promptAddons = [
       agentModeSystemPromptAddon(modeNow),
       taskSystemPromptAddon(),
+      planSystemPromptAddon(),
+      assignSystemPromptAddon({
+        dataDir: hooks?.dataDir || '',
+        sessionKey: hooks?.sessionKey || '',
+      }),
+      escalateSystemPromptAddon({
+        dataDir: hooks?.dataDir || '',
+        sessionKey: hooks?.sessionKey || '',
+      }),
       sessionNameSystemPromptAddon(),
       askSystemPromptAddon(),
       trailSystemPromptAddon(trailPolicy),
@@ -777,7 +797,7 @@ export async function runOpenAiAgentLoop({
     approvalModeResolved = nextApproval;
     tools.setMode(agentMode);
     tools.approval.setMode(approvalModeResolved);
-    toolSchemas = openaiToolSchemasWithTrail(agentMode);
+    toolSchemas = openaiToolSchemasWithTrail(agentMode, { orchestrated });
     systemPrompt = buildSystemPrompt(agentMode, approvalModeResolved);
     onEvent?.({
       type: 'status',

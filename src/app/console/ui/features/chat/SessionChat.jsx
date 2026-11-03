@@ -29,13 +29,20 @@ import {
   transferHasFiles,
 } from '#ui/shared/lib/attachments.js';
 import { PopupToggle } from './PopupList.jsx';
-import { estimateContextTokens, isCursorTrustError, truncate } from '#ui/shared/lib/chatText.js';
+import {
+  estimateContextTokens,
+  isCursorTrustError,
+  stripMarkdownForSpeech,
+  truncate,
+} from '#ui/shared/lib/chatText.js';
 import { readLocal, writeLocal } from '#ui/shared/lib/storage.js';
 import { SetupGuide } from '#ui/shared/SetupGuide.jsx';
 import {
   ArrowUpIcon,
   AttachmentsIcon,
   ChevronDownIcon,
+  LiveChatIcon,
+  PlanIcon,
   QueueIcon,
   StopIcon,
   TaskIcon,
@@ -44,7 +51,15 @@ import { AttachmentStack } from './AttachmentPanel.jsx';
 import { ClippedGrow, lastPendingGate } from './ClippedGrow.jsx';
 import { QueueStack } from './QueuePanel.jsx';
 import { TaskStack } from './TaskPanel.jsx';
+import { PlanStack, useWorkspacePlans } from './PlanPanel.jsx';
 import { ChatTurn } from './TranscriptTurns.jsx';
+import {
+  isOrchestratedChatSession,
+  mergeOrchestratedLiveTurns,
+  mergeOrchestratedMessages,
+  speakerFromSession,
+} from './mergeOrchestratedTranscript.js';
+import { LiveChatStack } from '#ui/features/live-chat/LiveChatDrawer.jsx';
 import { startLiveVoiceSession } from '#ui/features/live-chat/voiceClient.js';
 
 /** Persist drawer dock across reloads — shared by Queue / Tasks / Attachments. */
@@ -158,6 +173,7 @@ const DEFAULT_MODEL_GROUP = 'Default';
  */
 export function SessionChat({
   session,
+  peerSessions = null,
   queued = null,
   tasks = null,
   onSend,
@@ -210,6 +226,10 @@ export function SessionChat({
   // IDE-hooked sessions are observe-only — Kusă cannot prompt into the same
   // chat, so the composer stays disabled with a notice.
   const externalOwned = session?.external === true;
+  // Subagents are driven by their parent (kusa_assign / plan workflow) — the
+  // human message box stays locked so prompts only come from orchestration.
+  const isSubagent = Boolean(session?.parentId || session?.options?.parentId);
+  const composerLocked = externalOwned || isSubagent;
   // Some CLIs block until the workspace is trusted once.
   const [trustNeeded, setTrustNeeded] = useState(false);
   const [trustBusy, setTrustBusy] = useState(false);
@@ -240,22 +260,38 @@ export function SessionChat({
     60,
     Math.max(1, Math.floor(Number(agentDefaults?.approvalTimeoutMinutes) || 2)),
   );
-  // Queue, Task List, and Attachments share one slot above the composer
-  // (tab-style): only one list is open at a time. Off hides the rows only —
-  // the server still holds queued prompts / tasks, and staged files stay on
-  // the draft, so closing a tab can never drop them.
+  // Queue, Task List, Plans, Attachments, and Live Chat share one slot above the
+  // composer (tab-style): only one drawer is open at a time. Off hides the
+  // panel only — the server still holds queued prompts / tasks, staged files
+  // stay on the draft, and an open voice session keeps running when the Live
+  // Chat drawer is closed.
   const [queueExpanded, setQueueExpanded] = useState(true);
   const [tasksExpanded, setTasksExpanded] = useState(false);
+  const [plansExpanded, setPlansExpanded] = useState(false);
   const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
-  // Live voice (Pipecat): idle when the bot is down or unused; phase tracks the
-  // mic/session lifecycle while a call is open. handle holds stop().
+  const [liveChatExpanded, setLiveChatExpanded] = useState(false);
+  const workspacePlans = useWorkspacePlans({ enabled: !externalOwned });
+  // Live voice (browser-native): phase tracks mic/session lifecycle. handle holds stop().
   const [voicePhase, setVoicePhase] = useState('idle');
   const [voiceError, setVoiceError] = useState('');
-  const [liveChatUp, setLiveChatUp] = useState(false);
-  // Optimistic STT / TTS transcript lines while Live voice is open (also persisted
-  // via /live-chat/transcript when the bot has the session ids).
+  const [liveChatUp, setLiveChatUp] = useState(true);
+  const [interimTranscript, setInterimTranscript] = useState('');
+  // Optimistic voice rows (STT preview). Durable turns live in the chat store.
   const [voiceMessages, setVoiceMessages] = useState([]);
   const voiceHandleRef = useRef(null);
+  /** True after a voice STT turn until we finish speaking the Kusă reply. */
+  const voiceExpectSpeakRef = useRef(false);
+  const lastSpokenAssistantIdRef = useRef('');
+  /** How much of the live/final Kusă reply has already been sent to TTS. */
+  const spokenReplyLenRef = useRef(0);
+  const busyRef = useRef(false);
+  const sessionKeyRef = useRef(session?.key || '');
+  const onSendRef = useRef(onSend);
+  const onQueueRef = useRef(onQueue);
+  const composerOptionsRef = useRef(/** @type {Record<string, string>} */ ({}));
+  onSendRef.current = onSend;
+  onQueueRef.current = onQueue;
+  sessionKeyRef.current = session?.key || '';
   // Shared dock for all three drawers: bottom (above the composer) or right
   // (flush left of the right rail). One icon on every open drawer toggles it.
   const [drawerDock, setDrawerDock] = useState(() => (
@@ -337,20 +373,43 @@ export function SessionChat({
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
   }
-  const baseMessages = session?.messages || [];
-  // Drop optimistic voice rows once the same text lands in the persisted transcript.
+  const peers = useMemo(
+    () => (Array.isArray(peerSessions) ? peerSessions.filter(Boolean) : []),
+    [peerSessions],
+  );
+  const orchestrated = isOrchestratedChatSession(session);
+  const baseMessages = useMemo(() => {
+    if (!orchestrated) {
+      const rows = session?.messages || [];
+      const speaker = speakerFromSession(session);
+      return speaker
+        ? rows.map((msg) => (msg?.speaker ? msg : { ...msg, speaker, _queueKey: session?.key }))
+        : rows;
+    }
+    return mergeOrchestratedMessages(session, peers);
+  }, [orchestrated, session, peers]);
+  // Drop greeting voice rows once the same text lands in the persisted transcript.
   const messages = useMemo(() => {
     if (!voiceMessages.length) return baseMessages;
     const seen = new Set(
       baseMessages
-        .filter((m) => m?.backend === 'live-chat' && typeof m.text === 'string')
+        .filter((m) => typeof m.text === 'string')
         .map((m) => `${m.role}:${m.text.trim()}`),
     );
     const extra = voiceMessages.filter((m) => !seen.has(`${m.role}:${m.text.trim()}`));
     return extra.length ? [...baseMessages, ...extra] : baseMessages;
   }, [baseMessages, voiceMessages]);
-  const busy = session?.status === 'busy' || session?.status === 'thinking';
+  const peerBusy = peers.some((p) => p?.status === 'busy' || p?.status === 'thinking' || p?.live);
+  const busy = session?.status === 'busy' || session?.status === 'thinking' || (orchestrated && peerBusy);
+  // Composer Stop / voice only track THIS session's own turn — peer busy must
+  // not lock the human out of prompting the orchestrator.
+  const selfBusy = session?.status === 'busy' || session?.status === 'thinking';
+  busyRef.current = selfBusy;
   const live = session?.live;
+  const liveTurns = useMemo(() => {
+    if (!orchestrated) return null;
+    return mergeOrchestratedLiveTurns(session, peers);
+  }, [orchestrated, session, peers]);
   const trustFromMessages = useMemo(
     () => messages.some((m) => isCursorTrustError(m)),
     [messages],
@@ -412,7 +471,7 @@ export function SessionChat({
     }
   }
   const liveToolKey = (live?.tools || []).map((t) => `${t.id}:${t.status}`).join('|');
-  const livePartsKey = (live?.parts || [])
+  const partsFingerprint = (parts) => (parts || [])
     .map((p) => {
       if (p.type === 'thinking') return `t:${(p.text || '').length}`;
       if (p.type === 'approval') return `a:${p.approval?.id}:${p.approval?.status}`;
@@ -424,6 +483,10 @@ export function SessionChat({
       return `tool:${p.tool?.id}:${p.tool?.status}`;
     })
     .join('|');
+  const livePartsKey = [
+    partsFingerprint(live?.parts),
+    ...(liveTurns || []).map((turn) => `${turn.id}:${(turn.text || '').length}:${partsFingerprint(turn.parts)}`),
+  ].join('/');
   const hasDraft = Boolean(draft.trim());
   // The server owns the real queue (POST/GET /kusa/queue); these two lists are
   // only what it last reported, so the UI can show and act on held prompts.
@@ -462,36 +525,35 @@ export function SessionChat({
   const hasPayload = hasDraft || Boolean(attachments.length);
   // The queue holds prompts the user typed: a row with no words is not a row
   // the queue can list, so only a typed draft may be held.
-  const canQueue = !externalOwned && hasDraft && busy && Boolean(session) && Boolean(onQueue);
-  const canSend = !externalOwned && hasPayload && !busy && Boolean(session) && !editingId;
-  // Stop only exists while a turn is actually running for this session.
-  const canStop = !externalOwned && busy && Boolean(session) && Boolean(onStop);
+  // Composer send/queue/stop follow THIS session's turn only. Peer Subagent
+  // activity shows in the merged transcript but must not force Queue mode.
+  const canQueue = !composerLocked && hasDraft && selfBusy && Boolean(session) && Boolean(onQueue);
+  const canSend = !composerLocked && hasPayload && !selfBusy && Boolean(session) && !editingId;
+  // Stop stays available for Subagents (halt a runaway assign); only IDE-owned
+  // chats block it. The message box itself stays locked via composerLocked.
+  const canStop = !externalOwned && selfBusy && Boolean(session) && Boolean(onStop);
   const voiceActive = voicePhase !== 'idle' && voicePhase !== 'error';
-  const canStartVoice = !externalOwned
+  const canStartVoice = !composerLocked
     && Boolean(session)
-    && !busy
+    && !selfBusy
     && !hasPayload
     && !voiceActive
-    && liveChatUp
     && !editingId;
 
   useEffect(() => {
+    // Soft status probe — browser voice does not require a Pipecat bot.
     let cancelled = false;
     const probe = async () => {
       try {
         const res = await fetch('/live-chat', { headers: { Accept: 'application/json' } });
         const data = res.ok ? await res.json() : null;
-        if (!cancelled) setLiveChatUp(Boolean(data?.serverUp));
+        if (!cancelled) setLiveChatUp(data?.serverUp !== false && data?.mode !== 'pipecat-required');
       } catch {
-        if (!cancelled) setLiveChatUp(false);
+        if (!cancelled) setLiveChatUp(true);
       }
     };
     void probe();
-    const id = setInterval(probe, 8000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => () => {
@@ -499,17 +561,38 @@ export function SessionChat({
     voiceHandleRef.current = null;
   }, []);
 
+  function openLiveChatDrawer() {
+    setLiveChatExpanded(true);
+    setQueueExpanded(false);
+    setTasksExpanded(false);
+    setPlansExpanded(false);
+    setAttachmentsExpanded(false);
+  }
+
+  function getVoiceLevels(bandCount = 40) {
+    return voiceHandleRef.current?.getAudioLevels?.(bandCount) ?? null;
+  }
+
   async function toggleLiveVoice() {
     if (voiceActive) {
       try { voiceHandleRef.current?.stop?.(); } catch { /* ignore */ }
       voiceHandleRef.current = null;
+      voiceExpectSpeakRef.current = false;
+      spokenReplyLenRef.current = 0;
+      setInterimTranscript('');
       setVoicePhase('idle');
       setVoiceError('');
+      // Ending voice does not abort an in-flight agent turn.
       return;
     }
     if (!canStartVoice || !session) return;
+    openLiveChatDrawer();
     setVoiceError('');
+    setInterimTranscript('');
     setVoiceMessages([]);
+    voiceExpectSpeakRef.current = false;
+    spokenReplyLenRef.current = 0;
+    lastSpokenAssistantIdRef.current = '';
     try {
       const handle = await startLiveVoiceSession({
         sessionId: session.id,
@@ -521,22 +604,49 @@ export function SessionChat({
           if (phase === 'error' && detail) setVoiceError(detail);
         },
         onError: (err) => setVoiceError(err?.message || String(err)),
-        onTranscript: ({ role, text }) => {
+        onTranscript: ({ role, text, interim }) => {
           const trimmed = String(text || '').trim();
           if (!trimmed) return;
+          if (interim) {
+            setInterimTranscript(trimmed);
+            return;
+          }
+          setInterimTranscript('');
+          const voiceRole = role === 'assistant' ? 'assistant' : 'user';
           setVoiceMessages((prev) => [
             ...prev,
             {
               id: `voice-live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-              role: role === 'assistant' ? 'assistant' : 'user',
+              role: voiceRole,
               text: trimmed,
               at: Date.now(),
-              backend: 'live-chat',
+              backend: 'browser-voice',
             },
           ]);
+          // Final user STT → normal Kusă agent turn (composer pickers).
+          if (voiceRole !== 'user') return;
+          const key = sessionKeyRef.current;
+          if (!key) {
+            setVoiceError('Voice transcript missing chat session key');
+            return;
+          }
+          const opts = { ...composerOptionsRef.current };
+          voiceExpectSpeakRef.current = true;
+          spokenReplyLenRef.current = 0;
+          const send = busyRef.current && onQueueRef.current
+            ? onQueueRef.current(key, 'enqueue', { text: trimmed, options: opts })
+            : onSendRef.current?.(key, trimmed, opts);
+          if (send && typeof send.then === 'function') {
+            void send.catch((err) => {
+              setVoiceError(err?.message || String(err));
+            });
+          }
         },
         onEnded: () => {
           voiceHandleRef.current = null;
+          voiceExpectSpeakRef.current = false;
+          spokenReplyLenRef.current = 0;
+          setInterimTranscript('');
           setVoicePhase('idle');
         },
       });
@@ -757,6 +867,67 @@ export function SessionChat({
     // Adapter catalogs never route through BYOK endpoints.
     endpointId: ownsModels ? '' : activeEndpointId,
   };
+  composerOptionsRef.current = composerOptions;
+
+  // Live voice phase mirrors the agent turn: busy → thinking; TTS owns speaking.
+  useEffect(() => {
+    if (!voiceActive) return;
+    voiceHandleRef.current?.setAgentBusy?.(selfBusy);
+  }, [selfBusy, voiceActive]);
+
+  // Speak Kusă reply as it streams (sentence/newline chunks), then flush the tail.
+  useEffect(() => {
+    if (!voiceActive || !selfBusy || !voiceExpectSpeakRef.current) return;
+    const liveText = typeof live?.text === 'string' ? live.text : '';
+    if (!liveText) return;
+
+    const already = spokenReplyLenRef.current;
+    if (liveText.length <= already) return;
+    const chunk = liveText.slice(already);
+    // Prefer sentence ends; also split on markdown newlines so headers get spoken.
+    const re = /(?:[^.!?\n]+[.!?]+(?:["')\]]+)?|[^\n]+\n+)/g;
+    let lastEnd = 0;
+    let match;
+    while ((match = re.exec(chunk)) !== null) {
+      const piece = match[0];
+      lastEnd = match.index + piece.length;
+      const spoken = stripMarkdownForSpeech(piece);
+      if (spoken) voiceHandleRef.current?.speak?.(spoken);
+    }
+    if (lastEnd > 0) spokenReplyLenRef.current = already + lastEnd;
+  }, [voiceActive, selfBusy, live?.text]);
+
+  // Flush unspoken tail when the Kusă turn settles (no fragile STT↔user text match).
+  useEffect(() => {
+    if (!voiceActive || selfBusy || !voiceExpectSpeakRef.current) return;
+
+    let reply = null;
+    for (let i = baseMessages.length - 1; i >= 0; i -= 1) {
+      const m = baseMessages[i];
+      if (m?.role !== 'assistant') continue;
+      if (m.streaming) return;
+      const replyText = typeof m.text === 'string' ? m.text.trim() : '';
+      if (!replyText) continue;
+      if (m.id && m.id === lastSpokenAssistantIdRef.current) {
+        voiceExpectSpeakRef.current = false;
+        spokenReplyLenRef.current = 0;
+        return;
+      }
+      reply = m;
+      break;
+    }
+    if (!reply) return;
+
+    if (reply.id) lastSpokenAssistantIdRef.current = reply.id;
+    const full = String(reply.text || '');
+    const already = spokenReplyLenRef.current;
+    const unsaid = full.slice(already);
+    spokenReplyLenRef.current = 0;
+    voiceExpectSpeakRef.current = false;
+    const spoken = stripMarkdownForSpeech(unsaid || (already === 0 ? full : ''));
+    if (spoken) voiceHandleRef.current?.speak?.(spoken);
+  }, [selfBusy, voiceActive, baseMessages]);
+
   // Whether an image attached to THIS draft can actually reach the model. A
   // text-only endpoint cannot see one, and OpenCode takes a prompt string, so
   // no picture is ever sent as a part there. Unknown capability counts as
@@ -1041,6 +1212,14 @@ export function SessionChat({
     }
   }
 
+  const closeOtherDrawers = (except) => {
+    if (except !== 'queue') setQueueExpanded(false);
+    if (except !== 'tasks') setTasksExpanded(false);
+    if (except !== 'plans') setPlansExpanded(false);
+    if (except !== 'attachments') setAttachmentsExpanded(false);
+    if (except !== 'live') setLiveChatExpanded(false);
+  };
+
   const drawers = (
     <>
       <TaskStack
@@ -1049,6 +1228,23 @@ export function SessionChat({
         dock={drawerDock}
         onDockToggle={toggleDrawerDock}
         onClose={() => setTasksExpanded(false)}
+      />
+      <PlanStack
+        plans={workspacePlans.plans}
+        expanded={plansExpanded}
+        selectedId={workspacePlans.selectedId}
+        selectedPlan={workspacePlans.selectedPlan}
+        busy={workspacePlans.busy}
+        note={workspacePlans.note}
+        dock={drawerDock}
+        onDockToggle={toggleDrawerDock}
+        onClose={() => setPlansExpanded(false)}
+        onSelect={(id) => { void workspacePlans.select(id); }}
+        onBack={workspacePlans.back}
+        onApprove={(id) => { void workspacePlans.approve(id); }}
+        onContinue={(id) => { void workspacePlans.continueWorkflow(id); }}
+        onRemove={(id) => { void workspacePlans.remove(id); }}
+        onRefresh={() => { void workspacePlans.refresh(); }}
       />
       <AttachmentStack
         attachments={attachments}
@@ -1074,13 +1270,28 @@ export function SessionChat({
         onDockToggle={toggleDrawerDock}
         onClose={() => setQueueExpanded(false)}
       />
+      <LiveChatStack
+        expanded={liveChatExpanded}
+        voiceActive={voiceActive}
+        voicePhase={voicePhase}
+        voiceError={voiceError}
+        liveChatUp={liveChatUp}
+        interimTranscript={interimTranscript}
+        getLevels={getVoiceLevels}
+        avatarUrl={agentDefaults?.avatar || ''}
+        dock={drawerDock}
+        onDockToggle={toggleDrawerDock}
+        onClose={() => setLiveChatExpanded(false)}
+      />
     </>
   );
 
   const drawerOpen = !externalOwned && (
     (queueExpanded && queueTotal > 0)
     || (tasksExpanded && taskTotal > 0)
+    || plansExpanded
     || (attachmentsExpanded && attachments.length > 0)
+    || liveChatExpanded
   );
   const bottomDockOpen = drawerDock === 'bottom' && drawerOpen;
   const rightDockOpen = drawerDock === 'right' && drawerOpen;
@@ -1136,53 +1347,105 @@ export function SessionChat({
           </div>
         ) : (
           <div className="w-full flex flex-col gap-6">
-            {messages.map((msg) => (
-              <ChatTurn
-                key={msg.id}
-                msg={msg}
-                busy={busy}
-                editing={!externalOwned && editingId === msg.id}
-                onStartEdit={
-                  externalOwned
-                    ? undefined
-                    : () => setEditingId(msg.id)
+            {messages.map((msg) => {
+              const gateKey = msg._queueKey || msg.speaker?.queueKey || session.key;
+              return (
+                <ChatTurn
+                  key={msg.id}
+                  msg={msg}
+                  busy={selfBusy}
+                  editing={!composerLocked && editingId === msg.id}
+                  onStartEdit={
+                    composerLocked
+                      ? undefined
+                      : () => setEditingId(msg.id)
+                  }
+                  onCancelEdit={
+                    composerLocked
+                      ? undefined
+                      : () => setEditingId(null)
+                  }
+                  onResendEdit={
+                    composerLocked
+                      ? undefined
+                      : (text) => {
+                        if (!session || selfBusy) return;
+                        setEditingId(null);
+                        // The files staged now belong to the message being resent,
+                        // not to the one being edited — same rule as pressing Send.
+                        onSend?.(
+                          session.key,
+                          text,
+                          { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
+                        );
+                        setAttachments([]);
+                        setAttachNote('');
+                        setAttachmentsExpanded(false);
+                      }
+                  }
+                  agentMaxHeight={agentMaxHeight}
+                  onApproval={
+                    // Pending gate cards (incl. Subagent relays on the parent) must
+                    // stay answerable after they land in history — not only while live.
+                    externalOwned || !onApproval
+                      ? null
+                      : async (decision) => { await onApproval(gateKey, decision); }
+                  }
+                  onAsk={
+                    externalOwned || !onAsk
+                      ? null
+                      : (decision) => onAsk(gateKey, decision)
+                  }
+                  onTrustWorkspace={
+                    hasWorkspaceTrust && !trustGranted
+                      ? () => { void grantWorkspaceTrust(); }
+                      : null
+                  }
+                  trustBusy={trustBusy}
+                  trustNote={trustNote}
+                />
+              );
+            })}
+            {orchestrated && liveTurns?.length ? (
+              liveTurns.map((turn) => {
+                const gateKey = turn._queueKey || turn.speaker?.queueKey || session.key;
+                if (turn._placeholder) {
+                  return (
+                    <div key={turn.id} className="text-sm">
+                      <span className="chat-shimmer font-medium text-gray-300">
+                        {turn.speaker?.role
+                          ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
+                          : 'Thinking…'}
+                      </span>
+                    </div>
+                  );
                 }
-                onCancelEdit={
-                  externalOwned
-                    ? undefined
-                    : () => setEditingId(null)
-                }
-                onResendEdit={
-                  externalOwned
-                    ? undefined
-                    : (text) => {
-                      if (!session || busy) return;
-                      setEditingId(null);
-                      // The files staged now belong to the message being resent,
-                      // not to the one being edited — same rule as pressing Send.
-                      onSend?.(
-                        session.key,
-                        text,
-                        { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
-                      );
-                      setAttachments([]);
-                      setAttachNote('');
-                      setAttachmentsExpanded(false);
+                return (
+                  <ChatTurn
+                    key={turn.id}
+                    msg={turn}
+                    agentMaxHeight={agentMaxHeight}
+                    onApproval={
+                      externalOwned || !onApproval
+                        ? null
+                        : async (decision) => { await onApproval(gateKey, decision); }
                     }
-                }
-                agentMaxHeight={agentMaxHeight}
-                onApproval={null}
-                onAsk={null}
-                onTrustWorkspace={
-                  hasWorkspaceTrust && !trustGranted
-                    ? () => { void grantWorkspaceTrust(); }
-                    : null
-                }
-                trustBusy={trustBusy}
-                trustNote={trustNote}
-              />
-            ))}
-            {busy && live ? (
+                    onAsk={
+                      externalOwned || !onAsk
+                        ? null
+                        : (decision) => onAsk(gateKey, decision)
+                    }
+                    onTrustWorkspace={
+                      hasWorkspaceTrust && !trustGranted
+                        ? () => { void grantWorkspaceTrust(); }
+                        : null
+                    }
+                    trustBusy={trustBusy}
+                    trustNote={trustNote}
+                  />
+                );
+              })
+            ) : selfBusy && live ? (
               <ChatTurn
                 msg={{
                   id: 'live',
@@ -1192,11 +1455,13 @@ export function SessionChat({
                   tools: live.tools || [],
                   parts: live.parts || [],
                   streaming: true,
+                  speaker: speakerFromSession(session),
                 }}
                 agentMaxHeight={agentMaxHeight}
                 onApproval={
-                  onApproval
-                    ? async (decision) => {
+                  externalOwned || !onApproval
+                    ? null
+                    : async (decision) => {
                         // The click settles THIS call only — it is not a Rule and
                         // it must not move one. The Rule is whatever the Rules
                         // picker holds, and that picker is the only thing that
@@ -1208,12 +1473,11 @@ export function SessionChat({
                         // here.
                         await onApproval(session.key, decision);
                       }
-                    : null
                 }
                 onAsk={
-                  onAsk
-                    ? (decision) => onAsk(session.key, decision)
-                    : null
+                  externalOwned || !onAsk
+                    ? null
+                    : (decision) => onAsk(session.key, decision)
                 }
                 onTrustWorkspace={
                   hasWorkspaceTrust && !trustGranted
@@ -1223,7 +1487,7 @@ export function SessionChat({
                 trustBusy={trustBusy}
                 trustNote={trustNote}
               />
-            ) : busy ? (
+            ) : selfBusy ? (
               <div className="text-sm">
                 <span className="chat-shimmer font-medium text-gray-300">Thinking…</span>
               </div>
@@ -1282,7 +1546,7 @@ export function SessionChat({
 
       <form
         className="@container relative z-50 shrink-0 border-t border-gray-800/80 bg-gray-950/70 px-4 py-3 backdrop-blur sm:px-6"
-        onSubmit={externalOwned ? (event) => event.preventDefault() : submit}
+        onSubmit={composerLocked ? (event) => event.preventDefault() : submit}
       >
         {externalOwned ? (
           <div
@@ -1304,6 +1568,38 @@ export function SessionChat({
                 in Cursor.
               </p>
             </div>
+          </div>
+        ) : isSubagent ? (
+          <div
+            className="flex items-start gap-3 rounded-2xl border border-sky-700/40 bg-sky-950/25 px-3.5 py-3"
+            role="status"
+          >
+            <LucideIcon
+              name="network"
+              className="mt-0.5 h-[18px] w-[18px] shrink-0 text-sky-400"
+              title="Subagent"
+            />
+            <div className="min-w-0 flex-1 space-y-1">
+              <p className="text-sm font-medium text-sky-100">
+                Driven by parent Agent
+              </p>
+              <p className="text-xs leading-relaxed text-sky-200/80">
+                This Subagent runs prompts assigned by its parent (plan workflow).
+                Human messaging is disabled here — assigned turns start on the server
+                automatically; open the parent Agent to orchestrate.
+              </p>
+            </div>
+            {canStop ? (
+              <button
+                type="button"
+                title="Stop this run"
+                aria-label="Stop response"
+                onClick={() => { void onStop(session.key); }}
+                className="chat-composer-action inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-rose-600 text-white hover:bg-rose-500"
+              >
+                <StopIcon />
+              </button>
+            ) : null}
           </div>
         ) : (
         <>
@@ -1328,10 +1624,7 @@ export function SessionChat({
             onToggle={() => {
               setQueueExpanded((open) => {
                 const next = !open;
-                if (next) {
-                  setTasksExpanded(false);
-                  setAttachmentsExpanded(false);
-                }
+                if (next) closeOtherDrawers('queue');
                 return next;
               });
             }}
@@ -1349,9 +1642,26 @@ export function SessionChat({
             onToggle={() => {
               setTasksExpanded((open) => {
                 const next = !open;
+                if (next) closeOtherDrawers('tasks');
+                return next;
+              });
+            }}
+          />
+          <PopupToggle
+            icon={PlanIcon}
+            label="Plans"
+            count={workspacePlans.plans.length}
+            noun="plans"
+            available
+            countClassName="text-violet-300/90"
+            activeClassName="bg-violet-500/15 text-violet-300"
+            expanded={plansExpanded}
+            onToggle={() => {
+              setPlansExpanded((open) => {
+                const next = !open;
                 if (next) {
-                  setQueueExpanded(false);
-                  setAttachmentsExpanded(false);
+                  closeOtherDrawers('plans');
+                  void workspacePlans.refresh();
                 }
                 return next;
               });
@@ -1368,10 +1678,24 @@ export function SessionChat({
             onToggle={() => {
               setAttachmentsExpanded((open) => {
                 const next = !open;
-                if (next) {
-                  setQueueExpanded(false);
-                  setTasksExpanded(false);
-                }
+                if (next) closeOtherDrawers('attachments');
+                return next;
+              });
+            }}
+          />
+          <PopupToggle
+            icon={LiveChatIcon}
+            label="Live Chat"
+            count={voiceActive ? 1 : 0}
+            noun="live"
+            available
+            countClassName="text-emerald-300/90"
+            activeClassName="bg-emerald-500/15 text-emerald-300"
+            expanded={liveChatExpanded}
+            onToggle={() => {
+              setLiveChatExpanded((open) => {
+                const next = !open;
+                if (next) closeOtherDrawers('live');
                 return next;
               });
             }}
@@ -1380,7 +1704,7 @@ export function SessionChat({
         <div className="w-full">
           <div
             className={`chat-composer rounded-2xl border bg-gray-900/90 shadow-sm transition-[border-color,box-shadow] ${
-              busy
+              selfBusy
                 ? 'border-gray-700'
                 : 'border-gray-700 focus-within:border-emerald-500/50 focus-within:ring-1 focus-within:ring-emerald-500/30'
             }`}
@@ -1395,7 +1719,7 @@ export function SessionChat({
               onKeyDown={onKeyDown}
               onPaste={onComposerPaste}
               placeholder={
-                busy
+                selfBusy
                   ? 'Kusă is working… pressing Send holds this prompt in the queue'
                   : editingId
                     ? 'Finish or cancel the edit above…'
@@ -1448,7 +1772,7 @@ export function SessionChat({
               <p className={`min-w-0 flex-1 truncate px-1 text-[11px] ${attachNote ? 'text-rose-400' : 'text-gray-600'}`}>
                 {attachNote
                   ? attachNote
-                  : busy
+                  : selfBusy
                     ? 'Generating… · Send queues · Stop ends this run'
                     : editingId
                       ? 'Editing — resend replaces everything after it'
@@ -1473,15 +1797,15 @@ export function SessionChat({
                 >
                   <DictateIcon />
                 </button>
-                {hasPayload && (busy || canSend) ? (
+                {hasPayload && (selfBusy || canSend) ? (
                   <button
                     type="submit"
                     disabled={!canSend && !canQueue}
-                    title={busy ? 'Queue for this run' : 'Send'}
-                    aria-label={busy ? 'Queue message' : 'Send'}
+                    title={selfBusy ? 'Queue for this run' : 'Send'}
+                    aria-label={selfBusy ? 'Queue message' : 'Send'}
                     className={`chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
                       canSend || canQueue
-                        ? (busy
+                        ? (selfBusy
                           ? 'bg-amber-600 text-white hover:bg-amber-500'
                           : 'bg-emerald-600 text-white hover:bg-emerald-500')
                         : 'bg-gray-800 text-gray-600'
@@ -1489,7 +1813,7 @@ export function SessionChat({
                   >
                     <ArrowUpIcon />
                   </button>
-                ) : busy ? (
+                ) : selfBusy ? (
                   <button
                     type="button"
                     disabled={!canStop}
@@ -1533,11 +1857,7 @@ export function SessionChat({
                   <button
                     type="button"
                     disabled={!canStartVoice}
-                    title={
-                      liveChatUp
-                        ? 'Live voice'
-                        : (voiceError || 'Live voice — start the Live Chat bot (Dev Tools › Live Chat)')
-                    }
+                    title={voiceError || 'Live voice (browser)'}
                     aria-label="Live voice"
                     onClick={() => { void toggleLiveVoice(); }}
                     className={`chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full border transition-colors ${
@@ -1551,14 +1871,6 @@ export function SessionChat({
                 )}
               </div>
             </div>
-            {voiceError && !voiceActive ? (
-              <p className="mt-1 px-1 text-[11px] text-amber-400">{voiceError}</p>
-            ) : null}
-            {voiceActive ? (
-              <p className="mt-1 px-1 text-[11px] text-emerald-400/90">
-                Live voice · {voicePhase}
-              </p>
-            ) : null}
           </div>
         </div>
         </>

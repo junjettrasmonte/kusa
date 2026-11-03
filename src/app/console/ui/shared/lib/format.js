@@ -174,13 +174,13 @@ export const TAB_LABELS = {
  * never by reusing `search-names`. */
 export const SIDEBAR_VIEW_IDS = [
   'explorer',
-  'sessions',
+  'agents',
   'search-names',
   'extensions',
 ];
 
 export const SIDEBAR_VIEW_LABELS = {
-  sessions: 'Agents',
+  agents: 'Agents',
   explorer: 'Explorer',
   'search-names': 'File names',
   extensions: 'Extensions',
@@ -190,6 +190,7 @@ export const SIDEBAR_VIEW_LABELS = {
  * Read back through initialSidebarView so a saved pane survives the rename. */
 export const SIDEBAR_VIEW_MIGRATED = {
   search: 'search-names',
+  sessions: 'agents',
 };
 
 /** Sub-views under the Monitors rail tab (main pane topbar tabs). */

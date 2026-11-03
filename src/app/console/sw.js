@@ -49,10 +49,12 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname === '/manifest.webmanifest') return;
 
   // Never cache API / auth / live data — network only.
+  // Also bypass Hugging Face / model CDNs so the shell SW never swallows multi‑MB weights.
   if (
     url.pathname === '/health'
     || url.pathname.startsWith('/auth/')
     || url.pathname.startsWith('/kusa/')
+    || url.pathname.startsWith('/live-chat')
     || url.pathname === '/settings'
     || url.pathname === '/ready'
     || url.pathname.startsWith('/mcp')
@@ -66,6 +68,9 @@ self.addEventListener('fetch', (event) => {
     || url.pathname.startsWith('/monitor-data')
     || url.pathname === '/index.json'
     || url.pathname.includes('/rpc')
+    || url.hostname === 'huggingface.co'
+    || url.hostname.endsWith('.huggingface.co')
+    || url.hostname === 'cdn.jsdelivr.net'
   ) {
     return;
   }

@@ -14,6 +14,13 @@ const PATHS = {
       <path d="M12 12V8" />
     </>
   ),
+  /** https://lucide.dev/icons/messages-square — orchestrated chat group. */
+  'messages-square': (
+    <>
+      <path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z" />
+      <path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1" />
+    </>
+  ),
   /** https://lucide.dev/icons/audio-lines — Live Chat voice extension. */
   'audio-lines': (
     <>
@@ -127,6 +134,8 @@ const PATHS = {
   ),
   /** https://lucide.dev/icons/chevron-down — collapsible card / disclosure. */
   'chevron-down': <path d="m6 9 6 6 6-6" />,
+  /** https://lucide.dev/icons/chevron-right — collapsed tree / disclosure. */
+  'chevron-right': <path d="m9 18 6-6-6-6" />,
   /** https://lucide.dev/icons/loader-circle — busy / in-progress spinner. */
   'loader-circle': <path d="M21 12a9 9 0 1 1-6.219-8.56" />,
 };

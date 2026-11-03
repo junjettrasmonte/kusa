@@ -1,229 +1,139 @@
 /**
- * Browser Live voice client — mints a session via /live-chat/session, then
- * opens WebSocket (PCM/media) or WebRTC (SDP via /live-chat/rtc).
+ * Browser-native Live voice session adapter.
+ * Preserves the SessionChat handle API previously backed by the Pipecat bot:
+ *   startLiveVoiceSession → { stop, speak, getAudioLevels, setAgentBusy }
+ *
+ * Audio stays in the browser. Text turns still go through /kusa/chat via onTranscript.
  */
+
+import { VoiceManager } from './voice/VoiceManager.js';
+import { DEFAULT_VOICE_MANAGER_CONFIG } from './voice/types.js';
 
 /**
  * @typedef {'idle'|'connecting'|'listening'|'thinking'|'speaking'|'error'} VoicePhase
  */
 
 /**
- * @param {object} opts
- * @param {string} opts.sessionId
- * @param {string} [opts.queueKey]
- * @param {string} [opts.model]
- * @param {string} [opts.endpointId]
+ * Load Live Chat prefs from the console settings API (browser voice fields).
+ * @returns {Promise<import('./voice/types.js').VoiceManagerConfig>}
+ */
+async function loadVoicePrefs() {
+  try {
+    const res = await fetch('/live-chat/settings', { headers: { Accept: 'application/json' } });
+    if (!res.ok) return { ...DEFAULT_VOICE_MANAGER_CONFIG };
+    const body = await res.json();
+    return {
+      ...DEFAULT_VOICE_MANAGER_CONFIG,
+      sttProvider: body.sttProvider || DEFAULT_VOICE_MANAGER_CONFIG.sttProvider,
+      ttsProvider: body.ttsProvider || DEFAULT_VOICE_MANAGER_CONFIG.ttsProvider,
+      vadProvider: body.vadProvider || DEFAULT_VOICE_MANAGER_CONFIG.vadProvider,
+      offlineOnly: body.offlineOnly !== false,
+      language: body.language || 'en',
+      autoSpeak: body.autoSpeak !== false,
+      interruptible: body.interruptible !== false,
+      voice: body.voice || DEFAULT_VOICE_MANAGER_CONFIG.voice,
+      speechRate: typeof body.speechRate === 'number' ? body.speechRate : 1,
+      whisperModel: (body.whisperModel && !String(body.whisperModel).includes('whisper-base'))
+        ? body.whisperModel
+        : DEFAULT_VOICE_MANAGER_CONFIG.whisperModel,
+    };
+  } catch {
+    return { ...DEFAULT_VOICE_MANAGER_CONFIG };
+  }
+}
+
+/**
+ * Start an in-browser voice session (no WebRTC / Pipecat bot).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.sessionId]  unused by audio path; kept for API compat
+ * @param {string|null} [opts.queueKey]
+ * @param {string|null} [opts.model]
+ * @param {string|null} [opts.endpointId]
  * @param {(phase: VoicePhase, detail?: string) => void} [opts.onPhase]
  * @param {(err: Error) => void} [opts.onError]
  * @param {() => void} [opts.onEnded]
- * @param {(msg: { role: string, text: string }) => void} [opts.onTranscript]
+ * @param {(msg: { role: string, text: string, interim?: boolean }) => void} [opts.onTranscript]
+ * @param {import('./voice/types.js').VoiceManagerConfig} [opts.config]
  */
 export async function startLiveVoiceSession(opts = {}) {
   const {
-    sessionId,
-    queueKey = null,
-    model = null,
-    endpointId = null,
     onPhase = null,
     onError = null,
     onEnded = null,
     onTranscript = null,
+    config: configOverride = null,
   } = opts;
 
   onPhase?.('connecting');
 
-  const statusRes = await fetch('/live-chat', { headers: { Accept: 'application/json' } });
-  const status = statusRes.ok ? await statusRes.json() : null;
-  if (!status?.serverUp) {
-    const err = new Error(status?.error || 'Live Chat bot is not running');
-    onPhase?.('error', err.message);
-    onError?.(err);
-    throw err;
-  }
-
-  const mintRes = await fetch('/live-chat/session', {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId,
-      queueKey: queueKey || undefined,
-      model: model || undefined,
-      endpointId: endpointId || undefined,
-    }),
-  });
-  const minted = await mintRes.json().catch(() => ({}));
-  if (!mintRes.ok) {
-    const err = new Error(minted?.error || `HTTP ${mintRes.status}`);
-    onPhase?.('error', err.message);
-    onError?.(err);
-    throw err;
-  }
-
-  const transport = minted.transport === 'webrtc' ? 'webrtc' : 'websocket';
-  const voiceSessionId = minted.voiceSessionId || '';
-
-  const media = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-    video: false,
-  });
-
-  let closed = false;
-  /** @type {WebSocket|null} */
-  let ws = null;
-  /** @type {RTCPeerConnection|null} */
-  let pc = null;
-  /** @type {AudioContext|null} */
-  let audioCtx = null;
-  /** @type {ScriptProcessorNode|MediaStreamAudioSourceNode|null} */
-  let processor = null;
-
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    try { processor?.disconnect?.(); } catch { /* ignore */ }
-    try { audioCtx?.close?.(); } catch { /* ignore */ }
-    try { ws?.close?.(); } catch { /* ignore */ }
-    try { pc?.close?.(); } catch { /* ignore */ }
-    for (const track of media.getTracks()) {
-      try { track.stop(); } catch { /* ignore */ }
+  const prefs = configOverride || await loadVoicePrefs();
+  const manager = new VoiceManager();
+  manager.onPhase = (phase, detail) => onPhase?.(/** @type {VoicePhase} */ (phase), detail);
+  manager.onError = (err) => onError?.(err);
+  manager.onEnded = () => onEnded?.();
+  manager.onTranscript = (info) => {
+    // SessionChat only sends finals to /kusa/chat; pass interim through for UI.
+    if (info.interim) {
+      onTranscript?.({ role: 'user', text: info.text, interim: true });
+      return;
     }
-    onPhase?.('idle');
-    onEnded?.();
+    onTranscript?.({ role: 'user', text: info.text });
   };
 
+  let closed = false;
+
   try {
-    if (transport === 'webrtc') {
-      pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      });
-      for (const track of media.getAudioTracks()) {
-        pc.addTrack(track, media);
-      }
-      pc.ontrack = (ev) => {
-        onPhase?.('speaking');
-        const [stream] = ev.streams;
-        if (!stream) return;
-        const el = new Audio();
-        el.srcObject = stream;
-        el.autoplay = true;
-        void el.play().catch(() => {});
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') onPhase?.('listening');
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') cleanup();
-      };
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const rtcRes = await fetch('/live-chat/rtc', {
-        method: 'POST',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sdp: offer.sdp,
-          type: offer.type,
-          voiceSessionId,
-          sessionId,
-          queueKey: queueKey || undefined,
-        }),
-      });
-      const answer = await rtcRes.json().catch(() => ({}));
-      if (!rtcRes.ok || !answer?.sdp) {
-        throw new Error(answer?.error || 'WebRTC signaling failed');
-      }
-      await pc.setRemoteDescription({ type: answer.type || 'answer', sdp: answer.sdp });
-      onPhase?.('listening');
-    } else {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const params = new URLSearchParams();
-      if (voiceSessionId) params.set('voiceSessionId', voiceSessionId);
-      // Also pass chat ids so the bot can POST transcripts without relying on mint memory.
-      if (sessionId) params.set('sessionId', sessionId);
-      if (queueKey) params.set('queueKey', queueKey);
-      const qs = params.toString() ? `?${params.toString()}` : '';
-      ws = new WebSocket(`${proto}//${window.location.host}/live-chat/ws${qs}`);
-      ws.binaryType = 'arraybuffer';
-      ws.onopen = () => {
-        onPhase?.('listening');
-        // Stream mic PCM16 @ 16kHz — common Pipecat websocket expectation.
-        audioCtx = new AudioContext({ sampleRate: 16000 });
-        const source = audioCtx.createMediaStreamSource(media);
-        // ScriptProcessor is deprecated but widely available without AudioWorklet bundling.
-        const bufferSize = 4096;
-        const script = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-        script.onaudioprocess = (ev) => {
-          if (closed || ws?.readyState !== WebSocket.OPEN) return;
-          const input = ev.inputBuffer.getChannelData(0);
-          const pcm = new Int16Array(input.length);
-          for (let i = 0; i < input.length; i += 1) {
-            const s = Math.max(-1, Math.min(1, input[i]));
-            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-          }
-          ws.send(pcm.buffer);
-        };
-        source.connect(script);
-        script.connect(audioCtx.destination);
-        processor = script;
-      };
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg?.type === 'thinking') onPhase?.('thinking');
-            if (msg?.type === 'speaking' || msg?.type === 'audio') onPhase?.('speaking');
-            if (msg?.type === 'listening') onPhase?.('listening');
-            if (msg?.type === 'transcript' && msg.text) {
-              onTranscript?.({
-                role: msg.role === 'assistant' ? 'assistant' : 'user',
-                text: String(msg.text),
-              });
-            }
-          } catch { /* ignore non-json */ }
-          return;
-        }
-        // Binary audio from bot — play via AudioContext
-        if (ev.data instanceof ArrayBuffer && audioCtx) {
-          onPhase?.('speaking');
-          const pcm = new Int16Array(ev.data);
-          const f32 = new Float32Array(pcm.length);
-          for (let i = 0; i < pcm.length; i += 1) f32[i] = pcm[i] / 0x8000;
-          const buf = audioCtx.createBuffer(1, f32.length, audioCtx.sampleRate || 16000);
-          buf.copyToChannel(f32, 0);
-          const node = audioCtx.createBufferSource();
-          node.buffer = buf;
-          node.connect(audioCtx.destination);
-          node.start();
-        }
-      };
-      ws.onerror = () => {
-        // Browsers hide the real reason on error; onclose usually has the code.
-        const err = new Error('Live voice WebSocket error — check the Live Chat bot logs');
-        onPhase?.('error', err.message);
-        onError?.(err);
-      };
-      ws.onclose = (ev) => {
-        if (!closed && ev && ev.code && ev.code !== 1000 && ev.code !== 1001) {
-          const detail = ev.reason
-            ? `Live voice closed (${ev.code}: ${ev.reason})`
-            : `Live voice closed (code ${ev.code})`;
-          onPhase?.('error', detail);
-          onError?.(new Error(detail));
-        }
-        cleanup();
-      };
-    }
+    await manager.initialize(prefs);
+    await manager.startSession();
   } catch (err) {
-    cleanup();
-    onPhase?.('error', err?.message || String(err));
-    onError?.(err instanceof Error ? err : new Error(String(err)));
-    throw err;
+    const wrapped = err instanceof Error ? err : new Error(String(err));
+    onPhase?.('error', wrapped.message);
+    onError?.(wrapped);
+    try { await manager.dispose(); } catch { /* ignore */ }
+    throw wrapped;
   }
 
   return {
-    transport,
-    voiceSessionId,
-    stop: cleanup,
+    async stop() {
+      if (closed) return;
+      closed = true;
+      try { await manager.dispose(); } catch { /* ignore */ }
+      onPhase?.('idle');
+      onEnded?.();
+    },
+    /**
+     * @param {string} text
+     */
+    speak(text) {
+      if (closed) return;
+      void manager.speak(text);
+    },
+    /**
+     * @param {number} [bandCount]
+     */
+    getAudioLevels(bandCount = 32) {
+      return manager.getAudioLevels(bandCount);
+    },
+    /**
+     * @param {boolean} busy
+     */
+    setAgentBusy(busy) {
+      manager.setAgentBusy(busy);
+    },
+    /** @returns {VoiceManager} */
+    getManager() {
+      return manager;
+    },
   };
 }
+
+export { VoiceManager } from './voice/VoiceManager.js';
+export { detectVoiceCapabilities } from './voice/capabilities.js';
+export { voiceProviders, listProviderIds, PROVIDER_LABELS } from './voice/registry.js';
+export { VoiceModelManager, VOICE_MODEL_CATALOG } from './voice/VoiceModelManager.js';
+export {
+  DEFAULT_VOICE_MANAGER_CONFIG,
+  DEFAULT_WHISPER_MODEL,
+  DEFAULT_KOKORO_VOICE,
+} from './voice/types.js';

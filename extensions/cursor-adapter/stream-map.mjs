@@ -48,10 +48,28 @@ export function parseCursorToolCall(toolCall) {
   };
 }
 
-/** @returns {{ cliSessionId?: string, thinking: string, content: string, segmentHadDeltas: boolean, sawResultText: string, turnError: Error | null, toolArgsById: Map<string, object> }} */
+/** Pick a model id from a Cursor stream event / nested message when present. */
+export function modelFromCursorEvent(ev) {
+  if (!ev || typeof ev !== 'object') return '';
+  for (const raw of [
+    ev.model,
+    ev.model_id,
+    ev.modelId,
+    ev.message?.model,
+    ev.message?.model_id,
+    ev.message?.modelId,
+  ]) {
+    const s = String(raw || '').trim();
+    if (s) return s;
+  }
+  return '';
+}
+
+/** @returns {{ cliSessionId?: string, model: string, thinking: string, content: string, segmentHadDeltas: boolean, sawResultText: string, turnError: Error | null, toolArgsById: Map<string, object> }} */
 export function emptyCursorStreamState(cliSessionId = '') {
   return {
     cliSessionId: String(cliSessionId || '').trim(),
+    model: '',
     thinking: '',
     content: '',
     segmentHadDeltas: false,
@@ -69,6 +87,8 @@ export function emptyCursorStreamState(cliSessionId = '') {
  */
 export function applyCursorStreamEvent(state, ev, emit = () => {}) {
   const type = String(ev?.type || '');
+  const reportedModel = modelFromCursorEvent(ev);
+  if (reportedModel) state.model = reportedModel;
 
   if (type === 'system' && (ev.subtype === 'init' || ev.session_id)) {
     const sid = String(ev.session_id || '').trim();

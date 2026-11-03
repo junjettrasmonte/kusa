@@ -183,10 +183,10 @@ async function prepare(page) {
     localStorage.setItem('monitor.tab', 'session');
     localStorage.setItem('monitor.sessionSubTab', 'chat');
     localStorage.setItem('monitor.sessionFilter', 'all');
-    localStorage.setItem('monitor.sidebarView', 'sessions');
+    localStorage.setItem('monitor.sidebarView', 'agents');
     localStorage.removeItem('monitor.chatSessions');
     document.documentElement.dataset.theme = 'light';
-    const res = await fetch('/kusa/sessions', {
+    const res = await fetch('/kusa/agents', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ session }),
@@ -255,7 +255,7 @@ async function shot(page, name) {
 
 /**
  * Demo a live approval turn without a real agent job:
- * 1) GET /kusa/sessions marks shot-demo busy + live
+ * 1) GET /kusa/agents marks shot-demo busy + live
  * 2) GET /kusa/chat/live returns a held-open SSE snapshot (resume would otherwise
  *    404 and clear the busy overlay)
  */
@@ -309,7 +309,7 @@ async function enableLiveDemoOverlay(page, live) {
       const res = await orig(input, init);
       // Only rewrite the list endpoint — never PUT/POST bodies (those omit `sessions`
       // and would wipe the sidebar if we returned `{ sessions: [] }`).
-      if (!window.__kusaShotLive || path !== '/kusa/sessions' || method !== 'GET') {
+      if (!window.__kusaShotLive || path !== '/kusa/agents' || method !== 'GET') {
         return res;
       }
       try {
@@ -345,7 +345,7 @@ async function clearLiveDemoOverlay(page) {
 }
 
 /**
- * Kusă chats re-sync from GET /kusa/sessions only when monitor `generatedAtWall`
+ * Kusă chats re-sync from GET /kusa/agents only when monitor `generatedAtWall`
  * changes — not on a fixed timer. Bump it once so the busy/live overlay applies
  * and resume attaches to the mocked SSE snapshot.
  */

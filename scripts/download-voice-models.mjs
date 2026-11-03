@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+/**
+ * Predownload browser voice weights into the PWA public tree so Live Chat
+ * never needs huggingface.co at runtime.
+ *
+ *   node scripts/download-voice-models.mjs
+ *   npm run voice:models
+ *
+ * Layout (served at /voice-models/...):
+ *   src/app/console/ui/public/voice-models/
+ *     onnx-community/whisper-tiny.en/...
+ *     onnx-community/Kokoro-82M-v1.0-ONNX/...
+ *     silero/silero_vad_v5.onnx
+ *     ort/*.wasm
+ *     MANIFEST.json
+ */
+import { createWriteStream, existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { fileURLToPath } from 'node:url';
+import { pkgRoot } from '../src/shared/lib/pkg.mjs';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const OUT = join(pkgRoot, 'src/app/console/ui/public/voice-models');
+const HF = 'https://huggingface.co';
+
+const WHISPER_ID = 'onnx-community/whisper-tiny.en';
+const KOKORO_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
+
+/** Minimal Whisper tiny (q8 / quantized) set for Transformers.js ASR. */
+const WHISPER_FILES = [
+  'config.json',
+  'generation_config.json',
+  'preprocessor_config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'special_tokens_map.json',
+  'added_tokens.json',
+  'normalizer.json',
+  'merges.txt',
+  'vocab.json',
+  'onnx/encoder_model_quantized.onnx',
+  'onnx/decoder_model_merged_quantized.onnx',
+];
+
+/** Kokoro q8 model + tokenizer (voices copied from kokoro-js package). */
+const KOKORO_FILES = [
+  'config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'onnx/model_quantized.onnx',
+];
+
+/** Voices used by Live Chat settings (see voices.mjs KOKORO_VOICES). */
+const KOKORO_VOICES = [
+  'af_heart', 'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
+  'bf_emma', 'bf_isabella',
+  'am_adam', 'am_michael', 'am_fenrir', 'am_puck',
+  'bm_george', 'bm_lewis',
+];
+
+const force = process.argv.includes('--force');
+
+function ensureDir(filePath) {
+  mkdirSync(dirname(filePath), { recursive: true });
+}
+
+async function download(url, dest) {
+  if (!force && existsSync(dest)) {
+    const st = readFileSync(dest);
+    if (st.length > 0) {
+      process.stdout.write(`  skip ${relative(OUT, dest)} (${st.length} bytes)\n`);
+      return { skipped: true, bytes: st.length };
+    }
+  }
+  ensureDir(dest);
+  process.stdout.write(`  get  ${url}\n`);
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'kusa-voice-models/1.0' },
+    redirect: 'follow',
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} for ${url}`);
+  }
+  const tmp = `${dest}.partial`;
+  await pipeline(res.body, createWriteStream(tmp));
+  const { renameSync, statSync } = await import('node:fs');
+  renameSync(tmp, dest);
+  const bytes = statSync(dest).size;
+  process.stdout.write(`  ok   ${relative(OUT, dest)} (${bytes} bytes)\n`);
+  return { skipped: false, bytes };
+}
+
+async function downloadHf(repo, file) {
+  const url = `${HF}/${repo}/resolve/main/${file}`;
+  const dest = join(OUT, repo, file);
+  return download(url, dest);
+}
+
+function copyLocal(from, destRel) {
+  const dest = join(OUT, destRel);
+  if (!existsSync(from)) {
+    throw new Error(`Missing local source: ${from}`);
+  }
+  if (!force && existsSync(dest)) {
+    process.stdout.write(`  skip ${destRel}\n`);
+    return;
+  }
+  ensureDir(dest);
+  copyFileSync(from, dest);
+  process.stdout.write(`  copy ${destRel}\n`);
+}
+
+async function main() {
+  mkdirSync(OUT, { recursive: true });
+  process.stdout.write(`Voice models → ${OUT}\n`);
+
+  process.stdout.write(`\n[whisper] ${WHISPER_ID}\n`);
+  for (const file of WHISPER_FILES) {
+    await downloadHf(WHISPER_ID, file);
+  }
+
+  process.stdout.write(`\n[kokoro] ${KOKORO_ID}\n`);
+  for (const file of KOKORO_FILES) {
+    await downloadHf(KOKORO_ID, file);
+  }
+  const voicesPkg = join(pkgRoot, 'node_modules/kokoro-js/voices');
+  for (const id of KOKORO_VOICES) {
+    copyLocal(join(voicesPkg, `${id}.bin`), join(KOKORO_ID, 'voices', `${id}.bin`));
+  }
+
+  process.stdout.write('\n[silero]\n');
+  const sileroSrc = join(pkgRoot, 'node_modules/@ricky0123/vad-web/dist/silero_vad_v5.onnx');
+  copyLocal(sileroSrc, 'silero/silero_vad_v5.onnx');
+
+  process.stdout.write('\n[onnxruntime wasm]\n');
+  const ortDist = join(pkgRoot, 'node_modules/onnxruntime-web/dist');
+  for (const name of readdirSync(ortDist)) {
+    if (!name.endsWith('.wasm')) continue;
+    // Prefer simd-threaded builds used by vad-web / transformers.
+    if (!name.includes('simd-threaded')) continue;
+    copyLocal(join(ortDist, name), join('ort', name));
+  }
+
+  const manifest = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    whisper: WHISPER_ID,
+    kokoro: KOKORO_ID,
+    voices: KOKORO_VOICES,
+    root: '/voice-models/',
+  };
+  writeFileSync(join(OUT, 'MANIFEST.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(
+    join(OUT, 'README.md'),
+    [
+      '# Bundled voice models',
+      '',
+      'Generated by `npm run voice:models`. Large `.onnx` / `.bin` / `.wasm` files',
+      'are gitignored — run the script after clone / before production build.',
+      '',
+      `Whisper: \`${WHISPER_ID}\``,
+      `Kokoro: \`${KOKORO_ID}\``,
+      '',
+    ].join('\n'),
+  );
+
+  process.stdout.write('\nDone. Models are served at /voice-models/ (Vite public + kusa serve).\n');
+}
+
+main().catch((err) => {
+  process.stderr.write(`voice:models failed: ${err?.stack || err}\n`);
+  process.exit(1);
+});

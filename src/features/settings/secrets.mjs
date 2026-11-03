@@ -188,6 +188,13 @@ export function publicSettings(settings = {}) {
       if (!Number.isFinite(n)) return 15;
       return Math.min(240, Math.max(1, Math.floor(n)));
     })(),
+    // Small image data URL for Live voice spectrum center (Settings → Agent).
+    agentAvatar: (() => {
+      const value = typeof s.agentAvatar === 'string' ? s.agentAvatar.trim() : '';
+      if (!value || value.length > 48_000) return '';
+      if (!/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(value)) return '';
+      return value;
+    })(),
     agentApiKeySet: hasKey,
     authMode: authPublic.authMode,
     authConfigured: authPublic.authConfigured,
@@ -202,12 +209,48 @@ export function publicSettings(settings = {}) {
 /** Browser-safe Live Chat prefs (no secrets). */
 function publicLiveChat(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const transport = String(src.transport ?? '').trim().toLowerCase();
-  const tts = String(src.tts ?? '').trim().toLowerCase();
+  const sttAllowed = ['whisper', 'webSpeech', 'mock'];
+  const ttsAllowed = ['kokoro', 'browserSpeech', 'mock'];
+  const vadAllowed = ['silero', 'energy', 'mock'];
+  const ttsProvider = ttsAllowed.includes(String(src.ttsProvider ?? '').trim())
+    ? String(src.ttsProvider).trim()
+    : 'kokoro';
+  const sttProvider = sttAllowed.includes(String(src.sttProvider ?? '').trim())
+    ? String(src.sttProvider).trim()
+    : 'whisper';
+  const vadProvider = vadAllowed.includes(String(src.vadProvider ?? '').trim())
+    ? String(src.vadProvider).trim()
+    : 'silero';
+  const genderRaw = String(src.gender ?? '').trim().toLowerCase();
+  const gender = genderRaw === 'female' || genderRaw === 'male' ? genderRaw : 'any';
+  const expressRaw = String(src.expressiveness ?? '').trim().toLowerCase();
+  const expressiveness = (
+    expressRaw === 'calm' || expressRaw === 'expressive' ? expressRaw : 'balanced'
+  );
+  const preferred = typeof src.voice === 'string' ? src.voice.trim() : '';
+  const fallback = gender === 'male' ? 'am_adam' : 'af_heart';
+  const rate = Number(src.speechRate);
   return {
-    transport: transport === 'webrtc' ? 'webrtc' : 'websocket',
-    tts: tts === 'kokoro' ? 'kokoro' : 'piper',
+    transport: 'browser',
+    tts: ttsProvider === 'kokoro' ? 'kokoro' : 'kokoro',
     baseUrl: typeof src.baseUrl === 'string' ? src.baseUrl.trim().replace(/\/+$/, '') : '',
+    gender,
+    voice: preferred || fallback,
+    expressiveness,
+    sttProvider,
+    ttsProvider,
+    vadProvider,
+    offlineOnly: src.offlineOnly !== false,
+    language: typeof src.language === 'string' && src.language.trim() ? src.language.trim() : 'en',
+    autoSpeak: src.autoSpeak !== false,
+    interruptible: src.interruptible !== false,
+    speechRate: Number.isFinite(rate) ? Math.min(2, Math.max(0.5, rate)) : 1,
+    whisperModel: (() => {
+      const raw = typeof src.whisperModel === 'string' ? src.whisperModel.trim() : '';
+      if (!raw || raw.includes('whisper-base')) return 'onnx-community/whisper-tiny.en';
+      return raw;
+    })(),
+    mode: 'browser',
   };
 }
 
