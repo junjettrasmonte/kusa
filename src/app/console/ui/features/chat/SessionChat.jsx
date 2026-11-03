@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useEffect,
   useMemo,
   useRef,
@@ -55,6 +56,7 @@ import { PlanStack, useWorkspacePlans } from './PlanPanel.jsx';
 import { ChatTurn } from './TranscriptTurns.jsx';
 import {
   isOrchestratedChatSession,
+  isTranscriptHandoff,
   mergeOrchestratedLiveTurns,
   mergeOrchestratedMessages,
   speakerFromSession,
@@ -1347,85 +1349,50 @@ export function SessionChat({
           </div>
         ) : (
           <div className="w-full flex flex-col gap-6">
-            {messages.map((msg) => {
+            {messages.map((msg, index) => {
               const gateKey = msg._queueKey || msg.speaker?.queueKey || session.key;
+              const handoff = isTranscriptHandoff(messages[index - 1], msg);
               return (
-                <ChatTurn
-                  key={msg.id}
-                  msg={msg}
-                  busy={selfBusy}
-                  editing={!composerLocked && editingId === msg.id}
-                  onStartEdit={
-                    composerLocked
-                      ? undefined
-                      : () => setEditingId(msg.id)
-                  }
-                  onCancelEdit={
-                    composerLocked
-                      ? undefined
-                      : () => setEditingId(null)
-                  }
-                  onResendEdit={
-                    composerLocked
-                      ? undefined
-                      : (text) => {
-                        if (!session || selfBusy) return;
-                        setEditingId(null);
-                        // The files staged now belong to the message being resent,
-                        // not to the one being edited — same rule as pressing Send.
-                        onSend?.(
-                          session.key,
-                          text,
-                          { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
-                        );
-                        setAttachments([]);
-                        setAttachNote('');
-                        setAttachmentsExpanded(false);
-                      }
-                  }
-                  agentMaxHeight={agentMaxHeight}
-                  onApproval={
-                    // Pending gate cards (incl. Subagent relays on the parent) must
-                    // stay answerable after they land in history — not only while live.
-                    externalOwned || !onApproval
-                      ? null
-                      : async (decision) => { await onApproval(gateKey, decision); }
-                  }
-                  onAsk={
-                    externalOwned || !onAsk
-                      ? null
-                      : (decision) => onAsk(gateKey, decision)
-                  }
-                  onTrustWorkspace={
-                    hasWorkspaceTrust && !trustGranted
-                      ? () => { void grantWorkspaceTrust(); }
-                      : null
-                  }
-                  trustBusy={trustBusy}
-                  trustNote={trustNote}
-                />
-              );
-            })}
-            {orchestrated && liveTurns?.length ? (
-              liveTurns.map((turn) => {
-                const gateKey = turn._queueKey || turn.speaker?.queueKey || session.key;
-                if (turn._placeholder) {
-                  return (
-                    <div key={turn.id} className="text-sm">
-                      <span className="chat-shimmer font-medium text-gray-300">
-                        {turn.speaker?.role
-                          ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
-                          : 'Thinking…'}
-                      </span>
-                    </div>
-                  );
-                }
-                return (
+                <Fragment key={msg.id}>
+                  {handoff ? (
+                    <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
+                  ) : null}
                   <ChatTurn
-                    key={turn.id}
-                    msg={turn}
+                    msg={msg}
+                    busy={selfBusy}
+                    editing={!composerLocked && editingId === msg.id}
+                    onStartEdit={
+                      composerLocked
+                        ? undefined
+                        : () => setEditingId(msg.id)
+                    }
+                    onCancelEdit={
+                      composerLocked
+                        ? undefined
+                        : () => setEditingId(null)
+                    }
+                    onResendEdit={
+                      composerLocked
+                        ? undefined
+                        : (text) => {
+                          if (!session || selfBusy) return;
+                          setEditingId(null);
+                          // The files staged now belong to the message being resent,
+                          // not to the one being edited — same rule as pressing Send.
+                          onSend?.(
+                            session.key,
+                            text,
+                            { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
+                          );
+                          setAttachments([]);
+                          setAttachNote('');
+                          setAttachmentsExpanded(false);
+                        }
+                    }
                     agentMaxHeight={agentMaxHeight}
                     onApproval={
+                      // Pending gate cards (incl. Subagent relays on the parent) must
+                      // stay answerable after they land in history — not only while live.
                       externalOwned || !onApproval
                         ? null
                         : async (decision) => { await onApproval(gateKey, decision); }
@@ -1443,6 +1410,58 @@ export function SessionChat({
                     trustBusy={trustBusy}
                     trustNote={trustNote}
                   />
+                </Fragment>
+              );
+            })}
+            {orchestrated && liveTurns?.length ? (
+              liveTurns.map((turn, index) => {
+                const gateKey = turn._queueKey || turn.speaker?.queueKey || session.key;
+                const prev = index > 0
+                  ? liveTurns[index - 1]
+                  : messages[messages.length - 1];
+                const handoff = isTranscriptHandoff(prev, turn);
+                const rule = handoff ? (
+                  <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
+                ) : null;
+                if (turn._placeholder) {
+                  return (
+                    <Fragment key={turn.id}>
+                      {rule}
+                      <div className="text-sm">
+                        <span className="chat-shimmer font-medium text-gray-300">
+                          {turn.speaker?.role
+                            ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
+                            : 'Thinking…'}
+                        </span>
+                      </div>
+                    </Fragment>
+                  );
+                }
+                return (
+                  <Fragment key={turn.id}>
+                    {rule}
+                    <ChatTurn
+                      msg={turn}
+                      agentMaxHeight={agentMaxHeight}
+                      onApproval={
+                        externalOwned || !onApproval
+                          ? null
+                          : async (decision) => { await onApproval(gateKey, decision); }
+                      }
+                      onAsk={
+                        externalOwned || !onAsk
+                          ? null
+                          : (decision) => onAsk(gateKey, decision)
+                      }
+                      onTrustWorkspace={
+                        hasWorkspaceTrust && !trustGranted
+                          ? () => { void grantWorkspaceTrust(); }
+                          : null
+                      }
+                      trustBusy={trustBusy}
+                      trustNote={trustNote}
+                    />
+                  </Fragment>
                 );
               })
             ) : selfBusy && live ? (

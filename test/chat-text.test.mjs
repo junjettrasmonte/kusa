@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  breakGluedCodeFences,
+  normalizeChatMarkdown,
   stripLeakedToolCalls,
   stripMarkdownForSpeech,
 } from '#ui/shared/lib/chatText.js';
@@ -50,5 +52,50 @@ describe('stripLeakedToolCalls', () => {
     assert.match(spoken, /Say hi/);
     assert.equal(spoken.includes('tool_call'), false);
     assert.equal(spoken.includes('script'), false);
+  });
+});
+
+describe('breakGluedCodeFences', () => {
+  it('leaves a fence that already starts a line alone', () => {
+    const input = 'Before.\n```\ncode\n```\nAfter.';
+    assert.equal(breakGluedCodeFences(input), input);
+  });
+
+  it('unsticks a fence glued to the previous sentence (git status style)', () => {
+    const input = [
+      "I'll run that git command and report the output as-is.```",
+      ' M .gitignore',
+      ' M foo.mjs',
+      '```',
+      '',
+      'There is something to commit.',
+    ].join('\n');
+    const out = breakGluedCodeFences(input);
+    assert.match(out, /as-is\.\n```\n M \.gitignore/);
+    assert.match(out, /\n```\n\nThere is something/);
+    assert.equal(out.includes('as-is.```'), false);
+  });
+
+  it('preserves a language tag on a glued fence', () => {
+    assert.equal(
+      breakGluedCodeFences('Here:```bash\necho hi\n```'),
+      'Here:\n```bash\necho hi\n```',
+    );
+  });
+
+  it('does not break inline triple-backtick code on one line', () => {
+    const input = 'Use ```x = 1``` inline.';
+    assert.equal(breakGluedCodeFences(input), input);
+  });
+});
+
+describe('normalizeChatMarkdown', () => {
+  it('strips tool_call and unsticks fences together', () => {
+    const out = normalizeChatMarkdown(
+      'Done.<tool_call><div>x</div></tool_call> See:```\nok\n```',
+    );
+    assert.equal(out.includes('tool_call'), false);
+    assert.equal(out.includes('<div'), false);
+    assert.match(out, /See:\n```\nok\n```/);
   });
 });

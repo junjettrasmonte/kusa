@@ -161,12 +161,35 @@ export function stripLeakedToolCalls(text) {
 }
 
 /**
+ * Models often glue a fenced block to the previous sentence
+ * (`…as-is.```\n…`) — CommonMark only opens a fence at line start, so the
+ * backticks leak as literal text and the closing fence swallows the rest.
+ * Split those onto their own line. Leaves real line-start fences alone, and
+ * ignores inline ```code``` (no trailing newline/EOF after the opener).
+ * @param {string} text
+ */
+export function breakGluedCodeFences(text) {
+  return String(text || '').replace(
+    /([^\s`])(```+)([a-zA-Z0-9_-]*)(\r?\n|$)/g,
+    '$1\n$2$3$4',
+  );
+}
+
+/**
+ * Prep assistant reply text for chat markdown render / speech.
+ * @param {string} text
+ */
+export function normalizeChatMarkdown(text) {
+  return breakGluedCodeFences(stripLeakedToolCalls(text));
+}
+
+/**
  * Light markdown → spoken prose for Live Chat TTS (final assistant text only).
  * @param {string} text
  * @param {number} [max=4000]
  */
 export function stripMarkdownForSpeech(text, max = 4000) {
-  const cleaned = stripLeakedToolCalls(String(text || ''))
+  const cleaned = normalizeChatMarkdown(String(text || ''))
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')

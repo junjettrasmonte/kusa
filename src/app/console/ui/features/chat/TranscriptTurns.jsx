@@ -6,7 +6,7 @@ import {
   assistantParts,
   groupAssistantParts,
   isAgentErrorMessage,
-  stripLeakedToolCalls,
+  normalizeChatMarkdown,
   truncate,
 } from '#ui/shared/lib/chatText.js';
 import { HARNESS_NAMES } from '#ui/shared/lib/format.js';
@@ -534,9 +534,10 @@ export function AgentSegment({
   trustNote = '',
 }) {
   const groups = groupAssistantParts(parts);
-  // Strip leaked <tool_call> dumps before deciding what to show — those break
-  // markdown/HTML rendering and the tool UI already covers the same action.
-  const displayReply = stripLeakedToolCalls(replyText);
+  // Normalize before deciding what to show — leaked <tool_call> dumps break
+  // markdown/HTML rendering, and fences glued to prose (`as-is.```) leak
+  // literal backticks. Real tool rows in `parts` stay as-is.
+  const displayReply = normalizeChatMarkdown(replyText);
   const hasProgress = parts.length > 0 || (streaming && !displayReply);
   const lastPart = parts[parts.length - 1];
   const thinkingStream = Boolean(

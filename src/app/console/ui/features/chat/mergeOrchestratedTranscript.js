@@ -11,6 +11,30 @@ export function isOrchestratedChatSession(session) {
   return kind === 'orchestrated' || Boolean(session.options?.workflowId || session.workflowId);
 }
 
+/** Lane identity for a merged transcript row (session key / speaker). */
+export function transcriptLaneKey(msg) {
+  if (!msg) return '';
+  return String(
+    msg._queueKey
+    || msg.speaker?.queueKey
+    || msg.speaker?.agentId
+    || '',
+  ).trim();
+}
+
+/**
+ * True when `msg` starts a handoff section relative to `prev`: a Delegated
+ * marker, or a switch to another agent lane (assign / escalate / return).
+ */
+export function isTranscriptHandoff(prev, msg) {
+  if (!msg) return false;
+  if (msg.role === 'delegate' || msg.role === 'meta') return true;
+  if (!prev) return false;
+  const from = transcriptLaneKey(prev);
+  const to = transcriptLaneKey(msg);
+  return Boolean(from && to && from !== to);
+}
+
 export function speakerFromSession(session) {
   if (!session) return null;
   const opts = session.options || {};
