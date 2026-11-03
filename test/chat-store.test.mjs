@@ -28,7 +28,7 @@ describe('chat-store', () => {
       });
       assert.deepEqual(written.options, { mode: 'agent', rules: 'allow' });
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'sessions', 'pick-1', 'pick-1.chat.json'), 'utf8'),
+        readFileSync(join(dir, 'sessions', 'pick-1', 'chat.json'), 'utf8'),
       );
       // The transcript stays a transcript: no picks inside it.
       assert.equal(Object.hasOwn(transcript, 'options'), false);
@@ -62,8 +62,8 @@ describe('chat-store', () => {
 
     it('a settings sidecar is never read as a monitor lane', () => {
       // A hand-edited sidecar that looks like a lane record (id + harness) must
-      // not hydrate a row: listLaneFiles reads every other .json in the folder,
-      // and a settings file carries no prompts.
+      // not hydrate a row: listLaneFiles only reads lane.json, and a settings
+      // file carries no prompts.
       mkdirSync(join(dir, 'sessions', 'ghost'), { recursive: true });
       writeFileSync(
         join(dir, 'sessions', 'ghost', 'session.json'),
@@ -96,6 +96,45 @@ describe('chat-store', () => {
       assert.equal(existsSync(join(dir, 'sessions', 'stem-1', 'session.json')), true);
     });
 
+    it('stem-prefixed lane/chat/events files migrate to short names', () => {
+      const stem = 'short-1';
+      const folder = join(dir, 'sessions', stem);
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(
+        join(folder, `${stem}.json`),
+        JSON.stringify({
+          key: `kusa:${stem}`,
+          harness: 'kusa',
+          id: stem,
+          active: true,
+          startedAtWall: 1,
+          promptIndex: 1,
+          prompts: [{ index: 1, text: 'hi', atWall: 1 }],
+        }),
+      );
+      writeFileSync(
+        join(folder, `${stem}.chat.json`),
+        JSON.stringify({
+          id: stem,
+          key: `kusa:${stem}`,
+          harness: 'kusa',
+          status: 'idle',
+          attempts: 0,
+          createdAt: 1,
+          messages: [],
+        }),
+      );
+      writeFileSync(join(folder, `${stem}.events.jsonl`), '{"ok":true}\n');
+
+      assert.ok(readChatSession(dir, stem));
+      assert.equal(existsSync(join(folder, `${stem}.json`)), false);
+      assert.equal(existsSync(join(folder, `${stem}.chat.json`)), false);
+      assert.equal(existsSync(join(folder, `${stem}.events.jsonl`)), false);
+      assert.equal(existsSync(join(folder, 'lane.json')), true);
+      assert.equal(existsSync(join(folder, 'chat.json')), true);
+      assert.equal(existsSync(join(folder, 'events.jsonl')), true);
+    });
+
     it('attachment bytes land in the session attachments folder, not chat.json', () => {
       const dataUrl = 'data:image/png;base64,AAAA';
       const written = writeChatSession(dir, {
@@ -116,7 +155,7 @@ describe('chat-store', () => {
       assert.equal(written.messages[0].attachments[0].dataUrl, dataUrl);
       assert.ok(written.messages[0].attachments[0].file);
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'sessions', 'attach-1', 'attach-1.chat.json'), 'utf8'),
+        readFileSync(join(dir, 'sessions', 'attach-1', 'chat.json'), 'utf8'),
       );
       // On disk the transcript keeps only the pointer — no inline payload.
       assert.equal(transcript.messages[0].attachments[0].dataUrl, undefined);

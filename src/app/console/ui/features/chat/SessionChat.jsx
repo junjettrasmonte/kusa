@@ -1141,23 +1141,35 @@ export function SessionChat({
                 key={msg.id}
                 msg={msg}
                 busy={busy}
-                editing={editingId === msg.id}
-                onStartEdit={() => setEditingId(msg.id)}
-                onCancelEdit={() => setEditingId(null)}
-                onResendEdit={(text) => {
-                  if (!session || busy) return;
-                  setEditingId(null);
-                  // The files staged now belong to the message being resent,
-                  // not to the one being edited — same rule as pressing Send.
-                  onSend?.(
-                    session.key,
-                    text,
-                    { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
-                  );
-                  setAttachments([]);
-                  setAttachNote('');
-                  setAttachmentsExpanded(false);
-                }}
+                editing={!externalOwned && editingId === msg.id}
+                onStartEdit={
+                  externalOwned
+                    ? undefined
+                    : () => setEditingId(msg.id)
+                }
+                onCancelEdit={
+                  externalOwned
+                    ? undefined
+                    : () => setEditingId(null)
+                }
+                onResendEdit={
+                  externalOwned
+                    ? undefined
+                    : (text) => {
+                      if (!session || busy) return;
+                      setEditingId(null);
+                      // The files staged now belong to the message being resent,
+                      // not to the one being edited — same rule as pressing Send.
+                      onSend?.(
+                        session.key,
+                        text,
+                        { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
+                      );
+                      setAttachments([]);
+                      setAttachNote('');
+                      setAttachmentsExpanded(false);
+                    }
+                }
                 agentMaxHeight={agentMaxHeight}
                 onApproval={null}
                 onAsk={null}
@@ -1296,56 +1308,17 @@ export function SessionChat({
         ) : (
         <>
         {/*
-         * Composer chrome: Mode / Rule / Model + Queue / Tasks / Attachments.
-         * The form is an @container so a narrow chat column collapses even when
-         * the window is wide — below 36rem the three pickers merge into one
-         * icon menu (ComposerOptionsMenu) and the popup switches drop their
-         * names, leaving glyph + count.
+         * Composer chrome: Queue / Tasks / Attachments sit above the input.
+         * Mode / Rule / Model live inside the composer footer (left of the
+         * context ring + action icons). The form is an @container so a narrow
+         * chat column collapses even when the window is wide — below 36rem the
+         * three pickers merge into one icon menu (ComposerOptionsMenu) and the
+         * popup switches drop their names, leaving glyph + count.
          */}
-        <div className="flex items-center gap-1.5 pb-1.5">
-          <div className="hidden min-w-0 flex-wrap items-center gap-2 @[36rem]:flex">
-            <ComposerDropdown
-              title="Mode"
-              options={AGENT_MODE_OPTIONS}
-              value={agentMode}
-              onSelect={selectComposerMode}
-            />
-            <ComposerDropdown
-              title="Rule"
-              options={rulePickerOptions}
-              value={approvalRules}
-              onSelect={selectApprovalRule}
-            />
-            {showModelPicker ? (
-              <ComposerDropdown
-                title="Model"
-                options={modelOptions}
-                value={activeModel}
-                onSelect={selectComposerModel}
-              />
-            ) : (
-              <span className="rounded-md border border-gray-800 px-2 py-1 text-[11px] text-gray-500">
-                via provider CLI
-              </span>
-            )}
-          </div>
-          <div className="@[36rem]:hidden">
-            <ComposerOptionsMenu
-              mode={agentMode}
-              modeOptions={AGENT_MODE_OPTIONS}
-              onModeSelect={selectComposerMode}
-              rule={approvalRules}
-              ruleOptions={rulePickerOptions}
-              onRuleSelect={selectApprovalRule}
-              model={showModelPicker ? activeModel : ''}
-              modelOptions={showModelPicker ? modelOptions : []}
-              onModelSelect={selectComposerModel}
-            />
-          </div>
+        <div className="flex items-center justify-end gap-1.5 pb-1.5">
           {/* Tab-style popup switches (PopupList.jsx): opening one closes the
               others so only a single list sits above the composer. */}
           <PopupToggle
-            className="ml-auto"
             icon={QueueIcon}
             label="Prompt Queue"
             count={queueTotal}
@@ -1433,24 +1406,53 @@ export function SessionChat({
               className="block max-h-[200px] min-h-[44px] w-full resize-none bg-transparent px-3.5 pt-3 pb-1.5 text-sm leading-relaxed text-gray-100 placeholder:text-gray-600 focus:outline-none disabled:opacity-50"
             />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
+              <div className="hidden min-w-0 flex-wrap items-center gap-0.5 @[36rem]:flex">
+                <ComposerDropdown
+                  title="Mode"
+                  options={AGENT_MODE_OPTIONS}
+                  value={agentMode}
+                  onSelect={selectComposerMode}
+                />
+                <ComposerDropdown
+                  title="Rule"
+                  options={rulePickerOptions}
+                  value={approvalRules}
+                  onSelect={selectApprovalRule}
+                />
+                {showModelPicker ? (
+                  <ComposerDropdown
+                    title="Model"
+                    options={modelOptions}
+                    value={activeModel}
+                    onSelect={selectComposerModel}
+                  />
+                ) : (
+                  <span className="rounded-md px-1.5 py-0.5 text-[11px] text-gray-500">
+                    via provider CLI
+                  </span>
+                )}
+              </div>
+              <div className="@[36rem]:hidden">
+                <ComposerOptionsMenu
+                  mode={agentMode}
+                  modeOptions={AGENT_MODE_OPTIONS}
+                  onModeSelect={selectComposerMode}
+                  rule={approvalRules}
+                  ruleOptions={rulePickerOptions}
+                  onRuleSelect={selectApprovalRule}
+                  model={showModelPicker ? activeModel : ''}
+                  modelOptions={showModelPicker ? modelOptions : []}
+                  onModelSelect={selectComposerModel}
+                />
+              </div>
               <p className={`min-w-0 flex-1 truncate px-1 text-[11px] ${attachNote ? 'text-rose-400' : 'text-gray-600'}`}>
                 {attachNote
                   ? attachNote
                   : busy
-                    ? 'Generating response… · pressing Send queues the prompt · Stop ends this run and sends the next queued prompt'
+                    ? 'Generating… · Send queues · Stop ends this run'
                     : editingId
-                      ? 'Editing a previous message — resend replaces everything after it'
-                      : (
-                        <>
-                          <kbd className="font-sans text-gray-500">Enter</kbd>
-                          {' '}to send
-                          <span className="mx-1.5 text-gray-700">·</span>
-                          <kbd className="font-sans text-gray-500">Shift</kbd>
-                          +
-                          <kbd className="font-sans text-gray-500">Enter</kbd>
-                          {' '}newline
-                        </>
-                      )}
+                      ? 'Editing — resend replaces everything after it'
+                      : null}
               </p>
               <div className="flex shrink-0 items-center gap-0.5">
                 <ContextRing

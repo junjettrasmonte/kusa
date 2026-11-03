@@ -275,7 +275,7 @@ Remove the link with `npm unlink --global kusa`.
 ```bash
 cd your-project
 kusa init          # detects Cursor / Copilot markers; writes hooks; adds npm scripts
-kusa serve         # http://127.0.0.1:1424/dashboard.html
+kusa serve         # http://127.0.0.1:1424/
 ```
 
 Force a harness: `kusa init --cursor` or `kusa init --copilot`. A repo with neither marker gets both hook sets.
@@ -322,7 +322,7 @@ Kusă is a **per-repo Node process**, not a hosted SaaS console. The same CLI wo
 
 | Where you run it | What you get |
 | --- | --- |
-| **Local machine** (laptop / workstation) | `kusa serve` → `http://127.0.0.1:1424/dashboard.html` next to your IDE |
+| **Local machine** (laptop / workstation) | `kusa serve` → `http://127.0.0.1:1424/` next to your IDE |
 | **Dev server / remote VM** (SSH box, cloud workspace) | Same console for that checkout’s `.kusa/` data and workspace tools |
 | **Any machine with Node ≥ 22.5** | Link or install the CLI, `kusa init` in the project, `kusa serve` |
 
@@ -341,7 +341,7 @@ Best when you and your teammates already share a Tailscale tailnet. The console 
    ```bash
    cd /path/to/your-project
    kusa serve
-   # → http://127.0.0.1:1424/dashboard.html
+   # → http://127.0.0.1:1424/
    ```
 
    Use another port if needed: `kusa serve --port 1424` or `KUSA_PORT=1424`.
@@ -356,10 +356,10 @@ Best when you and your teammates already share a Tailscale tailnet. The console 
 
    Equivalent forms: `tailscale serve localhost:1424` or `tailscale serve http://127.0.0.1:1424`.
 
-4. Copy the HTTPS URL from the CLI output (shape: `https://<device>.<tailnet>.ts.net`). Open it in a browser on any device signed into the same tailnet — append `/dashboard.html` if you land on `/` and need the console explicitly:
+4. Copy the HTTPS URL from the CLI output (shape: `https://<device>.<tailnet>.ts.net`) and open it in a browser on any device signed into the same tailnet:
 
    ```text
-   https://<device>.<tailnet>.ts.net/dashboard.html
+   https://<device>.<tailnet>.ts.net/
    ```
 
 5. Optional: keep Serve running after you close the terminal:
@@ -399,7 +399,7 @@ Best when you want a stable hostname (for example `kusa.example.com`) without op
    cloudflared tunnel --url http://127.0.0.1:1424
    ```
 
-3. Open the printed `https://….trycloudflare.com` URL and go to `/dashboard.html`.
+3. Open the printed `https://….trycloudflare.com` URL.
 
 This URL is public for as long as the process runs. Treat it as temporary and unauthenticated unless you add Cloudflare Access in front.
 
@@ -439,7 +439,7 @@ This URL is public for as long as the process runs. Treat it as temporary and un
    cloudflared tunnel run kusa-console
    ```
 
-5. Browse to `https://kusa.example.com/dashboard.html`.
+5. Browse to `https://kusa.example.com/`.
 
 6. **Recommended:** put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) (or another identity gate) on that hostname so the console is not open to the world.
 
@@ -542,7 +542,7 @@ Hooks print `{}` and do not allow, deny, or follow up. Monitoring must never blo
 ## CLI reference
 
 ```text
-kusa serve [--port <n>]   Start dashboard (default http://127.0.0.1:1424/dashboard.html)
+kusa serve [--port <n>]   Start dashboard (default http://127.0.0.1:1424/)
 kusa serve --live         Hot reload: rebuild UI on save, restart server on src/ edits
 kusa init [dir]           Detect Cursor / Copilot, write hooks, add npm scripts
 kusa hook <event>         Harness hook entry (stdin JSON)

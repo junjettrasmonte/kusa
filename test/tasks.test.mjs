@@ -11,7 +11,7 @@ import {
   createKusaHookEmitter,
   createTrailAwareTools,
 } from '#features/agent/index.mjs';
-import { extractPlanTodo, runHook } from '#features/monitor/lib.mjs';
+import { extractPlanTodo, runHook, pwaFile } from '#features/monitor/lib.mjs';
 import { loadTasks, saveTasks, tasksFilePath } from '#features/chat/data/task-store.mjs';
 
 const dirs = [];
@@ -166,7 +166,7 @@ describe('kusa agent task tools', () => {
     // No second hook event was fed: the write re-rendered the monitor itself,
     // so the artifact the UI re-polls every second already carries the row on
     // the lane — which is what the chat Task Stack renders.
-    const dataScript = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
+    const dataScript = readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8');
     assert.match(dataScript, /Appear without a refresh/);
     // Still one list, not a second copy: the sidecar and the lane agree.
     assert.deepEqual(
@@ -177,10 +177,10 @@ describe('kusa agent task tools', () => {
     // A status change propagates the same way, and a no-op write does not churn
     // the monitor at all (commit is skipped, so nothing is re-rendered).
     tasks.update({ tasks: [{ id: 'Appear', status: 'completed' }] });
-    assert.match(readFileSync(join(dir, 'monitor-data.js'), 'utf8'), /"status":"completed"/);
-    const before = statSync(join(dir, 'monitor-data.js')).mtimeMs;
+    assert.match(readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8'), /"status":"completed"/);
+    const before = statSync(pwaFile(dir, 'monitor-data.js')).mtimeMs;
     tasks.update({ tasks: [{ id: 'Appear', status: 'completed' }] });
-    assert.equal(statSync(join(dir, 'monitor-data.js')).mtimeMs, before);
+    assert.equal(statSync(pwaFile(dir, 'monitor-data.js')).mtimeMs, before);
   });
 
   it('leaves other sessions alone when it writes the sidecar', async () => {

@@ -39,10 +39,12 @@ export const viteConfigPath = join(consoleDir, 'vite.config.mjs');
 export const templatesDir = join(srcDir, 'features', 'setup', 'templates');
 
 /** Built console assets: committed output of `npm run build`, read by serve + hooks. */
-export const dashboardHtmlPath = join(consoleDir, 'dashboard.html');
-export const dashboardJsPath = join(consoleDir, 'dashboard.js');
-export const dashboardCssPath = join(consoleDir, 'dashboard.css');
+export const consoleHtmlPath = join(consoleDir, 'index.html');
+export const consoleJsPath = join(consoleDir, 'console.js');
+export const consoleCssPath = join(consoleDir, 'console.css');
 export const faviconSvgPath = join(consoleDir, 'favicon.svg');
+/** @deprecated Use consoleHtmlPath — kept for older callers during the rename. */
+export const dashboardHtmlPath = consoleHtmlPath;
 
 /** Any other asset published beside the console shell (stable filename). */
 export function consoleAsset(name) {

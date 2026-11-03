@@ -55,7 +55,7 @@ emit('agentStop', { stopReason: 'end_turn' }, 25);
 
 const state = emit('sessionEnd', { reason: 'complete' }, 10);
 const view = state.tools.view;
-console.log(`Wrote ${join(dir, 'dashboard.html')}`);
+console.log(`Wrote ${join(dir, 'pwa', 'index.html')}`);
 console.log(`view attempts=${view.total} success=${view.success} avgMs=${Math.round(view.durationMsSum / view.durationCount)}`);
 console.log(`bash success=${state.tools.bash.success} failed=${state.tools.bash.failed} denied=${state.tools.bash.denied}`);
 console.log('Synthetic data only. A live agent session has not been verified.');

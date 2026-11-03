@@ -32,6 +32,7 @@ import {
   saveMonitorSettings,
   sumTrailFooters,
   todosFromTranscriptText,
+  pwaFile,
 } from '#features/monitor/lib.mjs';
 import {
   chatFilePath,
@@ -42,6 +43,7 @@ import {
   writeChatSession,
 } from '#features/chat/data/chat-store.mjs';
 import { createMonitorServer, resolveServeOptions, resolveServePort } from '#app/console/serve.mjs';
+import { createKusaHookEmitter, mirrorCliMonitorEvent } from '#features/agent/hooks.mjs';
 import { serverSourceClosure } from '#app/console/serve-live.mjs';
 import { loadQueues, queuesFilePath, saveQueues, WORKSPACE_QUEUE_KEY } from '#features/chat/data/queue-store.mjs';
 import { loadTasks, saveTasks, tasksFilePath } from '#features/chat/data/task-store.mjs';
@@ -86,9 +88,9 @@ function feed(dir, eventName, payload, extra = {}) {
   });
 }
 
-/** The view inlined into the runtime dashboard.html. */
+/** The view inlined into the runtime index.html. */
 function bootstrap(dir) {
-  const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+  const html = readFileSync(pwaFile(dir, 'index.html'), 'utf8');
   const match = html.match(/<script id="monitor-bootstrap" type="application\/json">([\s\S]*?)<\/script>/);
   assert.ok(match, 'bootstrap script present');
   return JSON.parse(match[1]);
@@ -96,7 +98,7 @@ function bootstrap(dir) {
 
 /** Shared index + focused lane from the on-disk schema-3 layout. */
 function readPersisted(dir) {
-  const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+  const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
   const rel = index.sessionFiles?.[index.focus];
   const lane = rel ? JSON.parse(readFileSync(join(dir, rel), 'utf8')) : null;
   return { index, lane };
@@ -105,13 +107,17 @@ function readPersisted(dir) {
 /** Concatenate persisted text files so tests can assert secrets never landed on disk. */
 function persistedText(dir) {
   const chunks = [];
-  for (const name of ['index.json', 'dashboard.html', 'monitor-data.js']) {
-    chunks.push(readFileSync(join(dir, name), 'utf8'));
+  for (const name of ['index.json', 'index.html', 'monitor-data.js']) {
+    chunks.push(readFileSync(pwaFile(dir, name), 'utf8'));
   }
   const { index } = readPersisted(dir);
   for (const rel of Object.values(index.sessionFiles || {})) {
     chunks.push(readFileSync(join(dir, rel), 'utf8'));
-    const events = rel.replace(/\.json$/, '.events.jsonl');
+    // Canonical: sessions/<stem>/events.jsonl beside lane.json.
+    // Legacy: <stem>.json → <stem>.events.jsonl (flat or in-folder).
+    const events = /(?:^|\/)lane\.json$/.test(rel)
+      ? rel.replace(/lane\.json$/, 'events.jsonl')
+      : rel.replace(/\.json$/, '.events.jsonl');
     if (existsSync(join(dir, events))) chunks.push(readFileSync(join(dir, events), 'utf8'));
   }
   return chunks.join('\n');
@@ -463,8 +469,8 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.equal(copilotLane.summary.attempts, 1);
     assert.equal(copilotLane.tools.Shell, undefined);
 
-    const files = ['dashboard.html', 'monitor-data.js']
-      .map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
+    const files = ['index.html', 'monitor-data.js']
+      .map((name) => readFileSync(pwaFile(dir, name), 'utf8')).join('\n');
     assert.equal(files.includes(`cd client && npm test -- --grep ${secret}`), true);
     assert.equal(files.includes(`blocked ${secret}`), false);
     assert.equal(files.includes('person@example.com'), false);
@@ -627,7 +633,7 @@ describe('Cursor and Copilot share one dashboard', () => {
     // ended
 
     let received = null;
-    new Function('window', readFileSync(join(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
+    new Function('window', readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
     assert.deepEqual(received.harnesses.map((h) => h.harness), ['cursor', 'github-copilot']);
     const cursorNode = received.harnesses.find((h) => h.harness === 'cursor');
     assert.equal(cursorNode.label, 'Cursor');
@@ -649,18 +655,18 @@ describe('Cursor and Copilot share one dashboard', () => {
     state = feed(dir, 'postToolUse', tool('view', { sessionId: 'cp-1', timestamp: 1_700_000_000_700, toolResult: { resultType: 'success' } }), { wall: 1_700_000_000_700, mono: 700 });
     assert.equal(state.focus, 'cursor:conv-1');
     assert.equal(state.session.id, 'cp-1', 'state.session still tracks the lane that received the event');
-    new Function('window', readFileSync(join(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
+    new Function('window', readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
     assert.equal(received.harnesses.find((h) => h.harness === 'github-copilot').sessions[0].status, 'thinking');
     assert.equal(received.lanes['cursor:conv-1'].session.turnOpen, true);
 
     // The runtime page is the React shell with the view inlined as bootstrap data.
-    const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+    const html = readFileSync(pwaFile(dir, 'index.html'), 'utf8');
     assert.match(html, /href="\.\/dashboard\.css"/);
     assert.match(html, /src="\.\/dashboard\.js"/);
     assert.match(html, /id="root"/);
     assert.match(html, /id="monitor-bootstrap" type="application\/json">\{"origin":"hooks"/);
-    assert.ok(readFileSync(join(dir, 'dashboard.css'), 'utf8').includes('animate-pulse'));
-    assert.ok(readFileSync(join(dir, 'dashboard.js'), 'utf8').includes('kusaUpdate'));
+    assert.ok(readFileSync(pwaFile(dir, 'console.css'), 'utf8').includes('animate-pulse'));
+    assert.ok(readFileSync(pwaFile(dir, 'console.js'), 'utf8').includes('kusaUpdate'));
   });
 
   it('keeps an id-less lane in the figures but never as a session row', () => {
@@ -835,7 +841,7 @@ describe('terminal command children', () => {
     assert.equal(termView.rows.find((row) => row.name === 'npm')?.success, 2);
     assert.equal(termView.rows.find((row) => row.name === 'git')?.incomplete, 1);
     let received = null;
-    new Function('window', readFileSync(join(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
+    new Function('window', readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
     const npmRow = received.rows.find((row) => row.name === 'npm');
     assert.equal(npmRow.depth, 1);
     assert.deepEqual(npmRow.commands, [
@@ -1038,7 +1044,7 @@ describe('sessions, prompts, and warnings', () => {
     state = feed(dir, 'agentStop', { sessionId: 'sess-1', timestamp: 1_700_000_009_000, cwd: '/work', stopReason: 'end_turn' }, { wall: 1_700_000_009_000, mono: 9000, config });
     assert.equal(state.session.turnOpen, false);
     assert.ok(state.warnings.some((warning) => warning.code === 'session-elapsed'));
-    const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+    const html = readFileSync(pwaFile(dir, 'index.html'), 'utf8');
     assert.match(html, /repeated-call warning/);
     assert.match(html, /long-running/);
     assert.doesNotMatch(html, /permissionDecision/);
@@ -1103,7 +1109,7 @@ describe('reliability', () => {
     assert.equal(view.prompts[0].role, 'user');
     assert.equal(view.prompts[0].toolAttempts, 3);
     assert.equal(view.prompts[0].open, true);
-    const files = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
+    const files = readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8');
     // Prompt text is intentionally kept for the Prompts tab (gitignored data dir).
     assert.equal(files.includes(prompt), true);
     assert.match(files, /"curl"/);
@@ -1112,6 +1118,99 @@ describe('reliability', () => {
     assert.equal(files.includes('/home/someone'), false);
     assert.equal(files.includes('SUPER_SECRET_GREP_9f3a'), false);
     assert.equal(files.includes('SUPER_SECRET_PATH_9f3a'), false);
+  });
+
+  it('records Cursor and Copilot CLI prompts and tool calls on that session lane', () => {
+    const dir = tempDir();
+    for (const harness of ['cursor', 'github-copilot']) {
+      const id = `${harness}-cli`;
+      const hooks = createKusaHookEmitter({
+        dataDir: dir,
+        sessionId: id,
+        workspaceRoot: dir,
+        harness,
+      });
+      hooks.sessionStart();
+      hooks.userPrompt(`prompt for ${harness}`);
+      mirrorCliMonitorEvent(hooks, {
+        type: 'tool_start',
+        id: 'call-1',
+        name: 'Read',
+        args: { path: 'README.md' },
+      });
+      mirrorCliMonitorEvent(hooks, {
+        type: 'tool_result',
+        id: 'call-1',
+        name: 'Read',
+        args: { path: 'README.md' },
+        result: 'ok',
+        ok: true,
+      });
+      hooks.afterAgentResponse(`reply for ${harness}`);
+      hooks.agentStop({ stopReason: 'end_turn' });
+    }
+
+    const view = bootstrap(dir);
+    for (const harness of ['cursor', 'github-copilot']) {
+      const id = `${harness}-cli`;
+      const lane = view.lanes[`${harness}:${id}`];
+      assert.ok(lane, `${harness} lane is addressable by the chat session key`);
+      assert.equal(lane.prompts.length, 1);
+      assert.equal(lane.prompts[0].text, `prompt for ${harness}`);
+      assert.equal(lane.prompts[0].response, `reply for ${harness}`);
+      const row = lane.rows.find((entry) => entry.name === 'Read' && !entry.depth);
+      assert.equal(row?.total, 1);
+      assert.equal(row?.success, 1);
+      assert.equal(view.lanes[`kusa:${id}`], undefined);
+    }
+  });
+
+  it('keeps a Cursor CLI chat file when the session has not been prompted yet', () => {
+    const dir = tempDir();
+    const created = createChatSession(dir, { id: 'cli-cursor', provider: 'cursor', workspaceRoot: dir });
+    assert.equal(created.key, 'cursor:cli-cursor');
+    assert.equal(existsSync(chatFilePath(dir, 'cli-cursor', 'cursor')), true);
+    const lane = JSON.parse(readFileSync(laneFiles(dir, { harness: 'cursor', id: 'cli-cursor' }).json, 'utf8'));
+    assert.equal(lane.harness, 'cursor');
+    assert.equal(lane.kusaOwned, true);
+    assert.equal(lane.prompts.length, 0);
+  });
+
+  it('moves an older kusa-lane CLI chat onto the provider session key', () => {
+    const dir = tempDir();
+    const id = 'moved-1';
+    feed(dir, 'sessionStart', {
+      kusa_version: '1',
+      harness: 'kusa',
+      sessionId: id,
+      timestamp: 1_700_000_000_000,
+      cwd: dir,
+      source: 'new',
+    });
+    feed(dir, 'beforeSubmitPrompt', {
+      kusa_version: '1',
+      harness: 'kusa',
+      sessionId: id,
+      timestamp: 1_700_000_000_100,
+      cwd: dir,
+      prompt: 'older cli prompt',
+    }, { wall: 1_700_000_000_100, mono: 100 });
+    writeChatSession(dir, {
+      key: 'cursor:moved-1',
+      id,
+      harness: 'cursor',
+      provider: 'cursor',
+      external: false,
+      status: 'idle',
+      attempts: 0,
+      createdAt: 1,
+      messages: [{ id: 'm1', role: 'user', text: 'older cli prompt', at: 1 }],
+    });
+    // Reload from disk so the chat sidecar can retag the lane.
+    feed(dir, 'sessionStart', session('reload-me'));
+    const view = bootstrap(dir);
+    assert.equal(view.lanes['cursor:moved-1'].prompts[0].text, 'older cli prompt');
+    assert.equal(view.lanes[`kusa:${id}`], undefined);
   });
 
   it('maps Local harness payloads, correlates by tool_use_id, and labels the harness', () => {
@@ -1150,7 +1249,7 @@ describe('reliability', () => {
     assert.equal(state.nonCopilotPayloads, 0);
     assert.equal(state.session.prompts[0].text, 'SUPER_SECRET_PROMPT_LOCAL');
     assert.equal(state.session.prompts[0].open, false);
-    const files = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
+    const files = readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8');
     // Tool argument secrets stay out; prompt text is kept for the Prompts tab.
     assert.equal(files.includes('SUPER_SECRET_LOCAL_9f3a'), false);
     assert.equal(files.includes('SUPER_SECRET_PROMPT_LOCAL'), true);
@@ -1160,7 +1259,7 @@ describe('reliability', () => {
     const dir = tempDir();
     feed(dir, 'sessionStart', session());
     feed(dir, 'preToolUse', tool('</script><b>x'), { mono: 1 });
-    const script = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
+    const script = readFileSync(pwaFile(dir, 'monitor-data.js'), 'utf8');
     assert.match(script, /^\(window\.kusaUpdate\|\|window\.copilotMonitorUpdate\)&&\(window\.kusaUpdate\|\|window\.copilotMonitorUpdate\)\(/);
     assert.doesNotMatch(script, /<\/script>/);
     let received = null;
@@ -1192,7 +1291,7 @@ describe('reliability', () => {
     const dir = tempDir();
     feed(dir, 'sessionStart', session());
     feed(dir, 'preToolUse', tool('<script>alert(1)</script>'), { mono: 1 });
-    const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+    const html = readFileSync(pwaFile(dir, 'index.html'), 'utf8');
     // The name is inlined as JSON bootstrap data; `<` is escaped so it cannot close the script tag.
     assert.match(html, /\\u003cscript>alert\(1\)\\u003c\/script>/);
     assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
@@ -1425,7 +1524,7 @@ describe('delete sessions', () => {
     assert.equal(existsSync(dropFiles.json), false);
     assert.equal(existsSync(dropFiles.events), false);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     assert.equal(index.focus, 'github-copilot:keep-me');
     assert.equal(index.sessionFiles['github-copilot:drop-me'], undefined);
     assert.ok(index.sessionFiles['github-copilot:keep-me']);
@@ -1817,9 +1916,9 @@ describe('local http server', () => {
     assert.ok(files.some((f) => f.endsWith('/lib.mjs')), 'transitive imports are followed');
     // Sibling .mjs the server does not import — editing it must not restart it.
     assert.equal(files.some((f) => f.endsWith('/vite.config.mjs')), false);
-    // dashboard.* is rewritten by the vite watcher on every save; a restart here
-    // would loop forever.
-    assert.equal(files.some((f) => /dashboard\.(html|js|css)$/.test(f)), false);
+    // UI sources / published shell assets are owned by Vite Fast Refresh;
+    // a restart here would loop forever on every JSX save.
+    assert.equal(files.some((f) => /(^|\/)(index\.html|dashboard\.(js|css)|console\.(js|css))$/.test(f)), false);
   });
 
   it('serves the page and the data folder from one origin, no-cache, and deletes sessions', async () => {
@@ -1829,12 +1928,15 @@ describe('local http server', () => {
     const base = `http://127.0.0.1:${server.address().port}`;
     try {
       // Before any hook event: page exists, data does not.
-      let res = await fetch(`${base}/dashboard.html`);
+      let res = await fetch(`${base}/`);
       assert.equal(res.status, 200);
       assert.match(res.headers.get('content-type'), /text\/html/);
       assert.match(res.headers.get('cache-control'), /no-store/);
       assert.match(await res.text(), /monitor-bootstrap/);
-      res = await fetch(`${base}/dashboard.js`);
+      res = await fetch(`${base}/index.html`);
+      assert.equal(res.status, 200);
+      assert.match(await res.text(), /monitor-bootstrap/);
+      res = await fetch(`${base}/console.js`);
       assert.equal(res.status, 200);
       assert.match(res.headers.get('content-type'), /javascript/);
       assert.match(await res.text(), /kusaUpdate/);
@@ -1870,9 +1972,9 @@ describe('local http server', () => {
       res = await fetch(`${base}/index.json`);
       assert.equal((await res.json()).focus, 'github-copilot:sess-2');
 
-      res = await fetch(`${base}/`, { redirect: 'manual' });
+      res = await fetch(`${base}/dashboard.html`, { redirect: 'manual' });
       assert.equal(res.status, 302);
-      assert.equal(res.headers.get('location'), '/dashboard.html');
+      assert.equal(res.headers.get('location'), '/');
       res = await fetch(`${base}/../../package.json`);
       assert.equal(res.status, 404);
       res = await fetch(`${base}/lib.mjs`);
@@ -2500,13 +2602,13 @@ describe('dashboard demonstration', () => {
     const state = feed(dir, 'postToolUse', tool('view', { toolResult: { resultType: 'success', textResultForLlm: 'file body' } }), { wall: 1_700_000_002_450, mono: 2450, origin: 'synthetic-demo' });
     assert.equal(state.origin, 'synthetic-demo');
     assert.equal(state.tools.view.durationMsSum, 2400);
-    const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+    const html = readFileSync(pwaFile(dir, 'index.html'), 'utf8');
     const boot = bootstrap(dir);
     assert.equal(boot.origin, 'synthetic-demo');
     assert.equal(boot.rows[0].name, 'view');
     assert.equal(boot.rows[0].avg, 2400);
     assert.match(html, /"origin":"synthetic-demo"/);
-    assert.match(readFileSync(consoleAsset('dashboard.js'), 'utf8'), /synthetic demo data/);
+    assert.match(readFileSync(consoleAsset('console.js'), 'utf8'), /synthetic demo data/);
     assert.equal(typeof boot.git?.ok, 'boolean');
     assert.equal(typeof boot.trailStatus?.ok, 'boolean');
     assert.equal(html.includes('file body'), false);

@@ -9,6 +9,7 @@ import { FILE_TOOL_DEFS, createFileTools, openaiToolSchemas as fileToolSchemas }
 import { TERMINAL_TOOL_DEFS, createTerminalTools } from '#features/agent/terminal.mjs';
 import { BROWSER_TOOL_DEFS, createBrowserTools } from '#features/agent/browser.mjs';
 import { TASK_TOOL_DEFS, createTaskTools, taskToolSchemas } from '#features/agent/tasks.mjs';
+import { SESSION_NAME_TOOL_DEFS, createSessionNameTools, sessionNameToolSchemas } from '#features/agent/session-name.mjs';
 import { ASK_TOOL_DEFS, createAskGate, askToolSchemas } from '#features/agent/ask.mjs';
 import { createApprovalGate } from '#features/agent/approval.mjs';
 import {
@@ -235,6 +236,10 @@ export function createTrailAwareTools(
     sessionKey,
     ask: (prompt, callId) => ask.call('kusa_ask', prompt, callId),
   });
+  // Session naming owns the same per-session sidecar the task tools write, so it
+  // takes the same dataDir / sessionKey pair: absent, the name stays unpersisted
+  // and the tool says so rather than inventing a row for a phantom session.
+  const names = createSessionNameTools({ dataDir, sessionKey });
 
   function trailAsk(args = {}) {
     const query = String(args.query || '').trim();
@@ -275,6 +280,12 @@ export function createTrailAwareTools(
       return tasks.call(name, args, callId);
     }
 
+    // Naming is not Trail-gated either: it writes the session's own name, never
+    // the working copy, so the model can name a chat before reading anything.
+    if (/^kusa_name_|^(name_session|rename_session|set_session_name)$/.test(name)) {
+      return names.call(name, args, callId);
+    }
+
     // Asking the user is not Trail-gated either: it reads nothing and writes
     // nothing, it just waits for a human answer.
     if (name === 'kusa_ask' || name === 'ask' || name === 'ask_user') {
@@ -296,6 +307,7 @@ export function createTrailAwareTools(
     ...FILE_TOOL_DEFS,
     ...TRAIL_TOOL_DEFS,
     ...tasks.defs,
+    ...names.defs,
     ...ask.defs,
     ...terminal.defs,
     ...browser.defs,
@@ -309,6 +321,7 @@ export function createTrailAwareTools(
     gate,
     approval,
     ask,
+    names,
     setMode(next) {
       agentMode = normalizeAgentMode(next);
       api.mode = agentMode;
@@ -317,6 +330,7 @@ export function createTrailAwareTools(
     trailAsk,
     trailMap,
     tasks,
+    names,
     call,
     readFile: files.readFile,
     writeFile: files.writeFile,
@@ -338,6 +352,7 @@ export function agentToolGroups(mode = null) {
     { group: 'file', schemas: fileToolSchemas() },
     { group: 'trail', schemas: toOpenAiSchemas(TRAIL_TOOL_DEFS) },
     { group: 'task', schemas: taskToolSchemas() },
+    { group: 'session', schemas: sessionNameToolSchemas() },
     { group: 'ask', schemas: askToolSchemas() },
     { group: 'terminal', schemas: toOpenAiSchemas(TERMINAL_TOOL_DEFS) },
     { group: 'browser', schemas: toOpenAiSchemas(BROWSER_TOOL_DEFS) },

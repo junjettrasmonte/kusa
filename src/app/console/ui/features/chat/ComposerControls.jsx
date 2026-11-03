@@ -6,11 +6,11 @@ import {
 } from '#ui/shared/lib/modelFamily.js';
 
 /**
- * Composer pickers + action icons — Mode / Rules / Model dropdowns above the
- * input (or, on a narrow composer, one ComposerOptionsMenu that drills into
- * each picker); context ring, attach, dictate, and live/send sit in the
- * composer footer. Values live in SessionChat state; these components only
- * render and route a selection back through onSelect.
+ * Composer pickers + action icons — Mode / Rules / Model dropdowns sit in the
+ * composer footer flush left of the context ring, attach, dictate, and
+ * live/send controls (or, on a narrow composer, one ComposerOptionsMenu that
+ * drills into each picker). Values live in SessionChat state; these
+ * components only render and route a selection back through onSelect.
  *
  * Model menus keep provider (endpoint) headings, then nest multi-model
  * families (Claude / GPT / Gemini / …) as selectable submenus.
@@ -384,8 +384,8 @@ function ComposerOptionsIcon() {
  * Narrow-composer Mode / Rule / Model control. One icon opens a menu whose
  * first level is the three pickers; each picker's options are a drill-in
  * submenu (tap Mode → Ask/Plan/Agent). Wide composers keep the three
- * ComposerDropdowns instead — SessionChat swaps on a container query so a
- * narrow chat column collapses even when the window itself is wide.
+ * ComposerDropdowns in the footer instead — SessionChat swaps on a container
+ * query so a narrow chat column collapses even when the window itself is wide.
  *
  * Focus-driven like ComposerDropdown: the trigger holds focus, menu presses
  * use mousedown + preventDefault so drilling in never blurs the trigger shut,

@@ -109,6 +109,26 @@ export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = proc
   };
 }
 
+/**
+ * CLI chat streams (Cursor Agent, Copilot CLI) already emit tool_start /
+ * tool_result into the transcript. Mirror those onto the monitor lane so
+ * Prompt History's tool counts and the Tool Call Viewer match Kusă's own agent.
+ */
+export function mirrorCliMonitorEvent(hooks, ev) {
+  if (!hooks?.enabled || !ev || typeof ev !== 'object') return;
+  if (ev.type === 'tool_start') {
+    hooks.preToolUse({ name: ev.name, args: ev.args, callId: ev.id });
+    return;
+  }
+  if (ev.type !== 'tool_result') return;
+  const call = { name: ev.name, args: ev.args, callId: ev.id };
+  if (ev.ok === false) {
+    hooks.postToolUseFailure({ ...call, error: ev.summary || 'tool failed' });
+    return;
+  }
+  hooks.postToolUse({ ...call, result: ev.result });
+}
+
 function summarizeToolResult(result) {
   if (result == null) return '';
   if (typeof result === 'string') return result.slice(0, 400);

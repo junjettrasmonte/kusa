@@ -12,7 +12,7 @@
  *   KUSA_SHOT_CHAT_ONLY=1 node scripts/capture-screenshots.mjs
  *
  * Env:
- *   KUSA_SHOT_URL       Dashboard URL (default http://127.0.0.1:1424/dashboard.html)
+ *   KUSA_SHOT_URL       Dashboard URL (default http://127.0.0.1:1424/)
  *   CHROME_PATH         Chrome/Chromium binary (default /usr/bin/google-chrome)
  *   KUSA_SHOT_CHAT_ONLY When "1", only rewrite kusa-overview.png + chat-harness.png
  *                       (does not delete other screenshots)
@@ -24,7 +24,7 @@ import puppeteer from 'puppeteer-core';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = join(here, '..', 'docs', 'screenshots');
-const baseUrl = process.env.KUSA_SHOT_URL || 'http://127.0.0.1:1424/dashboard.html';
+const baseUrl = process.env.KUSA_SHOT_URL || 'http://127.0.0.1:1424/';
 const chrome = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 
 /** Persisted transcript (idle). Live approval turn is injected in the browser. */

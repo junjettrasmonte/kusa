@@ -3,7 +3,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { defaultMonitorDir } from '#features/monitor/lib.mjs';
+import { defaultMonitorDir, indexJsonPath } from '#features/monitor/lib.mjs';
 import { ensureSkillsInitialized, listSkills, readSkill } from '#features/skills/index.mjs';
 import { addLearning, listLearnings } from '#features/trail/learnings.mjs';
 import { loadMcpState } from './config.mjs';
@@ -38,7 +38,7 @@ function resolveDirs(cwd = process.cwd()) {
 }
 
 function getSessionSummary(dataDir) {
-  const indexPath = join(dataDir, 'index.json');
+  const indexPath = indexJsonPath(dataDir);
   if (!existsSync(indexPath)) {
     return { focus: null, message: 'No monitor data yet under .kusa/' };
   }
@@ -46,7 +46,7 @@ function getSessionSummary(dataDir) {
   try {
     index = JSON.parse(readFileSync(indexPath, 'utf8'));
   } catch {
-    return { focus: null, message: 'Could not parse .kusa/index.json' };
+    return { focus: null, message: 'Could not parse .kusa/pwa/index.json' };
   }
   const focus = index.focus || null;
   if (!focus) return { focus: null, message: 'No focused session' };

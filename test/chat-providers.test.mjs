@@ -76,9 +76,9 @@ describe('chat providers', () => {
       assert.equal(orch.options?.workflowId, 'demo-flow');
       assert.equal(kusa.cliBacked, false);
 
-      assert.equal(existsSync(join(dir, 'sessions', 'k1', 'k1.chat.json')), true);
-      assert.equal(existsSync(join(dir, 'sessions', 'c1', 'c1.chat.json')), true);
-      assert.equal(existsSync(join(dir, 'sessions', 'o1', 'o1.chat.json')), true);
+      assert.equal(existsSync(join(dir, 'sessions', 'k1', 'chat.json')), true);
+      assert.equal(existsSync(join(dir, 'sessions', 'c1', 'chat.json')), true);
+      assert.equal(existsSync(join(dir, 'sessions', 'o1', 'chat.json')), true);
 
       const listed = listChatSessions(dir);
       assert.equal(listed.length, 3);

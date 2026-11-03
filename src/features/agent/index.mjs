@@ -18,7 +18,7 @@ export {
   openaiToolSchemas,
   resolveWorkspacePath,
 } from './files.mjs';
-export { createKusaHookEmitter, KUSA_HOOK_VERSION } from './hooks.mjs';
+export { createKusaHookEmitter, mirrorCliMonitorEvent, KUSA_HOOK_VERSION } from './hooks.mjs';
 export {
   DEFAULT_MAX_STEPS,
   DEFAULT_ENDPOINT_LABEL,
@@ -79,6 +79,13 @@ export {
   taskToolSchemas,
   taskSystemPromptAddon,
 } from './tasks.mjs';
+export {
+  SESSION_NAME_TOOL_DEFS,
+  createSessionNameTools,
+  requestSessionName,
+  sessionNameSystemPromptAddon,
+  sessionNameToolSchemas,
+} from './session-name.mjs';
 export {
   ASK_TOOL_DEFS,
   ASK_TIMEOUT_MS,

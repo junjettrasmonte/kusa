@@ -7,8 +7,8 @@
  * Reads the hook payload on stdin only to learn the session id and cwd;
  * nothing from it is stored.
  *
- * Opens the live console in a browser: http://127.0.0.1:1424/dashboard.html when
- * `serve.mjs` is up, otherwise the file copy in `.kusa/` (polling needs the server).
+ * Opens the live console in a browser: http://127.0.0.1:1424/ when
+ * `serve.mjs` is up, otherwise the file copy in `.kusa/pwa/` (polling needs the server).
  *
  * Off by default — sessionStart hooks call this on every chat, and opening the
  * console lands on AuthGate when login is configured. Set KUSA_OPEN=browser to
@@ -28,8 +28,8 @@ import { platform, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
-import { defaultMonitorDir } from '#features/monitor/lib.mjs';
-import { dashboardHtmlPath } from '#shared/lib/pkg.mjs';
+import { defaultMonitorDir, pwaFile } from '#features/monitor/lib.mjs';
+import { consoleHtmlPath } from '#shared/lib/pkg.mjs';
 
 const log = (message) => process.stderr.write(`kusa: ${message}\n`);
 
@@ -57,7 +57,7 @@ function which(name) {
 /** True when serve.mjs answers on the console port. */
 function serverUp(port) {
   return new Promise((done) => {
-    const req = request({ host: '127.0.0.1', port, path: '/dashboard.html', method: 'HEAD', timeout: 500 }, (res) => {
+    const req = request({ host: '127.0.0.1', port, path: '/', method: 'HEAD', timeout: 500 }, (res) => {
       res.resume();
       done(res.statusCode === 200);
     });
@@ -118,10 +118,12 @@ async function main() {
   })();
   const port = Number(process.env.KUSA_PORT || process.env.COPILOT_MONITOR_PORT) || 1424;
 
-  const html = join(dataDir, 'dashboard.html');
+  const html = pwaFile(dataDir, 'index.html');
+  const legacyHtml = join(dataDir, 'index.html');
+  const fileHtml = existsSync(html) ? html : (existsSync(legacyHtml) ? legacyHtml : consoleHtmlPath);
   const url = await serverUp(port)
-    ? `http://127.0.0.1:${port}/dashboard.html`
-    : pathToFileURL(existsSync(html) ? html : dashboardHtmlPath).href;
+    ? `http://127.0.0.1:${port}/`
+    : pathToFileURL(fileHtml).href;
   const opened = openInBrowser(url);
 
   if (opened) {

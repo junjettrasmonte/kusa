@@ -1,11 +1,11 @@
 /**
- * Provider chat transcripts under `.kusa/sessions/<id>/<id>.chat.json`.
+ * Provider chat transcripts under `.kusa/sessions/<id>/chat.json`.
  *
  * Every session owns a folder under the shared `sessions/` tree that holds its
  * monitor lane, events, chat transcript, settings sidecar, and an
  * `attachments/` subfolder for files that rode on messages. Harness/provider is
  * a field on the record (and in lane keys), not a disk folder. Monitor lanes
- * stay in `<id>.json` beside the chat sidecar so message history survives
+ * stay in `lane.json` beside the chat sidecar so message history survives
  * across browsers and reloads.
  */
 import {
@@ -29,6 +29,7 @@ import { createKusaHookEmitter } from '#features/agent/hooks.mjs';
 import { AGENT_MODE_ASK, AGENT_MODE_AGENT, AGENT_MODE_PLAN } from '#features/agent/modes.mjs';
 import { normalizeApprovalMode } from '#features/agent/approval.mjs';
 import {
+  CHAT_FILE,
   ensureSessionDirs,
   laneFiles,
   laneKey,
@@ -52,6 +53,8 @@ import {
 import './load-builtin-adapters.mjs';
 
 export const KUSA_HARNESS = 'kusa';
+export { CHAT_FILE };
+/** @deprecated use CHAT_FILE — kept for callers matching legacy `*.chat.json`. */
 export const CHAT_SUFFIX = '.chat.json';
 export {
   CHAT_HARNESSES,
@@ -252,6 +255,21 @@ function clampTitle(raw) {
 }
 
 /**
+ * A name the model authored for a session (`kusa_name_session`). Clamped exactly
+ * like a derived title because the sidebar renders either one through the same
+ * box — two different widths would make a renamed row look different.
+ */
+function normalizeSessionName(raw) {
+  const clamped = clampTitle(raw);
+  if (!clamped) return null;
+  // A name must not end in punctuation, the same trim `titleFromText` does
+  // before it appends '…': the model is asked for a plain line, and a stray
+  // "—" or "," would otherwise sit in the same box a derived title fills.
+  const trimmed = clamped.replace(/[\s,;:.!?\-–—]+$/, '').trim();
+  return trimmed || null;
+}
+
+/**
  * Per-session composer picks (Mode / Rule / Model), as stored on the session.
  *
  * A chat owns its pickers: the choice survives a refresh for THAT session only,
@@ -289,6 +307,12 @@ function normalizeSessionOptions(raw) {
   if (Object.hasOwn(raw, 'kind') || raw.kind) {
     out.kind = normalizeSessionKind(raw.kind);
   }
+  // A name the model authored for this chat (kusa_name_session). It lives here,
+  // not in the transcript: the turn path rebuilds chat.json on every step, so a
+  // name written into it only survives while the last writer happens to carry it
+  // — the sidecar is never touched by those writes (same rule as the picks).
+  const authoredName = normalizeSessionName(raw.name);
+  if (authoredName) out.name = authoredName;
   if (typeof raw.caoSessionName === 'string' && raw.caoSessionName.trim()) {
     out.caoSessionName = raw.caoSessionName.trim().slice(0, 120);
   }
@@ -354,6 +378,12 @@ export function normalizeChatSession(raw, opts = {}) {
   const resolvedMeta = providerMeta || resolveChatProvider(provider);
   const trust = resolvedMeta?.workspaceTrust;
   const modelsMeta = resolvedMeta?.models;
+  // What names this row in the sidebar. An authored name (the model renamed the
+  // session) wins over the transcript: it is not turn data, it lives in the
+  // settings sidecar, and a record already carrying `options` was just read
+  // through that sidecar — reading it again only happens for a bare record.
+  const authoredName = normalizeSessionName(options?.name)
+    || (opts.dir ? normalizeSessionName(readSessionConfig(opts.dir, id, harness)?.name) : null);
   return {
     key,
     id,
@@ -375,8 +405,12 @@ export function normalizeChatSession(raw, opts = {}) {
         summary: String(trust.summary || ''),
       }
       : null,
-    title: clampTitle(raw.title) || deriveSessionTitle(messages),
+    title: authoredName || clampTitle(raw.title) || deriveSessionTitle(messages),
+    // Live activity (busy/thinking/idle/ended) is separate from user archive.
+    // `status === 'archived'` is accepted as a legacy/alias write shape.
     status: raw.status === 'ended' ? 'ended' : 'idle',
+    archived: raw.archived === true || raw.status === 'archived',
+    archivedAt: Number.isFinite(raw.archivedAt) ? raw.archivedAt : null,
     endedAt: Number.isFinite(raw.endedAt) ? raw.endedAt : null,
     attempts: Number.isFinite(raw.attempts) ? raw.attempts : 0,
     createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(),
@@ -414,9 +448,56 @@ export function writeSessionConfig(dir, sessionId, over = {}, harness = null) {
     ...(readSessionConfig(dir, id, h) || {}),
     ...(over || {}),
   });
-  if (!merged) return null;
-  atomicWriteFile(sessionConfigPath(dir, id, h), `${JSON.stringify(merged, null, 2)}\n`);
+  const path = sessionConfigPath(dir, id, h);
+  if (!merged) {
+    // Nothing is left to store: a cleared pick (an authored name, a model…) must
+    // not linger on disk, or the next read would resurrect it. No file is the
+    // "never picked" shape, so dropping the sidecar is the honest end state.
+    try {
+      unlinkSync(path);
+    } catch {
+      /* absent already — nothing to clear */
+    }
+    return null;
+  }
+  atomicWriteFile(path, `${JSON.stringify(merged, null, 2)}\n`);
   return merged;
+}
+
+/**
+ * Name (or rename) a session with an authored title.
+ *
+ * The name lands in the settings sidecar, never in the transcript — see the
+ * note in `normalizeChatSession`: turn writers rebuild chat.json every step and
+ * know nothing about names, so an authored name written there would be reset by
+ * the next turn write. Pass an empty name to drop the authored name and let the
+ * first user prompt title the row again.
+ * @returns {{ ok: boolean, name: string|null, previous: string|null, cleared: boolean }}
+ */
+export function nameChatSession(dir, sessionIdOrKey, name, harness = null) {
+  const ref = harness
+    ? { harness, id: String(sessionIdOrKey || '').trim() }
+    : resolveSessionRef(dir, sessionIdOrKey);
+  const id = ref?.id || '';
+  if (!id) return { ok: false, error: 'session not found' };
+  const h = ref.harness || KUSA_HARNESS;
+  const files = chatSessionFiles(dir, h, id);
+  // A name only belongs to a session that exists — naming a phantom would write
+  // a sidecar nothing owns and leave an orphan folder on disk.
+  const known = [files.chat, files.json, files.config].some((p) => existsSync(p));
+  if (!known) return { ok: false, error: `no session ${id} to name` };
+  const previous = normalizeSessionName(readSessionConfig(dir, id, h)?.name);
+  const cleared = !(typeof name === 'string' && String(name).trim());
+  const next = cleared ? null : normalizeSessionName(name);
+  const options = writeSessionConfig(dir, id, { ...(cleared ? { name: '' } : { name: next }) }, h);
+  return {
+    ok: Boolean(options?.name) || cleared,
+    name: normalizeSessionName(options?.name),
+    previous,
+    cleared,
+    sessionId: id,
+    harness: h,
+  };
 }
 
 /**
@@ -432,12 +513,15 @@ export function slimChatSession(session, opts = {}) {
   if (!normalized) return null;
   const { live: _live, ...rest } = normalized;
   const status = rest.status === 'ended' ? 'ended' : 'idle';
+  const archived = rest.archived === true;
   return {
     ...rest,
     // An end is the only chat event that re-ranks the row (see sessionRankAt),
     // so stamp it once — later saves must not move the session again.
     status,
     endedAt: status === 'ended' ? (rest.endedAt ?? Date.now()) : null,
+    archived,
+    archivedAt: archived ? (rest.archivedAt ?? Date.now()) : null,
   };
 }
 
@@ -501,10 +585,9 @@ function listLaneFiles(dir) {
   const out = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const stem = entry.name;
-    const path = join(folder, stem, `${stem}.json`);
-    if (!existsSync(path)) continue;
-    const raw = readJsonSafe(path);
+    const files = migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: entry.name });
+    if (!existsSync(files.json)) continue;
+    const raw = readJsonSafe(files.json);
     if (!raw?.id) continue;
     const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
     out.push({ ...raw, harness });
@@ -525,10 +608,9 @@ function listChatFiles(dir) {
   const out = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const stem = entry.name;
-    const path = join(folder, stem, `${stem}${CHAT_SUFFIX}`);
-    if (!existsSync(path)) continue;
-    const raw = readJsonSafe(path);
+    const files = migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: entry.name });
+    if (!existsSync(files.chat)) continue;
+    const raw = readJsonSafe(files.chat);
     const harnessHint = CHAT_HARNESSES.includes(raw?.harness) ? raw.harness : null;
     const session = normalizeChatSession(raw, {
       dir,
@@ -569,7 +651,7 @@ function preferListedChatSession(current, next) {
 }
 
 /**
- * All provider chats: prefer `.chat.json` sidecars; fall back to hydrating from
+ * All provider chats: prefer `chat.json` sidecars; fall back to hydrating from
  * monitor lane prompts when a sidecar is missing (pre-persistence sessions).
  * One row per session id — cross-harness copies of the same id collapse here
  * so the consolidated Agents list never double-loads kusa+cursor twins.

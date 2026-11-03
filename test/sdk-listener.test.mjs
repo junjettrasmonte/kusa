@@ -4,9 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  loadMonitorSettings,
   runHook,
-  saveMonitorSettings,
+  pwaFile,
 } from '#features/monitor/lib.mjs';
 import {
   SessionListener,
@@ -111,7 +110,7 @@ describe('SDK session listener', () => {
     session.emit(sdkEvent('assistant.turn_end', { turnId: '1' }, { wall: 1_700_000_000_500, n: 2 }));
     await flush(listener);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     const rel = index.sessionFiles[index.focus];
     const lane = JSON.parse(readFileSync(join(dir, rel), 'utf8'));
     assert.equal(lane.turnCount, 1);
@@ -138,7 +137,7 @@ describe('SDK session listener', () => {
     }, { wall: 1_700_000_000_250, n: 4 }));
     await flush(listener);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     const lane = JSON.parse(readFileSync(join(dir, index.sessionFiles[index.focus]), 'utf8'));
     assert.equal(lane.tools.bash.total, 1);
     assert.equal(lane.tools.bash.success, 1);
@@ -172,13 +171,13 @@ describe('SDK session listener', () => {
     }, { wall: 1_700_000_000_100, n: 4 }));
     await flush(listener);
 
-    const disk = readFileSync(join(dir, 'index.json'), 'utf8')
-      + readFileSync(join(dir, JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).sessionFiles[
-        JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).focus
+    const disk = readFileSync(pwaFile(dir, 'index.json'), 'utf8')
+      + readFileSync(join(dir, JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8')).sessionFiles[
+        JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8')).focus
       ]), 'utf8');
     assert.equal(disk.includes('should not land on disk'), false);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     const lane = JSON.parse(readFileSync(join(dir, index.sessionFiles[index.focus]), 'utf8'));
     assert.equal(lane.reasoning.seen, true);
     assert.equal(lane.reasoning.blocks, 1);
@@ -199,7 +198,7 @@ describe('SDK session listener', () => {
     session.emit(evt);
     await flush(listener);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     assert.ok(index.focus);
     assert.ok(index.duplicates >= 1);
     const lane = JSON.parse(readFileSync(join(dir, index.sessionFiles[index.focus]), 'utf8'));
@@ -231,7 +230,7 @@ describe('SDK session listener', () => {
       config: quiet,
     });
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     const lane = JSON.parse(readFileSync(join(dir, index.sessionFiles[index.focus]), 'utf8'));
     assert.equal(lane.tools.bash.total, 1);
     assert.ok(index.duplicates >= 1);
@@ -242,7 +241,7 @@ describe('SDK session listener', () => {
     const listener = new SessionListener({ dir, target: 'vscode-copilot-chat' });
     listener.start({ on() { return () => {}; } });
     assert.equal(listener.status, 'unsupported');
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     assert.equal(index.sdkListener.status, 'unsupported');
     assert.equal(Object.keys(index.sessionFiles || {}).length, 0);
   });
@@ -258,7 +257,7 @@ describe('SDK session listener', () => {
     session.emit(sdkEvent('assistant.intent', { intent: 'after stop' }, { wall: 1_700_000_000_200, n: 9 }));
     await flush(listener);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     assert.equal(index.sdkListener.status, 'disconnected');
     // No lane should have picked up the post-stop intent.
     for (const rel of Object.values(index.sessionFiles || {})) {
@@ -267,14 +266,12 @@ describe('SDK session listener', () => {
     }
   });
 
-  it('respects settings that disable reasoning collection', async () => {
+  it('respects listener options that disable reasoning collection', async () => {
     const dir = tempDir();
-    saveMonitorSettings(dir, { collectReasoningEvents: false });
-    assert.equal(loadMonitorSettings(dir).collectReasoningEvents, false);
 
     const session = new SimulatedSdkSession('cli-sess');
     const listener = new SessionListener({ dir, target: 'copilot-cli', sessionId: 'cli-sess' });
-    listener.start(session);
+    listener.start(session, { settings: { collectReasoningEvents: false } });
     session.emit(sdkEvent('assistant.reasoning', {
       reasoningId: 'r1',
       content: 'hidden',
@@ -282,7 +279,7 @@ describe('SDK session listener', () => {
     session.emit(sdkEvent('assistant.intent', { intent: 'still works' }, { wall: 1_700_000_000_010, n: 2 }));
     await flush(listener);
 
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const index = JSON.parse(readFileSync(pwaFile(dir, 'index.json'), 'utf8'));
     const lane = JSON.parse(readFileSync(join(dir, index.sessionFiles[index.focus]), 'utf8'));
     assert.equal(lane.reasoning?.seen || false, false);
     assert.equal(lane.currentIntent, 'still works');

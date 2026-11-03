@@ -1,10 +1,9 @@
 /**
- * Agentic Development Console — Copilot CLI session listener extension.
+ * Agentic Development Console — Copilot CLI session listener extension (retired).
  *
- * Discovered by Copilot CLI under .github/extensions/<name>/extension.mjs.
- * Calls the official joinSession() API so this process attaches to the
- * same foreground CLI session (SESSION_ID injected by the CLI). It does
- * not create a new agent session and registers no tools.
+ * Copilot CLI / Cursor hooks replace the SDK joinSession() path. This file stays
+ * under .github/extensions/ so older installs do not break discovery; it only
+ * records that the listener is unavailable and exits.
  *
  * Install via: npm install --global kusa && kusa init
  */
@@ -37,57 +36,20 @@ const libUrl = pathToFileURL(join(pkgRoot, 'src/features/monitor/lib.mjs')).href
 
 async function main() {
   const { SessionListener } = await import(listenerUrl);
-  const { defaultMonitorDir, defaultWorkspaceRoot, loadMonitorSettings } = await import(libUrl);
+  const { defaultMonitorDir, defaultWorkspaceRoot } = await import(libUrl);
 
   const workspace = defaultWorkspaceRoot();
   const dir = defaultMonitorDir(workspace);
-  const settings = loadMonitorSettings(dir);
   const listener = new SessionListener({
     dir,
     target: 'copilot-cli',
     sessionId: process.env.SESSION_ID || null,
-    settings,
   });
 
-  if (!settings.sdkListenerEnabled) {
-    listener.markUnavailable('disabled', 'SDK listener disabled in .kusa/settings.json');
-    return;
-  }
-
-  if (!process.env.SESSION_ID) {
-    listener.markUnavailable(
-      'no-session-id',
-      'joinSession() requires SESSION_ID from the Copilot CLI parent process. This file is only live when Copilot CLI loads .github/extensions/kusa-session-listener/.',
-    );
-    return;
-  }
-
-  let joinSession;
-  try {
-    ({ joinSession } = await import('@github/copilot-sdk/extension'));
-  } catch (err) {
-    listener.markUnavailable(
-      'sdk-missing',
-      `Could not import @github/copilot-sdk/extension (${err?.message || err}). Copilot CLI normally resolves this module for extensions.`,
-    );
-    return;
-  }
-
-  let session;
-  try {
-    session = await joinSession({ tools: [] });
-  } catch (err) {
-    listener.markUnavailable('join-failed', err?.message || String(err));
-    return;
-  }
-
-  listener.start(session, { sessionId: process.env.SESSION_ID, settings });
-
-  const shutdown = () => {
-    try { listener.stop({ reason: 'shutdown' }); } catch { /* ignore */ }
-  };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  listener.markUnavailable(
+    'disabled',
+    'SDK session listener retired; use CLI/hooks monitoring instead.',
+  );
 }
 
 main().catch((err) => {

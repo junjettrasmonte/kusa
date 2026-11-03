@@ -4,15 +4,11 @@ import { Choice, Field } from '#ui/shared/SettingsControls.jsx';
 export function SettingsPanel({
   subTab,
   settings,
-  sdkListener,
   canPersist,
   onSettingsChange,
   settingsBusy,
 }) {
   const s = settings || {
-    sdkListenerEnabled: true,
-    collectReasoningEvents: true,
-    persistReasoningText: false,
     detectTrail: true,
     enforceTrail: true,
     detectGit: true,
@@ -28,7 +24,6 @@ export function SettingsPanel({
     agentApprovalTimeoutMinutes: 2,
     agentAllowDenyRevertMinutes: 15,
   };
-  const L = sdkListener || { status: 'idle' };
   const backendOpencode = s.agentBackend === 'opencode';
 
   return (
@@ -187,48 +182,6 @@ export function SettingsPanel({
             ) : null}
           </section>
         ) : null}
-
-        {subTab === 'sdk' ? (
-          <section>
-            <h2 className="mb-2 text-base font-semibold">SDK session listener</h2>
-            <p className="mb-3 text-sm text-gray-400">
-              Status:{' '}
-              <span className={statusClass(L.status)}>{L.status || 'idle'}</span>
-              {L.target ? ` · ${L.target}` : ''}
-              {L.lastEventType ? ` · last ${L.lastEventType}` : ''}
-            </p>
-            {L.detail ? <p className="mb-3 text-xs text-gray-500">{L.detail}</p> : null}
-            <div className="space-y-3 rounded-xl border border-gray-800 bg-gray-900/60 p-3">
-              <SliderToggle
-                checked={s.sdkListenerEnabled !== false}
-                disabled={!canPersist || settingsBusy}
-                onChange={(v) => onSettingsChange?.({ sdkListenerEnabled: v })}
-                label="Enable Copilot CLI SDK listener"
-                hint="Applies when Copilot CLI loads .github/extensions/kusa-session-listener/. VS Code Copilot Chat and Cursor cannot join via joinSession(); they stay hooks-only."
-              />
-              <SliderToggle
-                checked={s.collectReasoningEvents !== false}
-                disabled={!canPersist || settingsBusy}
-                onChange={(v) => onSettingsChange?.({ collectReasoningEvents: v })}
-                label="Collect reasoning events"
-                hint="Records reasoning activity status and timing only. Raw reasoning text is not stored unless the option below is on."
-              />
-              <SliderToggle
-                checked={s.persistReasoningText === true}
-                disabled={!canPersist || settingsBusy || s.collectReasoningEvents === false}
-                onChange={(v) => onSettingsChange?.({ persistReasoningText: v })}
-                label="Persist raw reasoning text (off by default)"
-                hint="Privacy-sensitive. Leave off unless you explicitly need the text on disk."
-              />
-            </div>
-            {!canPersist ? (
-              <p className="mt-3 text-xs text-amber-400">
-                Saving settings needs <code className="text-sky-300">npm run kusa:serve</code> (POST /settings).
-                Opening the HTML from disk is view-only for these toggles.
-              </p>
-            ) : null}
-          </section>
-        ) : null}
     </div>
   );
 }
@@ -260,12 +213,4 @@ function SliderToggle({ checked, disabled, onChange, label, hint }) {
       </button>
     </div>
   );
-}
-
-function statusClass(status) {
-  if (status === 'connected') return 'text-emerald-400';
-  if (status === 'connecting') return 'text-sky-400';
-  if (status === 'unsupported' || status === 'error') return 'text-amber-400';
-  if (status === 'disconnected') return 'text-gray-400';
-  return 'text-gray-500';
 }

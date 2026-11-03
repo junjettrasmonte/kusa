@@ -1,13 +1,22 @@
 /* Kusă console shell service worker — caches static UI for offline splash. */
-const CACHE = 'kusa-shell-v5';
+const CACHE = 'kusa-shell-v8';
 const SHELL = [
-  '/dashboard.html',
-  '/dashboard.js',
-  '/dashboard.css',
+  '/',
+  '/index.html',
+  '/console.js',
+  '/console.css',
   '/favicon.svg',
   '/icons/pwa-192.png',
   '/icons/pwa-512.png',
 ];
+
+/** Shell assets change under `kusa serve --live`; never serve a stale cache hit first. */
+const NETWORK_FIRST = new Set([
+  '/',
+  '/index.html',
+  '/console.js',
+  '/console.css',
+]);
 
 self.addEventListener('install', (event) => {
   // Precache best-effort: one missing asset must not abort SW install.
@@ -62,7 +71,7 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Install icons: network-first so desktop icon updates land immediately.
-  if (url.pathname.startsWith('/icons/')) {
+  if (url.pathname.startsWith('/icons/') || NETWORK_FIRST.has(url.pathname)) {
     event.respondWith(
       fetch(request).then((response) => {
         if (response && response.ok) {
@@ -99,7 +108,7 @@ self.addEventListener('fetch', (event) => {
         return response;
       }).catch(async () => {
         if (request.mode === 'navigate') {
-          const fallback = await caches.match('/dashboard.html');
+          const fallback = await caches.match('/index.html') || await caches.match('/');
           if (fallback) return fallback;
         }
         throw new Error('offline');

@@ -37,12 +37,12 @@ your project and shows up in a live dashboard.
 
 Quick start:
   kusa init        Set up hooks in this repo
-  kusa serve       Open the dashboard at http://127.0.0.1:1424/dashboard.html
+  kusa serve       Open the dashboard at http://127.0.0.1:1424/
 
 Usage: kusa <command> [args]
 
 Commands:
-  serve [--port <n>] Start dashboard (default http://127.0.0.1:1424/dashboard.html)
+  serve [--port <n>] Start dashboard (default http://127.0.0.1:1424/)
          [--live]     Rebuild the UI on save + restart on server source edits
   hook <event>       Harness hook entry (reads JSON on stdin)
   open               Open the browser dashboard (set KUSA_OPEN=browser for sessionStart)

@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 /**
- * kusa serve --live — hot reload for the console, on the same localhost port.
+ * kusa serve --live — Vite Fast Refresh for the console, on the same localhost port.
  *
- *   kusa serve --live    -> http://127.0.0.1:1424/dashboard.html, rebuilt on save
+ *   kusa serve --live    -> http://127.0.0.1:1424/  (Vite + React Fast Refresh)
  *   kusa serve --hmr       alias
  *
- * Two watchers, one supervisor:
- *   UI      `vite build --watch` re-runs the publish hook in src/vite.config.mjs,
- *           which rewrites dashboard.{html,js,css} next to this file. serve.mjs
- *           reads those routes per request with no-store headers, so the next
- *           navigation gets the new bundle. Nothing here caches or patches it.
+ * Two processes, one supervisor:
+ *   UI      `vite` (dev server) on the public port. React Fast Refresh updates
+ *           modules in place — no full tab reload on JSX/CSS saves. API calls
+ *           and WebSockets proxy to the Node child (see vite.config.mjs).
  *   Server  Node has no module reload, so a change to serve.mjs' own import
- *           graph restarts the child process. In-flight turns, pending approvals
- *           and open SSE streams are lost; everything persisted under .kusa/ is
- *           re-read by the next child, so sessions and settings survive.
+ *           graph restarts the API child on publicPort+1. In-flight turns,
+ *           pending approvals and open SSE streams are lost; everything
+ *           persisted under .kusa/ is re-read by the next child. The Vite
+ *           process stays up across API restarts, so React state survives.
  *
  * Binds 127.0.0.1 only, exactly like plain `kusa serve`.
  */
@@ -30,8 +30,8 @@ const serveEntry = join(here, 'serve.mjs');
 const viteConfig = join(here, 'vite.config.mjs');
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-// A burst of saves (an editor writing several files, vite rewriting its own
-// output) must cost one restart, not one per event.
+// A burst of saves (an editor writing several files) must cost one restart, not
+// one per event.
 const RESTART_DEBOUNCE_MS = 300;
 
 /**
@@ -57,9 +57,9 @@ function importTargets(text) {
 
 /**
  * Files the running server depends on, transitively from serve.mjs. This is the
- * watch set: the UI graph (src/ui/**) is deliberately absent — vite watches it,
- * and the generated dashboard.* assets in this folder must never restart the
- * server.
+ * watch set: the UI graph (src/app/console/ui/**) is deliberately absent — Vite
+ * owns Fast Refresh for those files, and a restart here must never loop on a
+ * UI save.
  */
 export function serverSourceClosure(entry = serveEntry) {
   const found = new Set();
@@ -99,30 +99,52 @@ function viteInvocation() {
   }
 }
 
+/** API listens on publicPort+1 so Vite can own the bookmarked console URL. */
+function apiPortFor(uiPort) {
+  const next = uiPort + 1;
+  if (next > 65535) return uiPort - 1;
+  return next;
+}
+
 export function runLiveServe(argv = process.argv.slice(2)) {
-  const { port } = resolveServeOptions(argv);
+  const { port: uiPort } = resolveServeOptions(argv);
+  const apiPort = apiPortFor(uiPort);
   // Set before any signal is forwarded: it is what tells a planned teardown
   // (Ctrl-C, kill) apart from a watcher that died and must be brought back.
   let shuttingDown = false;
   const ui = viteInvocation();
   if (!ui) {
     // The server half still works; say so instead of silently serving a stale UI.
-    process.stderr.write('kusa: --live needs vite (npm install vite) — UI will not rebuild\n');
+    process.stderr.write('kusa: --live needs vite (npm install vite) — falling back to API only\n');
   }
 
-  /** UI watcher: rebuild + republish dashboard.* on every save. */
+  /** Vite dev server: Fast Refresh on the public port. */
   let uiChild = null;
   let uiRestartPending = false;
   const startUi = () => {
     const inv = ui || viteInvocation();
     if (!inv) return;
     uiRestartPending = false;
-    uiChild = spawn(inv.command, [...inv.args, 'build', '--config', viteConfig, '--watch'], {
-      cwd: pkgRoot,
-      stdio: 'inherit',
-    });
+    uiChild = spawn(
+      inv.command,
+      [
+        ...inv.args,
+        '--config', viteConfig,
+        '--host', '127.0.0.1',
+        '--port', String(uiPort),
+        '--strictPort',
+      ],
+      {
+        cwd: pkgRoot,
+        stdio: 'inherit',
+        env: {
+          ...process.env,
+          KUSA_PROXY_TARGET: `http://127.0.0.1:${apiPort}`,
+        },
+      },
+    );
     uiChild.on('error', (err) => {
-      process.stderr.write(`kusa: --live could not start vite watch (${err?.code || err}): the UI will not rebuild\n`);
+      process.stderr.write(`kusa: --live could not start vite (${err?.code || err}): UI HMR unavailable\n`);
     });
     uiChild.on('exit', (code, signal) => {
       if (shuttingDown) return;
@@ -130,18 +152,24 @@ export function runLiveServe(argv = process.argv.slice(2)) {
         startUi();
         return;
       }
-      if (code !== 0) process.stderr.write(`kusa: UI watcher exited ${code} — the UI will not rebuild\n`);
+      if (code !== 0) process.stderr.write(`kusa: vite exited ${code} — UI HMR stopped\n`);
     });
   };
-  if (ui) startUi();
 
-  /** Server child: restarted, never patched. */
+  /** Server child: restarted, never patched. Listens on apiPort only. */
   let serverChild = null;
   let restartPending = false;
   const startServer = () => {
     restartPending = false;
-    serverChild = spawn(process.execPath, [serveEntry, '--port', String(port), '--no-live'], {
+    serverChild = spawn(process.execPath, [serveEntry, '--port', String(apiPort), '--no-live'], {
       stdio: 'inherit',
+      env: {
+        ...process.env,
+        KUSA_LIVE: '1',
+        KUSA_SUPERVISED: '1',
+        // MCP / SSO redirect URLs should advertise the public Vite port.
+        KUSA_PUBLIC_PORT: String(uiPort),
+      },
     });
     serverChild.on('error', (err) => {
       process.stderr.write(`kusa: serve child failed to start (${err?.code || err})\n`);
@@ -157,12 +185,15 @@ export function runLiveServe(argv = process.argv.slice(2)) {
       if (code !== 0) process.stderr.write(`kusa: serve exited ${code}\n`);
     });
   };
+
+  // API first so the first Vite proxy hits do not 502 the splash.
   startServer();
+  if (ui) startUi();
 
   let pendingRestart;
   const restartServer = () => {
     if (shuttingDown || !serverChild) return;
-    process.stdout.write(`kusa: server sources changed — restarting on :${port} (in-flight turns are lost)\n`);
+    process.stdout.write(`kusa: server sources changed — restarting API on :${apiPort} (in-flight turns are lost)\n`);
     restartPending = true;
     serverChild.kill('SIGTERM');
   };
@@ -210,7 +241,7 @@ export function runLiveServe(argv = process.argv.slice(2)) {
     watchers.push(configWatcher);
     configWatcher.on('change', () => {
       if (!uiChild || shuttingDown) return;
-      process.stdout.write('kusa: vite.config.mjs changed — restarting UI watcher\n');
+      process.stdout.write('kusa: vite.config.mjs changed — restarting Vite\n');
       uiRestartPending = true;
       uiChild.kill('SIGTERM');
     });
@@ -231,7 +262,9 @@ export function runLiveServe(argv = process.argv.slice(2)) {
     });
   }
 
-  process.stdout.write(`kusa: --live watching ${watchedFiles.size} server files; UI rebuilds on save\n`);
+  process.stdout.write(
+    `kusa: --live Fast Refresh on :${uiPort} (API :${apiPort}); watching ${watchedFiles.size} server files\n`,
+  );
 }
 
 if (isMain) {

@@ -154,9 +154,6 @@ export function publicSettings(settings = {}) {
   );
   const authPublic = publicAuthSettings(s.auth);
   return {
-    sdkListenerEnabled: s.sdkListenerEnabled !== false,
-    collectReasoningEvents: s.collectReasoningEvents !== false,
-    persistReasoningText: s.persistReasoningText === true,
     detectTrail: s.detectTrail !== false,
     enforceTrail: s.enforceTrail !== false,
     detectGit: s.detectGit !== false,

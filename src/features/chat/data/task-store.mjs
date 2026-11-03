@@ -155,11 +155,13 @@ function migrateLegacySharedTasks(dir) {
  * in the path.
  */
 function sessionKeyForFolder(sessionFolder, stem) {
-  const lane = readJsonSafe(join(sessionFolder, `${stem}.json`));
+  const lane = readJsonSafe(join(sessionFolder, 'lane.json'))
+    || readJsonSafe(join(sessionFolder, `${stem}.json`));
   if (lane?.key && typeof lane.key === 'string') return lane.key;
   if (lane?.id && lane?.harness) return laneKey(lane.harness, lane.id);
 
-  const chat = readJsonSafe(join(sessionFolder, `${stem}.chat.json`));
+  const chat = readJsonSafe(join(sessionFolder, 'chat.json'))
+    || readJsonSafe(join(sessionFolder, `${stem}.chat.json`));
   if (chat?.key && typeof chat.key === 'string') return chat.key;
   if (chat?.id && chat?.harness) return laneKey(chat.harness, chat.id);
 

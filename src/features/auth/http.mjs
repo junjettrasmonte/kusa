@@ -39,6 +39,7 @@ import {
 /** Paths that never require a console session. */
 export const AUTH_PUBLIC_PATHS = new Set([
   '/health',
+  '/__live',
   '/auth/status',
   '/auth/setup',
   '/auth/login',
@@ -51,11 +52,12 @@ export const AUTH_PUBLIC_PATHS = new Set([
   '/auth/saml/acs',
 ]);
 
+
 /** Static shell / PWA assets that stay reachable offline / before login. */
 export const AUTH_PUBLIC_PREFIXES = [
-  '/dashboard.html',
-  '/dashboard.js',
-  '/dashboard.css',
+  '/index.html',
+  '/console.js',
+  '/console.css',
   '/favicon.svg',
   '/manifest.webmanifest',
   '/sw.js',
@@ -105,7 +107,11 @@ export async function handleAuthHttp(req, res, {
   mcpPort = 1424,
 }) {
   if (url.pathname === '/health' && (req.method === 'GET' || req.method === 'HEAD')) {
-    sendJson(res, 200, { ok: true });
+    sendJson(res, 200, {
+      ok: true,
+      // Set by `serve-live.mjs` on the API child — marks Vite Fast Refresh mode.
+      live: process.env.KUSA_LIVE === '1',
+    });
     return true;
   }
 
@@ -275,7 +281,7 @@ export async function handleAuthHttp(req, res, {
       const token = createSessionToken({ username, mode: 'oidc' });
       setSessionCookie(res, token);
       clearPendingCookie(res);
-      res.writeHead(302, { Location: '/dashboard.html' }).end();
+      res.writeHead(302, { Location: '/' }).end();
     } catch (err) {
       sendJson(res, 401, { error: err?.message || 'OIDC callback failed' });
     }
@@ -334,7 +340,7 @@ export async function handleAuthHttp(req, res, {
       const token = createSessionToken({ username, mode: 'saml' });
       setSessionCookie(res, token);
       clearPendingCookie(res);
-      res.writeHead(302, { Location: '/dashboard.html' }).end();
+      res.writeHead(302, { Location: '/' }).end();
     } catch (err) {
       sendJson(res, 401, { error: err?.message || 'SAML ACS failed' });
     }

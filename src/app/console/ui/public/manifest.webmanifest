@@ -1,9 +1,9 @@
 {
-  "id": "/dashboard.html",
+  "id": "/",
   "name": "Kusă Console",
   "short_name": "Kusă",
   "description": "Harness-agnostic agent console",
-  "start_url": "/dashboard.html",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#030712",

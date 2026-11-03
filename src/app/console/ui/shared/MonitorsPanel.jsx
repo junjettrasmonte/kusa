@@ -8,7 +8,6 @@ export function MonitorsPanel({
   subTab,
   lane,
   now,
-  sdkListener,
   tokens,
   tokenTurns,
   recent,
@@ -23,7 +22,7 @@ export function MonitorsPanel({
       aria-labelledby={`monitors-tab-${subTab}`}
     >
       {subTab === 'counters' && (
-        <CountersPanel lane={lane} now={now} sdkListener={sdkListener} />
+        <CountersPanel lane={lane} now={now} />
       )}
       {subTab === 'tokens' && (
         <TokensPanel tokens={tokens} tokenTurns={tokenTurns} />

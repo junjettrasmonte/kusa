@@ -105,6 +105,7 @@ export const STATUS_TEXT = {
   thinking: 'prompt open',
   idle: 'idle',
   ended: 'ended',
+  archived: 'archived',
 };
 
 export const HARNESS_NAMES = {
@@ -147,10 +148,10 @@ export function kusaLaneKey(sessionId) {
 }
 
 export const TAB_IDS = [
-  'monitors',
   'session',
   'harness',
   'devtools',
+  'monitors',
   'settings',
   'user',
 ];
@@ -255,13 +256,11 @@ export const HARNESS_SUBTAB_LABELS = {
 export const SETTINGS_SUBTAB_IDS = [
   'agent',
   'workspace',
-  'sdk',
 ];
 
 export const SETTINGS_SUBTAB_LABELS = {
   agent: 'Agent',
   workspace: 'Workspace',
-  sdk: 'SDK listener',
 };
 
 /** Porcelain short codes → short labels for the Git tab. */

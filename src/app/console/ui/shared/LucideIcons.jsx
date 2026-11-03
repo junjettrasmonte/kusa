@@ -127,6 +127,8 @@ const PATHS = {
   ),
   /** https://lucide.dev/icons/chevron-down — collapsible card / disclosure. */
   'chevron-down': <path d="m6 9 6 6 6-6" />,
+  /** https://lucide.dev/icons/loader-circle — busy / in-progress spinner. */
+  'loader-circle': <path d="M21 12a9 9 0 1 1-6.219-8.56" />,
 };
 
 export function LucideIcon({

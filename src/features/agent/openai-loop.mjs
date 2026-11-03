@@ -17,6 +17,7 @@ import {
 } from '#features/trail/agent/trail.mjs';
 import { agentModeLabel, agentModeSystemPromptAddon, normalizeAgentMode } from './modes.mjs';
 import { taskSystemPromptAddon } from './tasks.mjs';
+import { sessionNameSystemPromptAddon } from './session-name.mjs';
 import { supportsVision } from './model-capabilities.mjs';
 import {
   formatBytes,
@@ -681,6 +682,7 @@ export async function runOpenAiAgentLoop({
     const promptAddons = [
       agentModeSystemPromptAddon(modeNow),
       taskSystemPromptAddon(),
+      sessionNameSystemPromptAddon(),
       askSystemPromptAddon(),
       trailSystemPromptAddon(trailPolicy),
       approvalSystemPromptAddon(approvalNow, approvalTimeoutMs),

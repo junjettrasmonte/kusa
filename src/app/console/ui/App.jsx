@@ -14,7 +14,7 @@ import {
   resolveExtensionNav,
 } from './features/extensions/registry.js';
 import { RightRail } from './shared/RightRail.jsx';
-import { Sidebar } from './features/monitor/Sidebar.jsx';
+import { Sidebar, normalizeSessionFilter } from './features/monitor/Sidebar.jsx';
 import { ConfirmDialog } from './shared/ConfirmDialog.jsx';
 import { TrashIcon } from './shared/IconButton.jsx';
 import {
@@ -113,7 +113,8 @@ function initialSettingsSubTab() {
   const saved = readLocal('monitor.settingsSubTab', 'agent');
   // Auth moved to the Account (user) page — stale 'auth' must not stick.
   // Playback (Follow latest) was removed — session stays until the user picks another.
-  if (saved === 'auth' || saved === 'playback') return 'agent';
+  // Auth moved to Account; SDK listener settings removed (CLI hooks replace it).
+  if (saved === 'auth' || saved === 'playback' || saved === 'sdk') return 'agent';
   return SETTINGS_SUBTAB_IDS.includes(saved) ? saved : 'agent';
 }
 
@@ -137,9 +138,14 @@ function clearLegacyKusaSessions() {
 function slimUiChatSession(session) {
   if (!session || !session.id) return null;
   const { live, status, ...rest } = session;
+  const archived = session.archived === true;
   return {
     ...rest,
     status: status === 'ended' ? 'ended' : 'idle',
+    archived,
+    archivedAt: archived
+      ? (Number.isFinite(session.archivedAt) ? session.archivedAt : Date.now())
+      : null,
   };
 }
 
@@ -213,11 +219,16 @@ function mergeKusaSessions(prev, incoming) {
     const messages = curBusy && localLen >= diskLen
       ? (cur.messages || next.messages)
       : (diskLen >= localLen ? next.messages : cur.messages);
+    const archived = Boolean(next.archived ?? cur.archived);
     merged.push({
       ...next,
       messages,
       status: curBusy ? cur.status : next.status,
       live: curBusy ? (cur.live || next.live || null) : (nextBusy ? next.live : null),
+      archived,
+      archivedAt: archived
+        ? (next.archivedAt ?? cur.archivedAt ?? null)
+        : null,
       opencodeSessionId: cur.opencodeSessionId || next.opencodeSessionId || null,
       attempts: Math.max(cur.attempts || 0, next.attempts || 0),
       turnId: cur.turnId || next.turnId || null,
@@ -539,10 +550,9 @@ export default function App() {
   );
   const [expandedTools, setExpandedTools] = useState(() => readJsonSet('monitor.expandedTools'));
   const [expandedPrompts, setExpandedPrompts] = useState(() => readJsonSet('monitor.expandedPrompts'));
-  const [sessionFilter, setSessionFilter] = useState(() => {
-    const saved = readLocal('monitor.sessionFilter', 'all');
-    return saved === 'active' || saved === 'closed' ? saved : 'all';
-  });
+  const [sessionFilter, setSessionFilter] = useState(() => (
+    normalizeSessionFilter(readLocal('monitor.sessionFilter', 'all'))
+  ));
   const [selectMode, setSelectMode] = useState(false);
   const [checkedKeys, setCheckedKeys] = useState(() => new Set());
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -1807,6 +1817,28 @@ export default function App() {
   }
 
   /**
+   * Toggle the session's archived flag and persist it. Archived rows leave the
+   * default Agents list (see matchesFilter) until the Status filter includes
+   * Archived — no confirm dialog; the list change is the feedback.
+   */
+  async function setSessionArchived(sessionKey, archived) {
+    if (!sessionKey || !canDelete) return;
+    const session = chatSessions.find((s) => s.key === sessionKey);
+    if (!session) return;
+    const next = {
+      ...session,
+      archived: archived === true,
+      archivedAt: archived === true ? Date.now() : null,
+    };
+    setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? next : s)));
+    try {
+      await persistChatSession(next);
+    } catch {
+      /* optimistic UI; next poll / refresh restores disk */
+    }
+  }
+
+  /**
    * Session delete, in two moves. The sidebar's per-row trash button and its
    * bulk "Delete N" button both land here, and this only opens the gate:
    * `pendingDelete` is the request ConfirmDialog shows, and nothing is removed
@@ -2098,8 +2130,9 @@ export default function App() {
         chatSessions={chatSessions}
         sessionFilter={sessionFilter}
         onSessionFilterChange={(next) => {
-          setSessionFilter(next);
-          writeLocal('monitor.sessionFilter', next);
+          const normalized = normalizeSessionFilter(next);
+          setSessionFilter(normalized);
+          writeLocal('monitor.sessionFilter', JSON.stringify(normalized));
         }}
         selectMode={selectMode}
         onSelectModeChange={setSelectMode}
@@ -2107,6 +2140,7 @@ export default function App() {
         onToggleChecked={toggleChecked}
         onClearChecked={() => setCheckedKeys(new Set())}
         onDeleteKeys={deleteKeys}
+        onArchiveSession={setSessionArchived}
         canDelete={canDelete && !deleteBusy}
         deleteGate={Boolean(pendingDelete)}
         statusLine={statusLine}
@@ -2143,7 +2177,6 @@ export default function App() {
                   subTab={monitorsSubTab}
                   lane={lane}
                   now={now}
-                  sdkListener={data?.sdkListener}
                   tokens={lane?.tokens}
                   tokenTurns={lane?.tokenTurns}
                   recent={lane?.recent}
@@ -2216,7 +2249,6 @@ export default function App() {
                 <SettingsPanel
                   subTab={settingsSubTab}
                   settings={data?.settings}
-                  sdkListener={data?.sdkListener}
                   canPersist={canPersistSettings}
                   settingsBusy={settingsBusy}
                   onSettingsChange={saveSettings}

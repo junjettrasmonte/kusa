@@ -1,6 +1,6 @@
 import { clock, fmt } from '#ui/shared/lib/format.js';
 
-export function CountersPanel({ lane, now, sdkListener }) {
+export function CountersPanel({ lane, now }) {
   if (!lane) return null;
   const s = lane.summary;
   const session = lane.session;
@@ -16,7 +16,6 @@ export function CountersPanel({ lane, now, sdkListener }) {
     : '—';
   const apiAvg = session.apiCallDurationAvgMs != null ? fmt(session.apiCallDurationAvgMs) : '—';
   const idle = session.lastEventAtWall == null ? null : now - session.lastEventAtWall;
-  const L = sdkListener || {};
   const timing =
     `Prompt ${session.promptIndex} · turn ${session.turnOpen ? 'open' : 'closed'}` +
     (session.startObserved ? '' : ' · start not observed') +
@@ -32,21 +31,14 @@ export function CountersPanel({ lane, now, sdkListener }) {
         <Stat label="Tool calls" value={s.attempts} />
         <Stat label="Session elapsed" value={elapsed} />
         <Stat label="Prompt elapsed" value={prompt} />
-        <Stat label="SDK turn elapsed" value={turn} />
+        <Stat label="Turn elapsed" value={turn} />
         <Stat label="API-call avg" value={apiAvg} />
         <Stat label="Running" value={s.running} />
         <Stat label="Success / Failed / Denied" value={`${s.success} / ${s.failed} / ${s.denied}`} />
       </div>
       <p className="mt-3 text-sm text-gray-400">{timing}</p>
-      {(session.currentIntent || session.reasoning?.seen || L.status) ? (
+      {(session.currentIntent || session.reasoning?.seen) ? (
         <p className="mt-2 text-sm text-gray-400">
-          {L.status ? (
-            <span>
-              Listener <span className={listenerClass(L.status)}>{L.status}</span>
-              {L.lastEventType ? ` · last ${L.lastEventType}` : ''}
-              {' · '}
-            </span>
-          ) : null}
           {session.currentIntent ? <span>Intent: {session.currentIntent}</span> : <span>Intent: —</span>}
           {session.reasoning?.seen ? (
             <span>
@@ -58,7 +50,7 @@ export function CountersPanel({ lane, now, sdkListener }) {
         </p>
       ) : null}
       <p className="mt-1 text-xs text-gray-600">
-        API-call avg is from SDK <code className="text-sky-300">assistant.usage.duration</code> when present.
+        API-call avg is from assistant usage duration when present.
         It is not total turn time. Hook durations remain wall/monotonic deltas between events.
       </p>
     </section>
@@ -72,10 +64,4 @@ function Stat({ label, value }) {
       <div className="mt-1 text-2xl font-bold tabular-nums">{value}</div>
     </div>
   );
-}
-
-function listenerClass(status) {
-  if (status === 'connected') return 'text-emerald-400';
-  if (status === 'unsupported' || status === 'error') return 'text-amber-400';
-  return 'text-gray-300';
 }

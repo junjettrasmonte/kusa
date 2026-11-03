@@ -2,32 +2,33 @@
 /**
  * Serve the Agentic Development Console over localhost.
  *
- *   kusa serve                           -> http://localhost:1424/dashboard.html
+ *   kusa serve                           -> http://localhost:1424/
  *   kusa serve --port 4000               -> explicit port
  *   kusa serve -p 4000                   -> same
  *   KUSA_PORT=4000 kusa serve             -> port when --port is omitted
- *   kusa serve --live                    -> hot reload: rebuild the UI on save and restart
- *   kusa serve --hmr                       the server on change to its own import graph
+ *   kusa serve --live                    -> Vite Fast Refresh on this port; API on port+1
+ *   kusa serve --hmr                       alias — server still restarts on its import graph
  *
  * Routes:
- *   /                 redirect to /dashboard.html
- *   /dashboard.html   the React shell in this package
- *   /dashboard.css    prebuilt Tailwind stylesheet
- *   /dashboard.js     prebuilt React bundle
+ *   /                 the React shell in this package (index.html)
+ *   /index.html       same shell
+ *   /dashboard.html   redirect to /
+ *   /console.css      prebuilt Tailwind stylesheet
+ *   /console.js       prebuilt React bundle
  *   /favicon.svg      Kusă mark (SVG favicon)
- *   /monitor-data.js  <workspace>/.kusa/monitor-data.js
- *   /index.json                                 same folder, read-only
- *   /sessions/<session>/<session>.json                    one session's record
- *   /sessions/<session>/<session>.events.jsonl            that session's recent events
+ *   /monitor-data.js  <workspace>/.kusa/pwa/monitor-data.js
+ *   /index.json                                 same pwa/ folder, read-only
+ *   /sessions/<session>/lane.json                         one session's record
+ *   /sessions/<session>/events.jsonl                      that session's recent events
  *   /sessions/<session>/attachments/<file>                a file attached to that session
  *   /sessions/<harness>/<session>/…                       legacy URL shape (still resolved)
  *   DELETE /sessions  JSON body { "keys": ["harness:id", ...] } — remove sessions
- *   GET/POST /settings  read/update SDK listener + Kusă agent settings (settings.json)
+ *   GET/POST /settings  read/update Kusă agent + workspace settings (settings.json)
  *   POST /kusa/chat   Kusă harness prompt (JSON or SSE stream=1 / Accept: text/event-stream)
  *   GET  /kusa/chat/live?queueKey=  re-attach SSE to a running turn (survives refresh)
  *   POST /kusa/chat/options  mid-turn Mode / Rules update (takes effect on the next tool call; an Allow / Deny Rule also settles an ask that is already waiting)
  *   GET/POST /kusa/queue  composer held/steering (per-session queues.json; parked in queues.json)
- *   GET /kusa/sessions          list chat transcripts (.kusa/sessions/<id>/<id>.chat.json)
+ *   GET /kusa/sessions          list chat transcripts (.kusa/sessions/<id>/chat.json)
  *                                 (busy sessions include in-memory `live` while a turn runs)
  *   POST /kusa/sessions         create an empty Kusă chat (+ monitor lane)
  *   PUT /kusa/sessions          upsert one `{ session }` or many `{ sessions }`
@@ -39,7 +40,7 @@
  *   GET /files        workspace file tree (sidebar Explorer view; ?depth= ?entries=)
  *   GET /search       workspace file-name search (sidebar File names pane; ?q= required, ?path= scope)
  *   GET /ready        combined git + trail readiness (dashboard load check)
- *   GET /health       lightweight serve-up probe (PWA splash; no auth)
+ *   GET /health       lightweight serve-up probe (PWA splash; no auth; live:true under --live)
  *   GET /auth/status  console auth gate status
  *   POST /auth/setup|/auth/login|/auth/totp|/auth/logout
  *   GET /auth/oidc/start|/auth/oidc/callback  OIDC SSO
@@ -80,10 +81,12 @@ import {
   approvalModeLabel,
   APPROVAL_GATED_TOOLS,
   createKusaHookEmitter,
+  mirrorCliMonitorEvent,
   listAgentModelGroups,
   normalizeAgentMode,
   normalizeApprovalMode,
   resolveTrailPolicy,
+  requestSessionName,
   runKusaAgent,
   trailNotReadyMessage,
 } from '#features/agent/index.mjs';
@@ -93,6 +96,7 @@ import {
   createChatSession,
   listChatSessions,
   migrateChatSessions,
+  nameChatSession,
   readChatSession,
   saveChatSessions,
 } from '#features/chat/data/chat-store.mjs';
@@ -154,14 +158,16 @@ import {
   defaultMonitorDir,
   defaultWorkspaceRoot,
   deleteSessions,
+  indexJsonPath,
+  LANE_FILE,
   laneKey,
   loadMonitorSettings,
   publicSettings,
+  pwaFile,
   refreshMonitorArtifacts,
   saveMonitorSettings,
   SESSIONS_DIR,
   sessionsRoot,
-  updateSdkListenerStatus,
 } from '#features/monitor/lib.mjs';
 import {
   compareSkillPublications,
@@ -206,6 +212,7 @@ import {
   mergeAuthPatch,
 } from '#features/auth/index.mjs';
 import { existsSync, readdirSync } from 'node:fs';
+
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = defaultWorkspaceRoot();
@@ -487,18 +494,20 @@ export function createMonitorServer({
     }, TURN_JOB_GRACE_MS);
   };
 
+  const shellHtml = { file: join(pageDir, 'index.html'), type: 'text/html; charset=utf-8' };
   const routes = {
-    '/dashboard.html': { file: join(pageDir, 'dashboard.html'), type: 'text/html; charset=utf-8' },
-    '/dashboard.css': { file: join(pageDir, 'dashboard.css'), type: 'text/css; charset=utf-8' },
-    '/dashboard.js': { file: join(pageDir, 'dashboard.js'), type: 'text/javascript; charset=utf-8' },
+    '/': shellHtml,
+    '/index.html': shellHtml,
+    '/console.css': { file: join(pageDir, 'console.css'), type: 'text/css; charset=utf-8' },
+    '/console.js': { file: join(pageDir, 'console.js'), type: 'text/javascript; charset=utf-8' },
     '/favicon.svg': { file: join(pageDir, 'favicon.svg'), type: 'image/svg+xml' },
     '/manifest.webmanifest': {
       file: join(pageDir, 'manifest.webmanifest'),
       type: 'application/manifest+json; charset=utf-8',
     },
     '/sw.js': { file: join(pageDir, 'sw.js'), type: 'text/javascript; charset=utf-8' },
-    '/monitor-data.js': { file: join(dataDir, 'monitor-data.js'), type: 'text/javascript; charset=utf-8' },
-    '/index.json': { file: join(dataDir, 'index.json'), type: 'application/json; charset=utf-8' },
+    '/monitor-data.js': { file: pwaFile(dataDir, 'monitor-data.js'), type: 'text/javascript; charset=utf-8' },
+    '/index.json': { file: pwaFile(dataDir, 'index.json'), type: 'application/json; charset=utf-8' },
   };
   // Workbox runtime files + PWA icons published next to dashboard.*.
   try {
@@ -594,7 +603,9 @@ export function createMonitorServer({
         file: resolveSessionDisk(null, stem, file),
         type,
         harness: SESSIONS_DIR,
-        stem: file.endsWith('.json') ? file.replace(/\.chat\.json$|\.json$/, '') : stem,
+        // Folder name is the session stem; short in-folder names (lane.json, …)
+        // must not be mistaken for the stem.
+        stem,
       };
     }
     // Legacy: /sessions/<harness>/<stem>/<file>  OR flat /sessions/<harness>/<file>
@@ -1494,9 +1505,6 @@ export function createMonitorServer({
       try {
         /** @type {Record<string, unknown>} */
         const update = {
-          ...(patch.sdkListenerEnabled !== undefined ? { sdkListenerEnabled: Boolean(patch.sdkListenerEnabled) } : {}),
-          ...(patch.collectReasoningEvents !== undefined ? { collectReasoningEvents: Boolean(patch.collectReasoningEvents) } : {}),
-          ...(patch.persistReasoningText !== undefined ? { persistReasoningText: Boolean(patch.persistReasoningText) } : {}),
           ...(patch.detectTrail !== undefined ? { detectTrail: Boolean(patch.detectTrail) } : {}),
           ...(patch.enforceTrail !== undefined ? { enforceTrail: Boolean(patch.enforceTrail) } : {}),
           ...(patch.detectGit !== undefined ? { detectGit: Boolean(patch.detectGit) } : {}),
@@ -1550,13 +1558,6 @@ export function createMonitorServer({
           );
         }
         const settings = saveMonitorSettings(dataDir, update);
-        // Refresh listener detail on the dashboard without inventing session events.
-        updateSdkListenerStatus(dataDir, {
-          detail: settings.sdkListenerEnabled
-            ? 'Settings updated. Copilot CLI extension will pick them up on the next join.'
-            : 'SDK listener disabled in settings. Hooks-only monitoring remains active.',
-          reason: 'settings-updated',
-        });
         sendJson(res, 200, publicSettings(settings));
       } catch (err) {
         const locked = err && err.code === 'ELOCK';
@@ -1565,7 +1566,7 @@ export function createMonitorServer({
       return;
     }
 
-    // Kusă chat transcripts (sidecar files under .kusa/kusa/*.chat.json).
+    // Kusă chat transcripts (sidecar files under .kusa/sessions/<id>/chat.json).
     if (url.pathname === '/kusa/sessions' && (req.method === 'GET' || req.method === 'HEAD')) {
       sendJson(res, 200, {
         sessions: sessionsWithActiveTurns(listChatSessions(dataDir), turnJobs),
@@ -2271,6 +2272,39 @@ export function createMonitorServer({
         if (prompt) hooks.userPrompt(prompt);
       }
 
+      // Name the chat with the model. A brand-new row would otherwise be
+      // labelled by its first prompt verbatim ("ok so basically the parser is
+      // slow because…"), and the first prompt is the only moment what the
+      // session is *about* is unambiguous — so the name is written here, once,
+      // rather than left to the model deciding to call its tool mid-turn.
+      // It runs BESIDE the turn (never awaited before it): the reply starts
+      // immediately and the sidebar row changes when the name lands. The
+      // monitor re-render is what tells the browser to re-read the session.
+      // Skipped for agent-owned sessions (Cursor/CAO keep their own title) and
+      // whenever a name already exists, so a chat is named once, not per turn.
+      const alreadyNamed = Boolean(existingChat?.options?.name);
+      const firstTurn = body.sessionStart === true || !existingChat?.messages?.length;
+      if (firstTurn && !alreadyNamed && !useCaoTurn && chatHarness === 'kusa' && resolvedSessionId) {
+        const scopedSettings = {
+          ...settings,
+          ...(requestedModel ? { agentModel: requestedModel } : {}),
+          ...(requestedEndpointId ? { agentEndpointId: requestedEndpointId } : {}),
+        };
+        void (async () => {
+          try {
+            const titled = await requestSessionName({
+              settings: scopedSettings,
+              prompt,
+              attachments,
+            });
+            if (!titled?.name) return;
+            const applied = nameChatSession(dataDir, sessionRefKey, titled.name, chatHarness);
+            if (!applied?.ok) return;
+            try { refreshMonitorArtifacts(dataDir, { origin: '' }); } catch { /* best-effort */ }
+          } catch { /* naming must never fail a turn */ }
+        })();
+      }
+
       if (wantStream) {
         // A refresh (or second tab) while this session is already running should
         // reattach to the same turn — never start a competing agent loop.
@@ -2330,6 +2364,7 @@ export function createMonitorServer({
                 const type = ev?.type || 'message';
                 if (type === 'done') return;
                 if (type === 'content' && typeof ev.text === 'string') streamedText = ev.text;
+                mirrorCliMonitorEvent(hooks, ev);
                 ingestTurnEvent(job, ev);
                 broadcastTurn(job, type, ev);
               },
@@ -2601,7 +2636,12 @@ export function createMonitorServer({
       if (route?.stem) {
         const stem = route.stem;
         const rels = new Set([
+          `${SESSIONS_DIR}/${stem}/${LANE_FILE}`,
+          // Legacy stem-prefixed / harness-folder paths still referenced in older indexes.
           `${SESSIONS_DIR}/${stem}/${stem}.json`,
+          route.harness && route.harness !== SESSIONS_DIR
+            ? `${route.harness}/${stem}/${LANE_FILE}`
+            : null,
           route.harness && route.harness !== SESSIONS_DIR
             ? `${route.harness}/${stem}/${stem}.json`
             : null,
@@ -2611,7 +2651,7 @@ export function createMonitorServer({
         ].filter(Boolean));
         let keys = [];
         try {
-          const index = JSON.parse(await readFile(join(dataDir, 'index.json'), 'utf8'));
+          const index = JSON.parse(await readFile(indexJsonPath(dataDir), 'utf8'));
           keys = Object.entries(index.sessionFiles || {})
             .filter(([, path]) => rels.has(String(path || '').split('\\').join('/')))
             .map(([key]) => key);
@@ -2649,8 +2689,8 @@ export function createMonitorServer({
       res.writeHead(405, { Allow: 'GET, HEAD, DELETE, POST' }).end();
       return;
     }
-    if (url.pathname === '/') {
-      res.writeHead(302, { Location: '/dashboard.html' }).end();
+    if (url.pathname === '/dashboard.html') {
+      res.writeHead(302, { Location: '/' }).end();
       return;
     }
     const route = routes[url.pathname] || iconRoute(url.pathname) || sessionRoute(url.pathname);
@@ -2747,9 +2787,9 @@ const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(imp
 
 /**
  * Serve flags. `--port` / `-p` overrides KUSA_PORT, which overrides 1424.
- * `--live` / `--hmr` asks for hot reload (see `src/serve-live.mjs`); `--no-live`
- * turns it off again, and the live supervisor passes that to the child so a
- * restart never re-enters watch mode.
+ * `--live` / `--hmr` asks for Vite Fast Refresh (see `serve-live.mjs`);
+ * `--no-live` turns it off again, and the live supervisor passes that to the
+ * API child so a restart never re-enters supervisor mode.
  */
 export function resolveServeOptions(argv = process.argv.slice(2), env = process.env) {
   let explicit;
@@ -2803,7 +2843,11 @@ function delegateLiveServe(port) {
 
 /** Plain `kusa serve`: one server, in this process, no watchers. */
 function startMonitorServer(port) {
-  const server = createMonitorServer({ mcpPort: port });
+  // Under `serve --live`, Vite owns the public URL; this process is API-only
+  // on port+1. Advertise MCP / redirects on the public port when set.
+  const publicPort = Number(process.env.KUSA_PUBLIC_PORT) || port;
+  const supervised = process.env.KUSA_SUPERVISED === '1';
+  const server = createMonitorServer({ mcpPort: publicPort });
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       console.error(`kusa: port ${port} is already in use (another serve.mjs?)`);
@@ -2812,12 +2856,16 @@ function startMonitorServer(port) {
     throw err;
   });
   server.listen(port, '127.0.0.1', () => {
-    server.setMcpPort?.(port);
+    server.setMcpPort?.(publicPort);
     const mcp = loadMcpState(defaultMonitorDir(repoRoot));
-    console.log(`Kusă Console: http://127.0.0.1:${port}/dashboard.html`);
+    if (supervised) {
+      console.log(`Kusă API: http://127.0.0.1:${port}/ (proxied via :${publicPort})`);
+    } else {
+      console.log(`Kusă Console: http://127.0.0.1:${port}/`);
+    }
     console.log(`Data folder: ${defaultMonitorDir(repoRoot)}`);
     if (mcp.enabled) {
-      console.log(`MCP endpoint: ${mcpEndpointUrl(port, repoRoot)}`);
+      console.log(`MCP endpoint: ${mcpEndpointUrl(publicPort, repoRoot)}`);
     }
   });
   for (const signal of ['SIGINT', 'SIGTERM']) {

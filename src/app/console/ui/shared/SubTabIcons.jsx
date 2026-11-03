@@ -121,13 +121,6 @@ export const SUBTAB_ICONS = {
       <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 4h3.5l1.5 1.5h6v7h-11z" />
     </svg>
   ),
-  /** Settings › SDK listener — radio waves (listening). */
-  sdk: (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <circle cx="8" cy="8" r="1.5" />
-      <path strokeLinecap="round" d="M5 11a4.2 4.2 0 0 1 6-6M3 13a7 7 0 0 1 10-10" />
-    </svg>
-  ),
 };
 
 /** Resolve a rail submenu glyph: hand-drawn SUBTAB_ICONS, else extension lucide. */

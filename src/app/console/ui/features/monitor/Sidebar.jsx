@@ -20,7 +20,7 @@ import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import { ExplorerPanel } from '#ui/features/explorer/ExplorerPanel.jsx';
 import { SearchPanel } from '#ui/features/explorer/SearchPanel.jsx';
 import { ExtensionsPanel } from '#ui/features/extensions/ExtensionsPanel.jsx';
-import { SessionIndicator } from './SessionIndicator.jsx';
+import { SessionIndicator, openGate } from './SessionIndicator.jsx';
 
 /** Provider / multi-agent mark tinted by session status (left of the row label). */
 const PROVIDER_COLOR = {
@@ -28,6 +28,7 @@ const PROVIDER_COLOR = {
   thinking: 'text-amber-400',
   idle: 'text-sky-400',
   ended: 'text-gray-500',
+  archived: 'text-gray-600',
 };
 
 const PROVIDER_ICON_SIZE = 'h-[18px] w-[18px]';
@@ -35,6 +36,111 @@ const PROVIDER_ICON_SIZE = 'h-[18px] w-[18px]';
 function isOrchestratedSession(session) {
   const kind = String(session?.kind || session?.options?.kind || '').toLowerCase();
   return kind === 'orchestrated' || Boolean(session?.options?.workflowId || session?.workflowId);
+}
+
+/** Empty = no restriction on that dimension (show all). */
+export const EMPTY_SESSION_FILTER = Object.freeze({
+  providers: Object.freeze([]),
+  kinds: Object.freeze([]),
+  statuses: Object.freeze([]),
+});
+
+const PROVIDER_FILTER_OPTIONS = [
+  { id: 'copilot', label: 'GitHub Copilot' },
+  { id: 'kusa', label: 'Kusă' },
+  { id: 'cursor', label: 'Cursor' },
+];
+
+const KIND_FILTER_OPTIONS = [
+  { id: 'standard', label: 'Standard' },
+  { id: 'orchestrated', label: 'Orchestrated' },
+];
+
+const STATUS_FILTER_OPTIONS = [
+  { id: 'active', label: 'Active' },
+  { id: 'completed', label: 'Completed' },
+  { id: 'attention', label: 'Needs Attention' },
+  { id: 'archived', label: 'Archived' },
+];
+
+const FILTER_SECTIONS = [
+  { key: 'providers', label: 'Provider', options: PROVIDER_FILTER_OPTIONS },
+  { key: 'kinds', label: 'Session type', options: KIND_FILTER_OPTIONS },
+  { key: 'statuses', label: 'Status', options: STATUS_FILTER_OPTIONS },
+];
+
+const PROVIDER_FILTER_IDS = new Set(PROVIDER_FILTER_OPTIONS.map((o) => o.id));
+const KIND_FILTER_IDS = new Set(KIND_FILTER_OPTIONS.map((o) => o.id));
+const STATUS_FILTER_IDS = new Set(STATUS_FILTER_OPTIONS.map((o) => o.id));
+
+/** Normalize persisted / legacy filter values into the multi-select shape. */
+export function normalizeSessionFilter(raw) {
+  if (!raw || raw === 'all') return { providers: [], kinds: [], statuses: [] };
+  // Legacy single-status radios from before multi-select filters.
+  if (raw === 'active') return { providers: [], kinds: [], statuses: ['active'] };
+  if (raw === 'closed') return { providers: [], kinds: [], statuses: ['completed'] };
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { return { providers: [], kinds: [], statuses: [] }; }
+  }
+  if (!parsed || typeof parsed !== 'object') return { providers: [], kinds: [], statuses: [] };
+  const pick = (list, allowed) => (
+    Array.isArray(list) ? list.map(String).filter((id) => allowed.has(id)) : []
+  );
+  return {
+    providers: pick(parsed.providers, PROVIDER_FILTER_IDS),
+    kinds: pick(parsed.kinds, KIND_FILTER_IDS),
+    statuses: pick(parsed.statuses, STATUS_FILTER_IDS),
+  };
+}
+
+export function isSessionFilterActive(filter) {
+  const f = filter || EMPTY_SESSION_FILTER;
+  return Boolean(f.providers?.length || f.kinds?.length || f.statuses?.length);
+}
+
+function sessionProviderFilterId(session) {
+  const provider = String(session?.provider || '').toLowerCase();
+  if (provider === 'copilot' || provider === 'github-copilot') return 'copilot';
+  if (provider === 'cursor') return 'cursor';
+  if (provider === 'kusa') return 'kusa';
+  const harness = session?.harness
+    || (typeof session?.key === 'string' && session.key.includes(':')
+      ? session.key.slice(0, session.key.indexOf(':'))
+      : 'kusa');
+  if (harness === 'github-copilot') return 'copilot';
+  if (harness === 'cursor') return 'cursor';
+  return 'kusa';
+}
+
+function sessionNeedsAttention(session) {
+  return Boolean(openGate(session?.live?.parts));
+}
+
+/** Exclusive status bucket so Active / Completed / Needs Attention / Archived don't overlap. */
+function sessionStatusBucket(session) {
+  if (session?.archived === true || session?.status === 'archived') return 'archived';
+  if (sessionNeedsAttention(session)) return 'attention';
+  if (session?.status === 'ended') return 'completed';
+  return 'active';
+}
+
+function toggleFilterId(filter, key, id) {
+  const list = Array.isArray(filter?.[key]) ? filter[key] : [];
+  const next = list.includes(id) ? list.filter((other) => other !== id) : [...list, id];
+  return { ...filter, [key]: next };
+}
+
+function filterSummaryLabel(filter) {
+  if (!isSessionFilterActive(filter)) return 'All';
+  const labels = [];
+  for (const section of FILTER_SECTIONS) {
+    const selected = new Set(filter[section.key] || []);
+    for (const option of section.options) {
+      if (selected.has(option.id)) labels.push(option.label);
+    }
+  }
+  return labels.join(', ') || 'All';
 }
 
 /**
@@ -58,7 +164,8 @@ function isExternalSession(session) {
 }
 
 function SessionProviderIcon({ session, className = '' }) {
-  const color = `${PROVIDER_COLOR[session?.status] || PROVIDER_COLOR.idle}${className ? ` ${className}` : ''}`;
+  const statusKey = session?.archived ? 'archived' : session?.status;
+  const color = `${PROVIDER_COLOR[statusKey] || PROVIDER_COLOR.idle}${className ? ` ${className}` : ''}`;
   const external = isExternalSession(session);
   const orchestrated = isOrchestratedSession(session);
   const harness = session?.harness
@@ -101,12 +208,6 @@ function SessionProviderIcon({ session, className = '' }) {
   );
 }
 
-const FILTERS = [
-  { id: 'all', label: 'All' },
-  { id: 'active', label: 'Active' },
-  { id: 'closed', label: 'Closed' },
-];
-
 /** Compact stroke icons — same visual language as RightRail.jsx. All view glyphs
  *  render in an 18×18 box. The Agents tab is lucide's `bot` and the Extensions tab
  *  lucide's `blocks`, both kept on lucide's own 24×24 grid; the rest are house-drawn
@@ -147,8 +248,22 @@ const VIEW_ICONS = {
 };
 
 function matchesFilter(session, filter) {
-  if (filter === 'active') return session.status !== 'ended';
-  if (filter === 'closed') return session.status === 'ended';
+  const f = filter && typeof filter === 'object' ? filter : EMPTY_SESSION_FILTER;
+  const bucket = sessionStatusBucket(session);
+  // Within a dimension: OR. Across dimensions: AND. Empty dimension = no restriction
+  // — except archived, which stays hidden until Status › Archived is selected.
+  if (f.providers?.length) {
+    if (!f.providers.includes(sessionProviderFilterId(session))) return false;
+  }
+  if (f.kinds?.length) {
+    const kind = isOrchestratedSession(session) ? 'orchestrated' : 'standard';
+    if (!f.kinds.includes(kind)) return false;
+  }
+  if (f.statuses?.length) {
+    if (!f.statuses.includes(bucket)) return false;
+  } else if (bucket === 'archived') {
+    return false;
+  }
   return true;
 }
 
@@ -156,6 +271,15 @@ function TrashIcon({ className = 'h-3.5 w-3.5' }) {
   return (
     <svg className={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" d="M3.5 4.5h9M6 4.5V3.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1M5 4.5l.5 8h5l.5-8" />
+    </svg>
+  );
+}
+
+/** Compact archive box — same stroke language as TrashIcon. */
+function ArchiveIcon({ className = 'h-3.5 w-3.5' }) {
+  return (
+    <svg className={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 3.5h11v2.5h-11zM3.5 6v6.5h9V6M6 8.5h4" />
     </svg>
   );
 }
@@ -227,7 +351,7 @@ export function Sidebar({
   onSelectLane,
   onNewSession,
   chatSessions = [],
-  sessionFilter = 'all',
+  sessionFilter = EMPTY_SESSION_FILTER,
   onSessionFilterChange,
   selectMode = false,
   onSelectModeChange,
@@ -235,6 +359,7 @@ export function Sidebar({
   onToggleChecked,
   onClearChecked,
   onDeleteKeys,
+  onArchiveSession = null,
   canDelete = true,
   // True while the delete confirmation dialog is open: the request is already
   // stated there, so a second click cannot add to it.
@@ -255,8 +380,8 @@ export function Sidebar({
   const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const filterRef = useRef(null);
   const newSessionRef = useRef(null);
-  const filterActive = sessionFilter !== 'all';
-  const filterLabel = FILTERS.find((f) => f.id === sessionFilter)?.label || 'All';
+  const filterActive = isSessionFilterActive(sessionFilter);
+  const filterLabel = filterSummaryLabel(sessionFilter);
   const sessionsView = view === 'sessions';
 
   function selectView(next) {
@@ -355,6 +480,16 @@ export function Sidebar({
       .sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
   }, [harnesses, chatSessions, sessionFilter]);
 
+  // Archived rows sit in their own block under an hr when the filter includes them.
+  const openSessions = useMemo(
+    () => filteredSessions.filter((s) => sessionStatusBucket(s) !== 'archived'),
+    [filteredSessions],
+  );
+  const archivedSessions = useMemo(
+    () => filteredSessions.filter((s) => sessionStatusBucket(s) === 'archived'),
+    [filteredSessions],
+  );
+
   const visibleKeys = useMemo(
     () => filteredSessions.map((s) => s.key),
     [filteredSessions],
@@ -386,6 +521,119 @@ export function Sidebar({
   const statusFooterTitle = statusLine
     ? [statusLine.text, statusAgentBit, versionBit ? `Kusă ${versionBit}` : ''].filter(Boolean).join('\n')
     : '';
+
+  function renderSessionRow(s) {
+    const isChatRow = Boolean(
+      s.messages
+      || s.provider
+      || s.kind
+      || (typeof s.key === 'string' && chatSessions.some((c) => c.key === s.key)),
+    );
+    const active = s.key === selected;
+    const checked = checkedKeys?.has(s.key);
+    const canRemove = (isChatRow || canDelete) && !deleteGate;
+    const label = sessionLabel(s);
+    const titled = Boolean(sessionTitle(s));
+
+    const external = isExternalSession(s);
+    const rowTitle = external
+      ? (titled ? `${label} · external (Cursor UI)` : 'External session · Cursor UI')
+      : (titled ? `Session ${shortId(s.id)}` : 'unknown');
+
+    if (collapsed) {
+      return (
+        <button
+          key={s.key}
+          type="button"
+          title={external ? `${label} · external (Cursor UI)` : label}
+          aria-label={external ? `${label} (external session)` : label}
+          aria-current={active ? 'true' : undefined}
+          className={`flex w-full items-center justify-center px-0 py-2 hover:bg-gray-800 ${active ? 'bg-gray-800' : ''}`}
+          onClick={() => {
+            onSelectLane(s.key);
+            onToggleCollapsed?.();
+          }}
+        >
+          <SessionProviderIcon session={s} />
+        </button>
+      );
+    }
+
+    return (
+      <div
+        key={s.key}
+        className={`group tree-session flex w-full items-center px-2 py-1 text-left hover:bg-gray-800 ${active ? 'bg-gray-800 text-gray-100' : 'text-gray-400'}`}
+      >
+        {selectMode ? (
+          <input
+            type="checkbox"
+            className="mr-1 h-3.5 w-3.5 shrink-0 rounded border-gray-600 bg-gray-800 accent-emerald-500"
+            checked={!!checked}
+            aria-label={`Select ${label}`}
+            onChange={() => onToggleChecked?.([s.key])}
+          />
+        ) : null}
+        <button
+          type="button"
+          title={rowTitle}
+          className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
+          onClick={() => onSelectLane(s.key)}
+        >
+          <SessionProviderIcon session={s} />
+          <span className={`min-w-0 flex-1 truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
+          {!isExternalSession(s) ? (
+            <span className="shrink-0">
+              <SessionIndicator status={s.status} parts={s.live?.parts} />
+            </span>
+          ) : null}
+        </button>
+        {!selectMode && (
+          <>
+            {isChatRow ? (
+              <button
+                type="button"
+                className="max-w-0 shrink-0 overflow-hidden rounded p-0 text-gray-600 opacity-0 transition-[max-width,padding,opacity] hover:bg-gray-700 hover:text-amber-300 group-hover:max-w-8 group-hover:p-1 group-hover:opacity-100 focus:max-w-8 focus:p-1 focus:opacity-100 disabled:cursor-not-allowed disabled:group-hover:opacity-30 disabled:focus:opacity-30"
+                title={
+                  !canDelete
+                    ? 'Start the local console server (npm run kusa:serve) to archive sessions'
+                    : s.archived
+                      ? 'Unarchive session'
+                      : 'Archive session'
+                }
+                aria-label={s.archived ? `Unarchive ${label}` : `Archive ${label}`}
+                disabled={!canDelete || !onArchiveSession}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onArchiveSession?.(s.key, !s.archived);
+                }}
+              >
+                <ArchiveIcon />
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="max-w-0 shrink-0 overflow-hidden rounded p-0 text-gray-600 opacity-0 transition-[max-width,padding,opacity] hover:bg-gray-700 hover:text-rose-300 group-hover:max-w-8 group-hover:p-1 group-hover:opacity-100 focus:max-w-8 focus:p-1 focus:opacity-100 disabled:cursor-not-allowed disabled:group-hover:opacity-30 disabled:focus:opacity-30"
+              title={
+                deleteGate
+                  ? 'A delete confirmation is open — answer it first'
+                  : isChatRow || canDelete
+                    ? 'Delete session'
+                    : 'Start the local console server (npm run kusa:serve) to delete sessions'
+              }
+              aria-label={`Delete ${label}`}
+              disabled={!canRemove}
+              onClick={(event) => {
+                event.stopPropagation();
+                onDeleteKeys?.([s.key]);
+              }}
+            >
+              <TrashIcon />
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
 
   return (
     <aside
@@ -589,29 +837,70 @@ export function Sidebar({
                 <div
                   role="menu"
                   aria-label="Filter agents"
-                  className="absolute right-0 top-full z-20 mt-1 min-w-[8rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
+                  className="absolute right-0 top-full z-20 mt-1 min-w-[11.5rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
                 >
-                  {FILTERS.map((f) => {
-                    const on = sessionFilter === f.id;
+                  {FILTER_SECTIONS.map((section, sectionIndex) => {
+                    const selected = new Set(sessionFilter?.[section.key] || []);
                     return (
-                      <button
-                        key={f.id}
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={on}
-                        className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] font-medium ${
-                          on ? 'bg-gray-800 text-gray-100' : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
-                        }`}
-                        onClick={() => {
-                          onSessionFilterChange?.(f.id);
-                          setFilterOpen(false);
-                        }}
+                      <div
+                        key={section.key}
+                        className={sectionIndex > 0 ? 'mt-1 border-t border-gray-800 pt-1' : ''}
                       >
-                        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${on ? 'bg-emerald-400' : 'bg-transparent'}`} />
-                        {f.label}
-                      </button>
+                        <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                          {section.label}
+                        </p>
+                        {section.options.map((option) => {
+                          const on = selected.has(option.id);
+                          return (
+                            <button
+                              key={option.id}
+                              type="button"
+                              role="menuitemcheckbox"
+                              aria-checked={on}
+                              className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] font-medium ${
+                                on
+                                  ? 'bg-gray-800/70 text-gray-100'
+                                  : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+                              }`}
+                              onClick={() => {
+                                onSessionFilterChange?.(
+                                  toggleFilterId(sessionFilter, section.key, option.id),
+                                );
+                              }}
+                            >
+                              <span
+                                className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border ${
+                                  on
+                                    ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300'
+                                    : 'border-gray-600 bg-gray-950 text-transparent'
+                                }`}
+                                aria-hidden="true"
+                              >
+                                <svg className="h-2.5 w-2.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="m3.5 8.5 3 3 6-6.5" />
+                                </svg>
+                              </span>
+                              {option.label}
+                            </button>
+                          );
+                        })}
+                      </div>
                     );
                   })}
+                  {filterActive ? (
+                    <div className="mt-1 border-t border-gray-800 pt-1">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="flex w-full items-center px-3 py-1.5 text-left text-[11px] font-medium text-gray-500 hover:bg-gray-800 hover:text-gray-200"
+                        onClick={() => {
+                          onSessionFilterChange?.({ providers: [], kinds: [], statuses: [] });
+                        }}
+                      >
+                        Clear filters
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               )}
             </div>
@@ -663,95 +952,22 @@ export function Sidebar({
               </p>
             )
           ) : (
-            filteredSessions.map((s) => {
-              const isChatRow = Boolean(
-                s.messages
-                || s.provider
-                || s.kind
-                || (typeof s.key === 'string' && chatSessions.some((c) => c.key === s.key)),
-              );
-              const active = s.key === selected;
-              const checked = checkedKeys?.has(s.key);
-              const canRemove = (isChatRow || canDelete) && !deleteGate;
-              const label = sessionLabel(s);
-              const titled = Boolean(sessionTitle(s));
-
-              const external = isExternalSession(s);
-              const rowTitle = external
-                ? (titled ? `${label} · external (Cursor UI)` : 'External session · Cursor UI')
-                : (titled ? `Session ${shortId(s.id)}` : 'unknown');
-
-              if (collapsed) {
-                return (
-                  <button
-                    key={s.key}
-                    type="button"
-                    title={external ? `${label} · external (Cursor UI)` : label}
-                    aria-label={external ? `${label} (external session)` : label}
-                    aria-current={active ? 'true' : undefined}
-                    className={`flex w-full items-center justify-center px-0 py-2 hover:bg-gray-800 ${active ? 'bg-gray-800' : ''}`}
-                    onClick={() => {
-                      onSelectLane(s.key);
-                      onToggleCollapsed?.();
-                    }}
-                  >
-                    <SessionProviderIcon session={s} />
-                  </button>
-                );
-              }
-
-              return (
-                <div
-                  key={s.key}
-                  className={`group tree-session flex w-full items-center gap-1 px-2 py-1 text-left hover:bg-gray-800 ${active ? 'bg-gray-800 text-gray-100' : 'text-gray-400'}`}
-                >
-                  {selectMode ? (
-                    <input
-                      type="checkbox"
-                      className="h-3.5 w-3.5 shrink-0 rounded border-gray-600 bg-gray-800 accent-emerald-500"
-                      checked={!!checked}
-                      aria-label={`Select ${label}`}
-                      onChange={() => onToggleChecked?.([s.key])}
-                    />
+            <>
+              {openSessions.map((s) => renderSessionRow(s))}
+              {archivedSessions.length ? (
+                <>
+                  {!collapsed && openSessions.length ? (
+                    <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
                   ) : null}
-                  <button
-                    type="button"
-                    title={rowTitle}
-                    className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
-                    onClick={() => onSelectLane(s.key)}
-                  >
-                    <SessionProviderIcon session={s} />
-                    <span className={`min-w-0 flex-1 truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
-                    {!isExternalSession(s) ? (
-                      <span className="shrink-0">
-                        <SessionIndicator status={s.status} parts={s.live?.parts} />
-                      </span>
-                    ) : null}
-                  </button>
-                  {!selectMode && (
-                    <button
-                      type="button"
-                      className="shrink-0 rounded p-1 text-gray-600 opacity-0 hover:bg-gray-700 hover:text-rose-300 group-hover:opacity-100 focus:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
-                      title={
-                        deleteGate
-                          ? 'A delete confirmation is open — answer it first'
-                          : isChatRow || canDelete
-                            ? 'Delete session'
-                            : 'Start the local console server (npm run kusa:serve) to delete sessions'
-                      }
-                      aria-label={`Delete ${label}`}
-                      disabled={!canRemove}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onDeleteKeys?.([s.key]);
-                      }}
-                    >
-                      <TrashIcon />
-                    </button>
-                  )}
-                </div>
-              );
-            })
+                  {!collapsed ? (
+                    <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
+                      Archived
+                    </p>
+                  ) : null}
+                  {archivedSessions.map((s) => renderSessionRow(s))}
+                </>
+              ) : null}
+            </>
           )}
         </nav>
       ) : (

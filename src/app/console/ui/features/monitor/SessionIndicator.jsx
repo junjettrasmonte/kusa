@@ -1,11 +1,12 @@
 import { STATUS_TEXT } from '#ui/shared/lib/format.js';
 import { AskIcon } from '#ui/shared/AskIcon.jsx';
 import { ApprovalIcon } from '#ui/shared/ApprovalIcon.jsx';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 
 // Right-side status glyph for a sidebar session row. The provider (or multi-agent)
-// mark lives to the LEFT of the label; this column only answers "what needs you"
-// or "the turn is done" — ask, approval, or turn-complete. Busy / thinking /
-// ended rows stay blank here so the provider mark is never displaced.
+// mark lives to the LEFT of the label; this column answers ask / approval /
+// busy (animated lucide loader-circle) / turn-complete. Thinking and ended
+// rows stay blank here so the provider mark is never displaced.
 //
 // Same hues as StatusDot's DOT map, written as text-* because every glyph here
 // paints through currentColor.
@@ -23,7 +24,7 @@ const GATE_LABEL = {
 
 const TURN_LABEL = 'turn complete';
 
-// Sidebar session status glyphs (ask / approval / turn-complete).
+// Sidebar session status glyphs (ask / approval / busy / turn-complete).
 const ICON_SIZE = 'h-[14px] w-[14px]';
 
 /**
@@ -62,7 +63,7 @@ function TurnDoneIcon({ size = ICON_SIZE, className = '', title = null }) {
 // an approval can still be settled by the Rules pick or by its countdown. So the
 // shape the row shows is the thing the user MUST do, not whichever gate was
 // created last.
-function openGate(parts) {
+export function openGate(parts) {
   const list = Array.isArray(parts) ? parts : [];
   let approvalOpen = false;
   for (const part of list) {
@@ -83,6 +84,16 @@ export function SessionIndicator({ status, parts = null, className = '' }) {
     const Icon = gate === 'ask' ? AskIcon : ApprovalIcon;
     const tooltip = `${STATUS_TEXT[status] || status} · ${GATE_LABEL[gate]}`;
     return <Icon size={ICON_SIZE} className={color} title={tooltip} />;
+  }
+  // Tool(s) in flight — lucide loader-circle spun with Tailwind animate-spin.
+  if (status === 'busy') {
+    return (
+      <LucideIcon
+        name="loader-circle"
+        className={`${ICON_SIZE} animate-spin ${color}`}
+        title={STATUS_TEXT.busy}
+      />
+    );
   }
   // Only a CLOSED turn gets the tick. 'idle' is laneStatus's own word for
   // "active session, no open turn" (features/monitor/lib.mjs): the assistant

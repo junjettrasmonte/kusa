@@ -12,7 +12,6 @@ import {
   AgentIcon,
   ArrowUpIcon,
   Chevron,
-  EditIcon,
   StatusGlyph,
 } from './ChatGlyphs.jsx';
 import { AttachmentChips } from '#ui/shared/AttachmentChips.jsx';
@@ -113,18 +112,37 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
 
   const files = Array.isArray(msg.attachments) ? msg.attachments.filter(Boolean) : [];
   const hasText = typeof msg.text === 'string' && Boolean(msg.text.trim());
+  const body = (
+    <>
+      {hasText ? msg.text : null}
+      {!hasText && files.length ? (
+        <span className="text-gray-500 italic">
+          {`(${files.length} file${files.length === 1 ? '' : 's'} attached — no words were typed)`}
+        </span>
+      ) : null}
+    </>
+  );
+  const bubbleClass =
+    'rounded-lg bg-emerald-500/15 px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap text-gray-100';
+  // External / observe-only sessions never pass onStartEdit — bubble stays inert.
+  const canEdit = Boolean(onStartEdit) && !busy;
 
   return (
-    <div className="group/user flex justify-end">
-      <div className="relative max-w-[85%]">
-        <div className="rounded-lg bg-emerald-500/15 px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap text-gray-100">
-          {hasText ? msg.text : null}
-          {!hasText && files.length ? (
-            <span className="text-gray-500 italic">
-              {`(${files.length} file${files.length === 1 ? '' : 's'} attached — no words were typed)`}
-            </span>
-          ) : null}
-        </div>
+    <div className="flex justify-end">
+      <div className="max-w-[85%]">
+        {canEdit ? (
+          <button
+            type="button"
+            title="Edit message"
+            aria-label="Edit message"
+            onClick={() => onStartEdit?.()}
+            className={`${bubbleClass} w-full cursor-pointer text-left transition-colors hover:bg-emerald-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50`}
+          >
+            {body}
+          </button>
+        ) : (
+          <div className={bubbleClass}>{body}</div>
+        )}
         {/*
          * The files this prompt carried, as a compact chip strip (same shape
          * the Attachments drawer staged). A sent message states what it held,
@@ -136,17 +154,6 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
             attachments={files}
             className="flex flex-wrap justify-end items-center gap-1.5 mt-1.5"
           />
-        ) : null}
-        {!busy ? (
-          <button
-            type="button"
-            title="Edit message"
-            aria-label="Edit message"
-            onClick={() => onStartEdit?.()}
-            className="absolute -bottom-3 -left-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-gray-700 bg-gray-900 text-gray-400 opacity-0 shadow-sm transition-opacity hover:border-gray-600 hover:text-gray-200 group-hover/user:opacity-100 focus:opacity-100"
-          >
-            <EditIcon />
-          </button>
         ) : null}
       </div>
     </div>
