@@ -139,6 +139,31 @@ export function isAgentErrorMessage(msg) {
   return /^Agent error:\s*/i.test(String(msg.text || ''));
 }
 
+/** Cursor CAO turns that failed because workspace trust was never granted. */
+const CURSOR_TRUST_RE =
+  /Workspace Trust Required|Do you trust the contents of this directory|trust this workspace|ECAO_TRUST|workspace trust is usually blocking/i;
+
+const CURSOR_TLS_RE =
+  /unable to get local issuer certificate|ECURSOR_TLS|HTTP_PROXY MITM/i;
+
+/**
+ * @param {object | string | null | undefined} msgOrText
+ */
+export function isCursorTrustError(msgOrText) {
+  if (msgOrText == null) return false;
+  if (typeof msgOrText === 'object') {
+    if (msgOrText.code === 'ECAO_TRUST') return true;
+    const blob = [
+      msgOrText.code,
+      msgOrText.errorMessage,
+      msgOrText.message,
+      msgOrText.text,
+    ].filter(Boolean).join('\n');
+    return CURSOR_TRUST_RE.test(blob);
+  }
+  return CURSOR_TRUST_RE.test(String(msgOrText));
+}
+
 /**
  * Human-readable body for an agent/model failure. Strips the legacy
  * `Agent error:` prefix and unwraps `Model endpoint HTTP N: <json>` payloads
@@ -159,6 +184,11 @@ export function agentErrorDisplayText(msgOrText) {
       detail = String(entry?.error?.message || entry?.message || detail).trim();
     } catch { /* keep detail */ }
     return detail || `Model endpoint HTTP ${httpMatch[1]}`;
+  }
+  if (CURSOR_TLS_RE.test(raw) || (typeof msgOrText === 'object' && msgOrText?.code === 'ECURSOR_TLS')) {
+    return raw.includes('HTTP_PROXY')
+      ? raw
+      : `${raw}\n\nCursor Agent could not verify TLS (often HTTP_PROXY). Retry — kusa now strips proxy for Cursor/Copilot spawns.`;
   }
   return raw || 'Something went wrong talking to the model.';
 }

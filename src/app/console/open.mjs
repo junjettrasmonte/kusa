@@ -7,31 +7,29 @@
  * Reads the hook payload on stdin only to learn the session id and cwd;
  * nothing from it is stored.
  *
- * Targets, in order:
- *   vscode   Markdown preview tab of `.kusa/dashboard.md` in the current
- *            editor window (`code`/`cursor --reuse-window`; `.vscode/settings.json` maps
- *            the file to the preview editor). Editors have no HTML preview their CLI can
- *            drive, so this is the only in-editor option.
- *   browser  The live console: http://127.0.0.1:1424/dashboard.html when `serve.mjs`
- *            is up, otherwise the file copy in `.kusa/` (polling needs the server).
+ * Opens the live console in a browser: http://127.0.0.1:1424/dashboard.html when
+ * `serve.mjs` is up, otherwise the file copy in `.kusa/` (polling needs the server).
  *
- * KUSA_OPEN / COPILOT_MONITOR_OPEN = vscode (default) | browser | none
+ * Off by default — sessionStart hooks call this on every chat, and opening the
+ * console lands on AuthGate when login is configured. Set KUSA_OPEN=browser to
+ * auto-open; a TTY `kusa open` still launches unless KUSA_OPEN=none.
+ *
+ * KUSA_OPEN / COPILOT_MONITOR_OPEN = none (default) | browser
+ *   (`vscode` is treated as browser — the old in-editor markdown snapshot is gone.)
  * KUSA_PORT / COPILOT_MONITOR_PORT, KUSA_DIR / COPILOT_MONITOR_DIR as for serve.mjs / hook.mjs.
  *
  * Always exits 0 and prints `{}`: the hook must never block the agent.
  */
 
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, utimesSync } from 'node:fs';
 import { request } from 'node:http';
-import { homedir, platform, tmpdir } from 'node:os';
+import { platform, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 import { defaultMonitorDir } from '#features/monitor/lib.mjs';
 import { dashboardHtmlPath } from '#shared/lib/pkg.mjs';
-
-const PLACEHOLDER = '# Kusă Console\n\nWaiting for the first hook event. This preview refreshes when the console rewrites the file.\n';
 
 const log = (message) => process.stderr.write(`kusa: ${message}\n`);
 
@@ -53,63 +51,6 @@ function which(name) {
     return first ? first.trim() : null;
   } catch {
     return null;
-  }
-}
-
-/** Editor CLI able to open a file in the connected window, or null. */
-function findEditorCli() {
-  // Prefer the CLI that matches the host harness so the tab lands in the right window.
-  const names = process.argv.includes('--cursor') ? ['cursor', 'code', 'code-insiders'] : ['code', 'code-insiders', 'cursor'];
-  for (const name of names) {
-    const found = which(name);
-    if (found) return found;
-  }
-  // Remote (WSL / SSH / container): the server ships a CLI that talks to the connected
-  // window through VSCODE_IPC_HOOK_CLI.
-  if (process.env.VSCODE_IPC_HOOK_CLI) {
-    const candidates = [];
-    for (const server of ['.cursor-server', '.vscode-server', '.vscode-server-insiders']) {
-      const bin = join(homedir(), server, 'bin');
-      if (!existsSync(bin)) continue;
-      for (const hash of readdirSync(bin)) {
-        const cli = join(bin, hash, 'bin', 'remote-cli', 'code');
-        if (existsSync(cli)) candidates.push(cli);
-      }
-    }
-    candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-    if (candidates.length) return candidates[0];
-  }
-  return null;
-}
-
-/** Wait briefly for the console to create the file; create a placeholder otherwise. */
-async function ensureMarkdown(path, waitMs) {
-  const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path)) return true;
-    await new Promise((done) => setTimeout(done, 100));
-  }
-  if (existsSync(path)) return true;
-  try {
-    mkdirSync(resolve(path, '..'), { recursive: true });
-    // 'wx' = O_EXCL so a concurrent monitor write is never clobbered.
-    writeFileSync(path, PLACEHOLDER, { flag: 'wx', mode: 0o600 });
-  } catch (error) {
-    if (error.code !== 'EEXIST') log(`cannot create ${path}: ${error.message}`);
-  }
-  return existsSync(path);
-}
-
-function openInEditor(markdown) {
-  const cli = findEditorCli();
-  if (!cli) return false;
-  try {
-    execFileSync(cli, ['--reuse-window', markdown], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 4000 });
-    return true;
-  } catch (error) {
-    const detail = error.stderr ? error.stderr.toString('utf8').trim() : error.message;
-    log(`editor CLI failed: ${detail}`);
-    return false;
   }
 }
 
@@ -151,8 +92,10 @@ function openInBrowser(url) {
 }
 
 async function main() {
-  const mode = (process.env.KUSA_OPEN || process.env.COPILOT_MONITOR_OPEN || 'vscode').trim().toLowerCase();
-  if (mode === 'none') return;
+  let mode = (process.env.KUSA_OPEN || process.env.COPILOT_MONITOR_OPEN || 'none').trim().toLowerCase();
+  // Legacy in-editor markdown preview; treat as browser when explicitly requested.
+  if (mode === 'vscode') mode = 'browser';
+  if (mode !== 'browser') return;
 
   let event = {};
   try {
@@ -173,19 +116,13 @@ async function main() {
     const dir = defaultMonitorDir(root);
     return isAbsolute(dir) ? dir : join(root, dir);
   })();
-  const markdown = join(dataDir, 'dashboard.md');
   const port = Number(process.env.KUSA_PORT || process.env.COPILOT_MONITOR_PORT) || 1424;
 
-  let opened = false;
-  if (mode === 'vscode' && await ensureMarkdown(markdown, 1500)) opened = openInEditor(markdown);
-
-  if (!opened) {
-    const html = join(dataDir, 'dashboard.html');
-    const url = await serverUp(port)
-      ? `http://127.0.0.1:${port}/dashboard.html`
-      : pathToFileURL(existsSync(html) ? html : dashboardHtmlPath).href;
-    opened = openInBrowser(url);
-  }
+  const html = join(dataDir, 'dashboard.html');
+  const url = await serverUp(port)
+    ? `http://127.0.0.1:${port}/dashboard.html`
+    : pathToFileURL(existsSync(html) ? html : dashboardHtmlPath).href;
+  const opened = openInBrowser(url);
 
   if (opened) {
     try {
@@ -198,9 +135,9 @@ async function main() {
   }
 }
 
-main()
-  .catch((error) => log(`error: ${error.message}`))
-  .finally(() => {
-    process.stdout.write('{}\n');
-    process.exit(0);
-  });
+main().catch((error) => {
+  log(error?.stack || String(error));
+}).finally(() => {
+  process.stdout.write('{}\n');
+  process.exit(0);
+});

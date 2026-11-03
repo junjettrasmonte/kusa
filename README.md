@@ -505,7 +505,7 @@ Prefer `KUSA_*` (legacy `COPILOT_MONITOR_*` still accepted where noted in code):
 | `KUSA_WORKSPACE` | Override workspace root for Git/Trail |
 | `KUSA_PORT` | Default port for `kusa serve` when `--port` omitted (default `1424`) |
 | `KUSA_SECRETS_KEY` | Master key for settings encryption (32-byte base64 or 64-char hex) |
-| `KUSA_OPEN` | `browser` / `none` — control session-open launcher |
+| `KUSA_OPEN` | `none` (default) / `browser` — sessionStart launcher; set `browser` to auto-open the console |
 | `KUSA_TOOL_WARN_MS` | Slow tool warning threshold |
 | `KUSA_REPEAT_WINDOW_MS` / `KUSA_REPEAT_COUNT` | Repeated-call warning window |
 | `KUSA_PROMPT_TOOL_WARN` / `KUSA_PROMPT_WARN_MS` / `KUSA_SESSION_WARN_MS` | Prompt/session warnings |
@@ -525,7 +525,6 @@ Threshold defaults can also be copied from `src/features/monitor/thresholds.json
 | `custom-tools.json` | Custom MCP tool definitions |
 | `skills/` | Canonical skills store |
 | `monitor-data.js` / `dashboard.*` | Console bootstrap artifacts |
-| `dashboard.md` | Markdown snapshot for in-editor preview |
 
 ### Hook adapters (summary)
 
@@ -547,7 +546,7 @@ kusa serve [--port <n>]   Start dashboard (default http://127.0.0.1:1424/dashboa
 kusa serve --live         Hot reload: rebuild UI on save, restart server on src/ edits
 kusa init [dir]           Detect Cursor / Copilot, write hooks, add npm scripts
 kusa hook <event>         Harness hook entry (stdin JSON)
-kusa open                 Open Markdown preview / browser once per session
+kusa open                 Open the browser dashboard (hooks need KUSA_OPEN=browser)
 kusa demo                 Synthetic events → temp directory
 kusa build                Rebuild React dashboard assets
 kusa mcp                  Stdio MCP server (skills, learnings, session)

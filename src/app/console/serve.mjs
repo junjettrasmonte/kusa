@@ -16,17 +16,18 @@
  *   /dashboard.js     prebuilt React bundle
  *   /favicon.svg      Kusă mark (SVG favicon)
  *   /monitor-data.js  <workspace>/.kusa/monitor-data.js
- *   /index.json, /dashboard.md                  same folder, read-only
- *   /sessions/<harness>/<session>/<session>.json          one session's record
- *   /sessions/<harness>/<session>/<session>.events.jsonl  that session's recent events
- *   /sessions/<harness>/<session>/attachments/<file>      a file attached to that session
+ *   /index.json                                 same folder, read-only
+ *   /sessions/<session>/<session>.json                    one session's record
+ *   /sessions/<session>/<session>.events.jsonl            that session's recent events
+ *   /sessions/<session>/attachments/<file>                a file attached to that session
+ *   /sessions/<harness>/<session>/…                       legacy URL shape (still resolved)
  *   DELETE /sessions  JSON body { "keys": ["harness:id", ...] } — remove sessions
  *   GET/POST /settings  read/update SDK listener + Kusă agent settings (settings.json)
  *   POST /kusa/chat   Kusă harness prompt (JSON or SSE stream=1 / Accept: text/event-stream)
  *   GET  /kusa/chat/live?queueKey=  re-attach SSE to a running turn (survives refresh)
  *   POST /kusa/chat/options  mid-turn Mode / Rules update (takes effect on the next tool call; an Allow / Deny Rule also settles an ask that is already waiting)
- *   GET/POST /kusa/queue  composer held/steering prompts (persisted in kusa/queues.json)
- *   GET /kusa/sessions          list Kusă chat transcripts (.kusa/kusa/<id>/<id>.chat.json)
+ *   GET/POST /kusa/queue  composer held/steering (per-session queues.json; parked in queues.json)
+ *   GET /kusa/sessions          list chat transcripts (.kusa/sessions/<id>/<id>.chat.json)
  *                                 (busy sessions include in-memory `live` while a turn runs)
  *   POST /kusa/sessions         create an empty Kusă chat (+ monitor lane)
  *   PUT /kusa/sessions          upsert one `{ session }` or many `{ sessions }`
@@ -55,15 +56,25 @@
  *   GET/POST /mcp/tools  list / create custom tools; GET/PUT/DELETE /mcp/tools/:id
  *   POST /mcp/<workspace-slug>/rpc  Localhost MCP protocol for this project (when enabled)
  *   GET/POST /learnings  Trail learnings (list / add)
+ *   GET /live-chat        Live Chat (Pipecat) bot status
+ *   POST /live-chat/server/start    spawn the local Pipecat bot (detached)
+ *   POST /live-chat/server/stop     stop the local Pipecat bot
+ *   POST /live-chat/server/restart  stop then start (apply transport/TTS prefs)
+ *   GET|PUT /live-chat/settings  transport + TTS prefs
+ *   POST /live-chat/session      mint voice session (Strata from agent settings)
+ *   POST /live-chat/transcript   bot → chat-store transcript append
+ *   POST /live-chat/rtc          WebRTC SDP proxy to the bot
+ *   WS  /live-chat/ws            WebSocket upgrade proxy to the bot
  *
  * Binds 127.0.0.1 only. No dependencies. Everything is served with no-cache
  * headers so the page's 1 s poll always sees the latest hook write.
  */
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { URL as NodeURL } from 'node:url';
 import {
   agentToolGroups,
   approvalModeLabel,
@@ -86,6 +97,14 @@ import {
   saveChatSessions,
 } from '#features/chat/data/chat-store.mjs';
 import {
+  dispatchAdapterHttp,
+  isCaoChatProvider,
+  isExternalChatSession,
+  resolveChatProvider,
+} from '#features/chat/data/providers.mjs';
+import '#features/chat/data/load-builtin-adapters.mjs';
+import { runCaoChatTurn } from '#features/chat/data/cao-chat-turn.mjs';
+import {
   broadcastTurn,
   createTurnJob,
   ingestTurnEvent,
@@ -104,12 +123,30 @@ import {
   buildProfileDocument,
   collectCaoStatus,
   createCaoProfile,
+  createCaoSession,
   deleteCaoProfile,
+  getCaoTerminal,
+  getCaoTerminalOutput,
   listCaoProfiles,
+  listCaoWorkflows,
   parseProfileDocument,
   readCaoProfileSource,
+  sendCaoTerminalInput,
+  startCaoServer,
   updateCaoProfile,
 } from '#features/cao/index.mjs';
+import {
+  appendLiveChatTranscript,
+  collectLiveChatStatus,
+  createLiveChatSession,
+  normalizeLiveChatSettings,
+  proxyLiveChatRtcOffer,
+  resolveLiveChatBaseUrl,
+  restartLiveChatServer,
+  startLiveChatServer,
+  stopLiveChatServer,
+} from '#features/live-chat/index.mjs';
+import { resolveSessionRef } from '#features/chat/data/chat-store.mjs';
 import {
   collectGitStatus,
   collectTrailStatus,
@@ -122,6 +159,8 @@ import {
   publicSettings,
   refreshMonitorArtifacts,
   saveMonitorSettings,
+  SESSIONS_DIR,
+  sessionsRoot,
   updateSdkListenerStatus,
 } from '#features/monitor/lib.mjs';
 import {
@@ -315,7 +354,8 @@ export function createMonitorServer({
   //              or send them; flush skips them until resumed onto a session.
   //   steering — "send now". Per-session; the running loop polls these while it
   //              runs (onSteer below) and injects them the moment they arrive.
-  // Hydrated from `.kusa/kusa/queues.json` so a serve restart keeps queues
+  // Hydrated from each session's `queues.json` (held/steering) plus shared
+  // `kusa/queues.json` (parked only) so a serve restart keeps queues
   // (steering folds into that session's held on cold load).
   const { queued: queuedMessages, steering: steeringMessages } = loadQueues(dataDir);
   const persistQueues = () => {
@@ -459,7 +499,6 @@ export function createMonitorServer({
     '/sw.js': { file: join(pageDir, 'sw.js'), type: 'text/javascript; charset=utf-8' },
     '/monitor-data.js': { file: join(dataDir, 'monitor-data.js'), type: 'text/javascript; charset=utf-8' },
     '/index.json': { file: join(dataDir, 'index.json'), type: 'application/json; charset=utf-8' },
-    '/dashboard.md': { file: join(dataDir, 'dashboard.md'), type: 'text/markdown; charset=utf-8' },
   };
   // Workbox runtime files + PWA icons published next to dashboard.*.
   try {
@@ -492,68 +531,87 @@ export function createMonitorServer({
           : 'image/png';
     return { file, type };
   };
-  // /sessions/<harness>/<session>/<file>  — session folder layout
-  // /sessions/<harness>/<session>/attachments/<file>  — persisted composer files
-  // Legacy flat paths (/sessions/<harness>/<file>) still resolve for old links.
+  // /sessions/<stem>/<file>  — shared sessions/ folder layout
+  // /sessions/<stem>/attachments/<file>
+  // Legacy /sessions/<harness>/<stem>/… still resolves (prefers sessions/<stem>).
   // Every segment must be a plain name (no dots-only, no separators).
   const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
   const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+  const sessionFileType = (file) => {
+    if (file.endsWith('.events.jsonl')) return 'application/x-ndjson; charset=utf-8';
+    if (file.endsWith('.json')) return 'application/json; charset=utf-8';
+    return null;
+  };
+  const resolveSessionDisk = (harness, stem, ...rest) => {
+    const shared = join(sessionsRoot(dataDir), stem, ...rest);
+    if (existsSync(shared)) return shared;
+    if (harness) {
+      const legacy = join(dataDir, harness, stem, ...rest);
+      if (existsSync(legacy)) return legacy;
+    }
+    return shared;
+  };
   const sessionRoute = (pathname) => {
     const parts = pathname.split('/').filter(Boolean);
     if (parts[0] !== 'sessions' || parts.length < 3) return null;
-    const harness = parts[1];
-    if (!SEGMENT.test(harness) || harness.includes('..')) return null;
-    // Folder layout: /sessions/<harness>/<stem>/attachments/<file>
-    if (parts.length === 4 && parts[3] === 'attachments') return null;
-    if (parts.length === 5 && parts[3] === 'attachments') {
-      const stem = parts[2];
-      const file = parts[4];
+
+    // New: /sessions/<stem>/attachments/<file>
+    if (parts.length === 4 && parts[2] === 'attachments') {
+      const stem = parts[1];
+      const file = parts[3];
       if (!SEGMENT.test(stem) || !SEGMENT.test(file) || stem.includes('..') || file.includes('..')) return null;
       return {
-        file: join(dataDir, harness, stem, 'attachments', file),
+        file: resolveSessionDisk(null, stem, 'attachments', file),
+        type: 'application/octet-stream',
+        harness: SESSIONS_DIR,
+        stem,
+        attachment: true,
+      };
+    }
+    // Legacy: /sessions/<harness>/<stem>/attachments/<file>
+    if (parts.length === 5 && parts[3] === 'attachments') {
+      const harness = parts[1];
+      const stem = parts[2];
+      const file = parts[4];
+      if (!SEGMENT.test(harness) || !SEGMENT.test(stem) || !SEGMENT.test(file)) return null;
+      if (harness.includes('..') || stem.includes('..') || file.includes('..')) return null;
+      return {
+        file: resolveSessionDisk(harness, stem, 'attachments', file),
         type: 'application/octet-stream',
         harness,
         stem,
         attachment: true,
       };
     }
-    // Folder layout: /sessions/<harness>/<stem>/<file>
+    // New: /sessions/<stem>/<file>
     if (parts.length === 3) {
-      const stem = parts[2];
-      if (!SEGMENT.test(stem) || stem.includes('..')) return null;
-      // Bare stem with no file — not a route.
-      if (!stem.includes('.')) return null;
-      // Legacy flat: /sessions/<harness>/<stem>.json
-      const file = stem;
-      if (file.endsWith('.events.jsonl')) {
-        return { file: join(dataDir, harness, file), type: 'application/x-ndjson; charset=utf-8' };
-      }
-      if (file.endsWith('.json')) {
-        return {
-          file: join(dataDir, harness, file),
-          type: 'application/json; charset=utf-8',
-          harness,
-          stem: file.slice(0, -'.json'.length),
-        };
-      }
-      return null;
+      const stem = parts[1];
+      const file = parts[2];
+      if (!SEGMENT.test(stem) || !SEGMENT.test(file) || stem.includes('..') || file.includes('..')) return null;
+      const type = sessionFileType(file);
+      if (!type) return null;
+      return {
+        file: resolveSessionDisk(null, stem, file),
+        type,
+        harness: SESSIONS_DIR,
+        stem: file.endsWith('.json') ? file.replace(/\.chat\.json$|\.json$/, '') : stem,
+      };
     }
+    // Legacy: /sessions/<harness>/<stem>/<file>  OR flat /sessions/<harness>/<file>
     if (parts.length === 4) {
+      const harness = parts[1];
       const stem = parts[2];
       const file = parts[3];
+      if (!SEGMENT.test(harness) || harness.includes('..')) return null;
       if (!SEGMENT.test(stem) || !SEGMENT.test(file) || stem.includes('..') || file.includes('..')) return null;
-      if (file.endsWith('.events.jsonl')) {
-        return { file: join(dataDir, harness, stem, file), type: 'application/x-ndjson; charset=utf-8' };
-      }
-      if (file.endsWith('.json')) {
-        return {
-          file: join(dataDir, harness, stem, file),
-          type: 'application/json; charset=utf-8',
-          harness,
-          stem: file.slice(0, -'.json'.length),
-        };
-      }
-      return null;
+      const type = sessionFileType(file);
+      if (!type) return null;
+      return {
+        file: resolveSessionDisk(harness, stem, file),
+        type,
+        harness,
+        stem,
+      };
     }
     return null;
   };
@@ -1025,6 +1083,30 @@ export function createMonitorServer({
       return;
     }
 
+    // Provider adapter HTTP (workspace trust, etc.) — owned by built-in
+    // extensions under extensions/*-adapter/, not by core chat.
+    {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts[0] === 'adapters' && parts[1]) {
+        try {
+          const result = await dispatchAdapterHttp({
+            providerId: decodeURIComponent(parts[1]),
+            action: parts[2] ? decodeURIComponent(parts[2]) : '',
+            method: req.method,
+            workspaceRoot,
+          });
+          if (result) {
+            sendJson(res, result.status || 200, result.body || {});
+            return;
+          }
+          sendJson(res, 404, { error: 'adapter action not found' });
+        } catch (err) {
+          sendJson(res, 500, { error: err?.message || 'adapter request failed' });
+        }
+        return;
+      }
+    }
+
     // CAO (CLI Agent Orchestrator): status + profile/connection CRUD proxied to
     // local cao-server. Profiles are the writable provider connections.
     {
@@ -1037,9 +1119,64 @@ export function createMonitorServer({
             sendJson(res, 200, await collectCaoStatus({ force: true }));
             return;
           }
+          // Start local cao-server (detached) when the CLI is installed but down.
+          if (section === 'server' && parts[2] === 'start' && req.method === 'POST') {
+            const result = await startCaoServer();
+            sendJson(res, result.ok ? 200 : (result.started ? 504 : 503), result);
+            return;
+          }
           if (section === 'providers' && (req.method === 'GET' || req.method === 'HEAD')) {
             const status = await collectCaoStatus({ force: true });
             sendJson(res, 200, { providers: status.providers || [], serverUp: status.serverUp });
+            return;
+          }
+          if (section === 'workflows' && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await listCaoWorkflows());
+            return;
+          }
+          if (section === 'sessions' && !profileName && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 64_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const created = await createCaoSession({
+              agentProfile: body.agentProfile || body.agent_profile || 'developer',
+              provider: body.provider,
+              sessionName: body.sessionName || body.session_name,
+              workingDirectory: body.workingDirectory || body.working_directory || workspaceRoot,
+              model: body.model,
+              initialMessage: body.initialMessage || body.initial_message,
+            });
+            sendJson(res, 201, created);
+            return;
+          }
+          if (section === 'terminals' && profileName && parts[3] === 'input' && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 200_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const message = typeof body.message === 'string'
+              ? body.message
+              : (url.searchParams.get('message') || '');
+            sendJson(res, 200, await sendCaoTerminalInput(profileName, message));
+            return;
+          }
+          if (section === 'terminals' && profileName && parts[3] === 'output' && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await getCaoTerminalOutput(profileName, {
+              mode: url.searchParams.get('mode') || 'full',
+            }));
+            return;
+          }
+          if (section === 'terminals' && profileName && !parts[3] && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await getCaoTerminal(profileName));
             return;
           }
           if (section === 'profiles' && !profileName && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -1116,6 +1253,172 @@ export function createMonitorServer({
             error: err?.message || 'cao api failed',
             ...(err?.data?.detail ? { detail: err.data.detail } : {}),
           });
+          return;
+        }
+      }
+    }
+
+    // Live Chat (Pipecat): status + settings + session mint + RTC signaling
+    // proxied to the external bot. WS upgrades are handled on server 'upgrade'.
+    {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts[0] === 'live-chat') {
+        const section = parts[1] || null;
+        const settings = loadMonitorSettings(dataDir);
+        const baseUrl = resolveLiveChatBaseUrl(process.env, settings);
+        try {
+          if (!section && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, await collectLiveChatStatus({
+              force: true,
+              baseUrl,
+              settings,
+              workspaceRoot,
+            }));
+            return;
+          }
+          // Start / stop / restart local Pipecat bot (detached).
+          if (section === 'server' && parts[2] === 'start' && req.method === 'POST') {
+            const result = await startLiveChatServer({
+              baseUrl,
+              settings,
+              workspaceRoot,
+              transcriptCallbackUrl: `http://127.0.0.1:${boundMcpPort}/live-chat/transcript`,
+            });
+            sendJson(res, result.ok ? 200 : (result.started ? 504 : 503), result);
+            return;
+          }
+          if (section === 'server' && parts[2] === 'stop' && req.method === 'POST') {
+            const result = await stopLiveChatServer({
+              baseUrl,
+              settings,
+              workspaceRoot,
+            });
+            sendJson(res, result.ok ? 200 : 504, result);
+            return;
+          }
+          if (section === 'server' && parts[2] === 'restart' && req.method === 'POST') {
+            const result = await restartLiveChatServer({
+              baseUrl,
+              settings,
+              workspaceRoot,
+              transcriptCallbackUrl: `http://127.0.0.1:${boundMcpPort}/live-chat/transcript`,
+              waitMs: 45_000,
+            });
+            sendJson(res, result.ok ? 200 : (result.started ? 504 : 503), result);
+            return;
+          }
+          if (section === 'settings' && (req.method === 'GET' || req.method === 'HEAD')) {
+            sendJson(res, 200, {
+              ...normalizeLiveChatSettings(settings.liveChat),
+              resolvedBaseUrl: baseUrl,
+            });
+            return;
+          }
+          if (section === 'settings' && req.method === 'PUT') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 64_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const next = normalizeLiveChatSettings({
+              ...settings.liveChat,
+              ...(body.transport !== undefined ? { transport: body.transport } : {}),
+              ...(body.tts !== undefined ? { tts: body.tts } : {}),
+              ...(body.baseUrl !== undefined ? { baseUrl: body.baseUrl } : {}),
+            });
+            const saved = saveMonitorSettings(dataDir, { liveChat: next });
+            sendJson(res, 200, {
+              ...normalizeLiveChatSettings(saved.liveChat),
+              resolvedBaseUrl: resolveLiveChatBaseUrl(process.env, saved),
+            });
+            return;
+          }
+          if (section === 'session' && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 64_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const minted = await createLiveChatSession({
+              settings,
+              sessionId: body.sessionId || body.session_id || null,
+              queueKey: body.queueKey || body.queue_key || null,
+              modelOverride: body.model || null,
+              endpointIdOverride: body.endpointId || body.endpoint_id || null,
+              transport: body.transport || null,
+              tts: body.tts || null,
+              baseUrl,
+            });
+            sendJson(res, 201, minted);
+            return;
+          }
+          if (section === 'transcript' && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 200_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const role = body.role === 'assistant' ? 'assistant' : 'user';
+            const text = typeof body.text === 'string' ? body.text : '';
+            let sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+            let harness = typeof body.harness === 'string' ? body.harness.trim() : '';
+            const queueKey = typeof body.queueKey === 'string' ? body.queueKey.trim() : '';
+            if ((!sessionId || !harness) && queueKey.includes(':')) {
+              const ref = resolveSessionRef(dataDir, queueKey);
+              sessionId = sessionId || ref?.id || queueKey.slice(queueKey.indexOf(':') + 1);
+              harness = harness || ref?.harness || queueKey.slice(0, queueKey.indexOf(':'));
+            }
+            const written = appendLiveChatTranscript(dataDir, {
+              sessionId,
+              harness: harness || undefined,
+              queueKey: queueKey || null,
+              role,
+              text,
+            });
+            if (!written) {
+              sendJson(res, 404, {
+                error: 'session not found or empty transcript',
+                sessionId: sessionId || null,
+                queueKey: queueKey || null,
+              });
+              return;
+            }
+            sendJson(res, 200, { ok: true, session: written });
+            return;
+          }
+          if (section === 'rtc' && req.method === 'POST') {
+            let body = {};
+            try {
+              const raw = await readBody(req, 500_000);
+              body = raw.trim() ? JSON.parse(raw) : {};
+            } catch (err) {
+              sendJson(res, err?.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+              return;
+            }
+            const proxied = await proxyLiveChatRtcOffer(body, { baseUrl });
+            if (!proxied.ok) {
+              sendJson(res, proxied.status || 502, { error: proxied.error || 'rtc proxy failed', ...(proxied.data || {}) });
+              return;
+            }
+            sendJson(res, 200, proxied.data);
+            return;
+          }
+          sendJson(res, section ? 405 : 404, { error: section ? 'method not allowed' : 'not found' });
+          return;
+        } catch (err) {
+          const code = err?.code === 'ECONN' || err?.status === 0 ? 503
+            : err?.status >= 400 && err?.status < 600 ? err.status
+              : 500;
+          sendJson(res, code, { error: err?.message || 'live-chat api failed' });
           return;
         }
       }
@@ -1218,6 +1521,9 @@ export function createMonitorServer({
           // per-endpoint credential encryption, so no key can leave as plaintext.
           ...(patch.agentModels !== undefined ? { agentModels: patch.agentModels } : {}),
           ...(patch.agentEndpoints !== undefined ? { agentEndpoints: patch.agentEndpoints } : {}),
+          ...(patch.liveChat !== undefined
+            ? { liveChat: normalizeLiveChatSettings(patch.liveChat) }
+            : {}),
         };
         // Omit agentApiKey from the patch to leave the existing encrypted secret unchanged.
         // Empty string clears it. Legacy agentAuthToken maps to agentApiKey when present.
@@ -1375,6 +1681,9 @@ export function createMonitorServer({
           id: typeof body.id === 'string' ? body.id : undefined,
           createdAt: Number.isFinite(body.createdAt) ? body.createdAt : undefined,
           workspaceRoot,
+          provider: typeof body.provider === 'string' ? body.provider : 'kusa',
+          kind: typeof body.kind === 'string' ? body.kind : 'standard',
+          workflowId: typeof body.workflowId === 'string' ? body.workflowId : null,
         });
         sendJson(res, 200, { session });
       } catch (err) {
@@ -1912,10 +2221,49 @@ export function createMonitorServer({
         sendJson(res, 503, { error: message, code: 'ETRAIL', steps: trailPolicy.status?.steps || [] });
         return;
       }
+      // Prefer queueKey (`cursor:<id>`) so a bare sessionId cannot resolve to a
+      // shadow kusa/ folder created by an earlier mis-routed BYOK turn.
+      const sessionRefKey = queueKey || chatSessionId;
+      const existingChat = sessionRefKey
+        ? readChatSession(dataDir, sessionRefKey)
+        : null;
+      // Cursor UI (and other IDE-owned) sessions are observe-only in Kusă —
+      // prompting here would fork a separate CLI session and mix transcripts.
+      if (isExternalChatSession(existingChat)) {
+        const message = 'This session is owned by Cursor UI. Prompting is disabled in Kusă — continue the chat in Cursor.';
+        if (wantStream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          res.write(`event: error\ndata: ${JSON.stringify({
+            type: 'error',
+            message,
+            code: 'EEXTERNAL',
+          })}\n\n`);
+          if (!res.writableEnded) res.end();
+          return;
+        }
+        sendJson(res, 403, { error: message, code: 'EEXTERNAL' });
+        return;
+      }
+      const chatProvider = resolveChatProvider(
+        existingChat?.provider
+        || existingChat?.options?.provider
+        || existingChat?.harness
+        || 'kusa',
+      );
+      const chatHarness = existingChat?.harness || chatProvider?.harness || 'kusa';
+      const resolvedSessionId = existingChat?.id || chatSessionId;
+      const useCaoTurn = Boolean(chatProvider && isCaoChatProvider(chatProvider.id));
+
       const hooks = createKusaHookEmitter({
         dataDir,
-        sessionId: chatSessionId,
+        sessionId: resolvedSessionId,
         workspaceRoot,
+        harness: chatHarness,
       });
       if (hooks.enabled) {
         if (body.sessionStart === true) hooks.sessionStart();
@@ -1941,7 +2289,8 @@ export function createMonitorServer({
         const initialApproval = approvalRules || settings?.agentApprovalMode || '';
         const job = createTurnJob({
           queueKey,
-          sessionId: chatSessionId,
+          sessionId: resolvedSessionId,
+          harness: chatHarness,
           prompt,
           promptMessageId: promptMessageId || null,
           mode: agentMode,
@@ -1959,6 +2308,73 @@ export function createMonitorServer({
         pipeSse(res, req, jobKey);
 
         let streamedText = '';
+
+        if (useCaoTurn) {
+          try {
+            const caoPrompt = [
+              prompt,
+              attachments.length
+                ? `\n\n[Attachments: ${attachments.map((a) => a.name || 'file').join(', ')}]`
+                : '',
+            ].join('').trim();
+            const result = await runCaoChatTurn({
+              dataDir,
+              sessionId: resolvedSessionId,
+              harness: chatHarness,
+              provider: chatProvider.id,
+              workspaceRoot,
+              prompt: caoPrompt || prompt,
+              model: requestedModel,
+              signal: turnAbort.signal,
+              onEvent: (ev) => {
+                const type = ev?.type || 'message';
+                if (type === 'done') return;
+                if (type === 'content' && typeof ev.text === 'string') streamedText = ev.text;
+                ingestTurnEvent(job, ev);
+                broadcastTurn(job, type, ev);
+              },
+            });
+            streamedText = result?.text || streamedText;
+            if (hooks.enabled) {
+              try { hooks.afterAgentResponse(streamedText); } catch { /* ignore */ }
+              try { hooks.agentStop({ stopReason: 'end_turn' }); } catch { /* ignore */ }
+            }
+            finishTurnJob(jobKey, {
+              type: 'done',
+              text: streamedText,
+              backend: result?.backend || 'cao',
+              provider: chatProvider.id,
+              turnId: job.turnId,
+              queued: visibleQueued(jobKey),
+            });
+          } catch (err) {
+            const aborted = err?.name === 'AbortError' || turnAbort.signal.aborted || stopRequested.has(jobKey);
+            if (aborted) {
+              if (hooks.enabled) {
+                try { hooks.agentStop({ stopReason: 'user_stop', status: 'stopped' }); } catch { /* ignore */ }
+              }
+              finishTurnJob(jobKey, {
+                type: 'stopped',
+                text: streamedText,
+                stopped: true,
+                turnId: job.turnId,
+                queued: visibleQueued(jobKey),
+              });
+            } else {
+              const message = err?.message || String(err) || 'CAO turn failed';
+              finishTurnJob(jobKey, {
+                type: 'error',
+                text: streamedText || message,
+                message,
+                code: err?.code || 'ECAO',
+                turnId: job.turnId,
+                queued: visibleQueued(jobKey),
+              });
+            }
+          }
+          return;
+        }
+
         try {
           const result = await runKusaAgent({
             workspaceRoot,
@@ -2183,15 +2599,33 @@ export function createMonitorServer({
     if (req.method === 'DELETE') {
       const route = sessionRoute(url.pathname);
       if (route?.stem) {
-        const rel = `${route.harness}/${route.stem}.json`;
-        let keys = [laneKey(route.harness, route.stem)];
+        const stem = route.stem;
+        const rels = new Set([
+          `${SESSIONS_DIR}/${stem}/${stem}.json`,
+          route.harness && route.harness !== SESSIONS_DIR
+            ? `${route.harness}/${stem}/${stem}.json`
+            : null,
+          route.harness && route.harness !== SESSIONS_DIR
+            ? `${route.harness}/${stem}.json`
+            : null,
+        ].filter(Boolean));
+        let keys = [];
         try {
           const index = JSON.parse(await readFile(join(dataDir, 'index.json'), 'utf8'));
-          const matched = Object.entries(index.sessionFiles || {})
-            .filter(([, path]) => path === rel)
+          keys = Object.entries(index.sessionFiles || {})
+            .filter(([, path]) => rels.has(String(path || '').split('\\').join('/')))
             .map(([key]) => key);
-          if (matched.length) keys = matched;
-        } catch { /* index missing; fall back to harness:stem */ }
+        } catch { /* index missing */ }
+        if (!keys.length) {
+          try {
+            const lane = JSON.parse(await readFile(route.file, 'utf8'));
+            if (lane?.key) keys = [lane.key];
+            else if (lane?.id) keys = [laneKey(lane.harness || route.harness || 'kusa', lane.id)];
+          } catch { /* ignore */ }
+        }
+        if (!keys.length && route.harness && route.harness !== SESSIONS_DIR) {
+          keys = [laneKey(route.harness, stem)];
+        }
         try {
           const result = deleteSessions(dataDir, keys);
           let queueDirty = false;
@@ -2242,6 +2676,69 @@ export function createMonitorServer({
       syncCursorMcpRegistration(workspaceRoot, dataDir, { port: boundMcpPort });
     }
   };
+
+  // Proxy browser WebSocket upgrades to the Live Chat Pipecat bot.
+  server.on('upgrade', (req, socket, head) => {
+    let pathname = '/';
+    let search = '';
+    try {
+      const u = new NodeURL(req.url || '/', 'http://127.0.0.1');
+      pathname = u.pathname;
+      search = u.search || '';
+    } catch {
+      socket.destroy();
+      return;
+    }
+    if (pathname !== '/live-chat/ws') {
+      socket.destroy();
+      return;
+    }
+    const settings = loadMonitorSettings(dataDir);
+    const baseUrl = resolveLiveChatBaseUrl(process.env, settings);
+    let target;
+    try {
+      target = new NodeURL(`/ws${search}`, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+    } catch {
+      socket.destroy();
+      return;
+    }
+    const headers = { ...req.headers, host: target.host };
+    delete headers['origin'];
+    const proxyReq = httpRequest({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method: 'GET',
+      headers,
+    });
+    proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+      const lines = [`HTTP/1.1 ${proxyRes.statusCode} Switching Protocols`];
+      for (const [key, value] of Object.entries(proxyRes.headers)) {
+        if (value == null) continue;
+        if (Array.isArray(value)) {
+          for (const v of value) lines.push(`${key}: ${v}`);
+        } else {
+          lines.push(`${key}: ${value}`);
+        }
+      }
+      lines.push('', '');
+      socket.write(lines.join('\r\n'));
+      if (proxyHead?.length) proxySocket.write(proxyHead);
+      if (head?.length) socket.write(head);
+      proxySocket.pipe(socket);
+      socket.pipe(proxySocket);
+      proxySocket.on('error', () => socket.destroy());
+      socket.on('error', () => proxySocket.destroy());
+    });
+    proxyReq.on('error', () => {
+      try {
+        socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+      } catch { /* ignore */ }
+      socket.destroy();
+    });
+    proxyReq.end();
+  });
 
   return server;
 }

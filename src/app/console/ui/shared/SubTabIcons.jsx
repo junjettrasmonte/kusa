@@ -115,12 +115,6 @@ export const SUBTAB_ICONS = {
       <path strokeLinecap="round" d="M8 3v2.5M6 8v1.5M10 8v1.5M6.5 11.5h3" />
     </svg>
   ),
-  /** Settings › Playback — play triangle. */
-  playback: (
-    <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <path strokeLinecap="round" strokeLinejoin="round" d="M5.5 3.5 12.5 8 5.5 12.5z" />
-    </svg>
-  ),
   /** Settings › Workspace — folder. */
   workspace: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

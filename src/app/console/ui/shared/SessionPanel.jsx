@@ -1,4 +1,4 @@
-import { ChatHarness } from '#ui/features/chat/ChatHarness.jsx';
+import { SessionChat } from '#ui/features/chat/SessionChat.jsx';
 import { PromptsPanel } from '#ui/features/chat/PromptsPanel.jsx';
 import { ToolsPanel } from '#ui/features/chat/ToolsPanel.jsx';
 
@@ -12,19 +12,19 @@ export function SessionPanel({
   now,
   expandedTools,
   onToggleTool,
-  kusaSession = null,
-  kusaQueue = null,
-  onSendKusaMessage,
-  onQueueKusaMessage,
-  onStopKusaTurn = null,
-  onKusaApproval,
-  onKusaAsk = null,
-  onKusaTurnOptions = null,
-  onKusaSessionOptions = null,
+  chatSession = null,
+  chatQueue = null,
+  onSendMessage,
+  onQueueMessage,
+  onStopTurn = null,
+  onApproval,
+  onAsk = null,
+  onTurnOptions = null,
+  onSessionOptions = null,
   agentDefaults = null,
 }) {
-  // Kusă Chat only exists for Kusă sessions — other harnesses have no chat transcript.
-  const fillHeight = Boolean(kusaSession);
+  // Chat transcript for provider chat sessions (Kusă BYOK or CAO-backed).
+  const fillHeight = Boolean(chatSession);
   const chatFill = fillHeight && subTab === 'chat';
 
   return (
@@ -41,18 +41,18 @@ export function SessionPanel({
               : undefined
         }
       >
-        {subTab === 'chat' && kusaSession && (
-          <ChatHarness
-            session={kusaSession}
-            queued={kusaQueue}
+        {subTab === 'chat' && chatSession && (
+          <SessionChat
+            session={chatSession}
+            queued={chatQueue}
             tasks={lane?.todos || []}
-            onSend={onSendKusaMessage}
-            onQueue={onQueueKusaMessage}
-            onStop={onStopKusaTurn}
-            onApproval={onKusaApproval}
-            onAsk={onKusaAsk}
-            onTurnOptions={onKusaTurnOptions}
-            onSessionOptions={onKusaSessionOptions}
+            onSend={onSendMessage}
+            onQueue={onQueueMessage}
+            onStop={onStopTurn}
+            onApproval={onApproval}
+            onAsk={onAsk}
+            onTurnOptions={onTurnOptions}
+            onSessionOptions={onSessionOptions}
             agentDefaults={agentDefaults}
           />
         )}

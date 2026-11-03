@@ -1,11 +1,12 @@
 /**
- * Kusă chat transcripts under `.kusa/kusa/<id>/<id>.chat.json`.
+ * Provider chat transcripts under `.kusa/sessions/<id>/<id>.chat.json`.
  *
- * Every session owns a folder (`<id>/`) that holds its monitor lane, events,
- * chat transcript, settings sidecar, and an `attachments/` subfolder for files
- * that rode on messages. Monitor lanes (hook counters) stay in `<id>.json`
- * inside that same folder; the chat UI reads/writes the transcript sidecar so
- * message history survives across browsers and reloads.
+ * Every session owns a folder under the shared `sessions/` tree that holds its
+ * monitor lane, events, chat transcript, settings sidecar, and an
+ * `attachments/` subfolder for files that rode on messages. Harness/provider is
+ * a field on the record (and in lane keys), not a disk folder. Monitor lanes
+ * stay in `<id>.json` beside the chat sidecar so message history survives
+ * across browsers and reloads.
  */
 import {
   existsSync,
@@ -31,12 +32,39 @@ import {
   ensureSessionDirs,
   laneFiles,
   laneKey,
+  laneListedInSidebar,
   migrateFlatSessionFiles,
+  migrateHarnessSessionsToShared,
   sessionRankAt,
+  sessionsRoot,
 } from '#features/monitor/lib.mjs';
+import {
+  CHAT_HARNESSES,
+  CHAT_PROVIDERS,
+  enrichChatSessions,
+  harnessForProvider,
+  isExternalOwnedHarness,
+  normalizeSessionKind,
+  providerForHarness,
+  resolveChatProvider,
+  SESSION_KIND_STANDARD,
+} from './providers.mjs';
+import './load-builtin-adapters.mjs';
 
 export const KUSA_HARNESS = 'kusa';
 export const CHAT_SUFFIX = '.chat.json';
+export {
+  CHAT_HARNESSES,
+  CHAT_PROVIDERS,
+  harnessForProvider,
+  isExternalChatSession,
+  normalizeSessionKind,
+  providerForHarness,
+  resolveChatProvider,
+  SESSION_KIND_STANDARD,
+} from './providers.mjs';
+// Local import is used above; re-export the same helper for callers.
+export { isExternalOwnedHarness };
 
 function atomicWriteFile(path, contents) {
   mkdirSync(dirname(path), { recursive: true });
@@ -61,18 +89,63 @@ function newId() {
   }
 }
 
-/** Paths for one Kusă session (folder layout; migrates flat files first). */
-function kusaSessionFiles(dir, sessionId) {
-  return migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: sessionId });
+/** Paths for one chat session under a harness folder (migrates flat files first). */
+export function chatSessionFiles(dir, harness, sessionId) {
+  const name = typeof harness === 'string' && harness.trim() ? harness.trim() : KUSA_HARNESS;
+  return migrateFlatSessionFiles(dir, { harness: name, id: sessionId });
 }
 
-/** Absolute path for a session's chat sidecar. */
-export function chatFilePath(dir, sessionId) {
-  return kusaSessionFiles(dir, sessionId).chat;
+/** @deprecated use chatSessionFiles — kept for callers that still assume Kusă. */
+function kusaSessionFiles(dir, sessionId) {
+  return chatSessionFiles(dir, KUSA_HARNESS, sessionId);
 }
 
 /**
- * Per-session settings sidecar: `.kusa/kusa/<id>/session.json`.
+ * Resolve a session id (or `harness:id` key) to `{ harness, id }`.
+ * Disk layout is shared (`sessions/<id>/`); harness comes from the key prefix
+ * when present, otherwise from the lane/chat/config record on disk.
+ */
+export function resolveSessionRef(dir, sessionIdOrKey) {
+  const raw = String(sessionIdOrKey || '').trim();
+  if (!raw) return null;
+  let harnessHint = null;
+  let id = raw;
+  for (const harness of CHAT_HARNESSES) {
+    const prefix = `${harness}:`;
+    if (raw.startsWith(prefix)) {
+      harnessHint = harness;
+      id = raw.slice(prefix.length);
+      break;
+    }
+  }
+  if (!id) return null;
+  // Touch migration so a bare id still finds a just-upgraded folder.
+  try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
+  const files = chatSessionFiles(dir, harnessHint || KUSA_HARNESS, id);
+  const chat = existsSync(files.chat) ? readJsonSafe(files.chat) : null;
+  const config = existsSync(files.config) ? readJsonSafe(files.config) : null;
+  const lane = existsSync(files.json) ? readJsonSafe(files.json) : null;
+  const fromRecord = lane?.harness
+    || chat?.harness
+    || resolveChatProvider(config?.provider || chat?.provider)?.harness
+    || null;
+  const harness = harnessHint
+    || (CHAT_HARNESSES.includes(fromRecord) ? fromRecord : null)
+    || KUSA_HARNESS;
+  return { harness, id };
+}
+
+/** Absolute path for a session's chat sidecar. */
+export function chatFilePath(dir, sessionId, harness = null) {
+  const ref = harness
+    ? { harness, id: String(sessionId || '').trim() }
+    : resolveSessionRef(dir, sessionId);
+  if (!ref?.id) return chatSessionFiles(dir, KUSA_HARNESS, '').chat;
+  return chatSessionFiles(dir, ref.harness, ref.id).chat;
+}
+
+/**
+ * Per-session settings sidecar: `.kusa/sessions/<id>/session.json`.
  *
  * A chat owns its composer picks (Mode / Rule / Model), and a chat transcript
  * is the wrong place to keep them: the turn path rewrites the transcript on
@@ -90,8 +163,12 @@ export const SESSION_CONFIG_FILE = 'session.json';
 export const SESSION_CONFIG_SUFFIX = '.session.json';
 
 /** Absolute path for a session's settings sidecar. */
-export function sessionConfigPath(dir, sessionId) {
-  return kusaSessionFiles(dir, sessionId).config;
+export function sessionConfigPath(dir, sessionId, harness = null) {
+  const ref = harness
+    ? { harness, id: String(sessionId || '').trim() }
+    : resolveSessionRef(dir, sessionId);
+  if (!ref?.id) return chatSessionFiles(dir, KUSA_HARNESS, '').config;
+  return chatSessionFiles(dir, ref.harness, ref.id).config;
 }
 
 /**
@@ -100,13 +177,13 @@ export function sessionConfigPath(dir, sessionId) {
  * keeps only the slim pointer (`file`) — chat.json must not grow with every
  * picture. Without a session folder the inline payload is kept (queue / tests).
  */
-function normalizeMessage(m, { dir = null, sessionId = '', persist = false, hydrate = false } = {}) {
+function normalizeMessage(m, { dir = null, sessionId = '', harness = KUSA_HARNESS, persist = false, hydrate = false } = {}) {
   if (!m || typeof m !== 'object' || typeof m.text !== 'string') return null;
   let attachments = normalizeAttachments(m.attachments);
   if (attachments.length && dir && sessionId && persist) {
-    attachments = persistAttachments(dir, sessionId, attachments);
+    attachments = persistAttachments(dir, sessionId, attachments, harness);
   } else if (attachments.length && dir && sessionId && hydrate) {
-    attachments = hydrateAttachments(dir, sessionId, attachments);
+    attachments = hydrateAttachments(dir, sessionId, attachments, harness);
   }
   return {
     id: String(m.id || newId()),
@@ -207,6 +284,26 @@ function normalizeSessionOptions(raw) {
   if (Object.hasOwn(raw, 'endpointId')) {
     out.endpointId = typeof raw.endpointId === 'string' ? raw.endpointId.trim().slice(0, 80) : '';
   }
+  const provider = resolveChatProvider(raw.provider);
+  if (provider) out.provider = provider.id;
+  if (Object.hasOwn(raw, 'kind') || raw.kind) {
+    out.kind = normalizeSessionKind(raw.kind);
+  }
+  if (typeof raw.caoSessionName === 'string' && raw.caoSessionName.trim()) {
+    out.caoSessionName = raw.caoSessionName.trim().slice(0, 120);
+  }
+  if (typeof raw.caoTerminalId === 'string' && raw.caoTerminalId.trim()) {
+    out.caoTerminalId = raw.caoTerminalId.trim().slice(0, 120);
+  }
+  if (typeof raw.workflowId === 'string' && raw.workflowId.trim()) {
+    out.workflowId = raw.workflowId.trim().slice(0, 200);
+  }
+  // Opaque CLI resume ids written by provider adapters (Cursor / Copilot).
+  for (const key of ['cliSessionId', 'cursorCliSessionId', 'copilotCliSessionId']) {
+    if (typeof raw[key] === 'string' && raw[key].trim()) {
+      out[key] = raw[key].trim().slice(0, 200);
+    }
+  }
   return Object.keys(out).length ? out : null;
 }
 
@@ -221,21 +318,63 @@ export function normalizeChatSession(raw, opts = {}) {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : null;
   if (!id) return null;
-  const key = typeof raw.key === 'string' && raw.key.startsWith(`${KUSA_HARNESS}:`)
+  // Only the settings sidecar / explicit `options` object carries picks — never
+  // scrape top-level provider/kind onto options or every write invents a sidecar.
+  const options = normalizeSessionOptions(raw.options) || null;
+  const providerMeta = resolveChatProvider(options?.provider || raw.provider || raw.harness);
+  let harness = providerMeta?.harness || KUSA_HARNESS;
+  if (typeof raw.key === 'string' && raw.key.includes(':')) {
+    const prefix = raw.key.slice(0, raw.key.indexOf(':'));
+    if (CHAT_HARNESSES.includes(prefix)) harness = prefix;
+  } else if (typeof raw.harness === 'string' && CHAT_HARNESSES.includes(raw.harness)) {
+    harness = raw.harness;
+  } else if (opts.harness && CHAT_HARNESSES.includes(opts.harness)) {
+    harness = opts.harness;
+  }
+  const key = typeof raw.key === 'string' && raw.key.startsWith(`${harness}:`)
     ? raw.key
-    : laneKey(KUSA_HARNESS, id);
+    : laneKey(harness, id);
+  const provider = providerMeta?.id || providerForHarness(harness);
+  const kind = normalizeSessionKind(options?.kind || raw.kind || SESSION_KIND_STANDARD);
   const messageOpts = {
     dir: opts.dir || null,
     sessionId: id,
+    harness,
     persist: Boolean(opts.persist),
     hydrate: Boolean(opts.hydrate),
   };
   const messages = Array.isArray(raw.messages)
     ? raw.messages.map((m) => normalizeMessage(m, messageOpts)).filter(Boolean)
     : [];
+  // Composer sidecar picks only — provider/kind live on the session record so a
+  // brand-new chat does not invent a session.json full of defaults.
+  // `external` marks IDE-owned chats (adapter hooks). Kusă-created CLI sessions
+  // write false; lane-only externalOwned harness chats hydrate as true.
+  const external = raw.external === true;
+  const resolvedMeta = providerMeta || resolveChatProvider(provider);
+  const trust = resolvedMeta?.workspaceTrust;
+  const modelsMeta = resolvedMeta?.models;
   return {
     key,
     id,
+    harness,
+    provider,
+    kind,
+    external,
+    /** True for adapter/CAO providers — BYOK endpoint credentials do not apply. */
+    cliBacked: resolvedMeta?.turnBackend === 'cao',
+    /** Adapter owns its model catalog (e.g. Cursor `--list-models`). */
+    ownsModels: Boolean(resolvedMeta?.ownsModels && modelsMeta?.path),
+    modelsPath: modelsMeta?.path ? String(modelsMeta.path) : null,
+    /** Workspace gate contributed by the provider adapter (e.g. Cursor trust). */
+    workspaceTrust: trust
+      ? {
+        path: String(trust.path || ''),
+        label: String(trust.label || 'Trust workspace'),
+        title: String(trust.title || ''),
+        summary: String(trust.summary || ''),
+      }
+      : null,
     title: clampTitle(raw.title) || deriveSessionTitle(messages),
     status: raw.status === 'ended' ? 'ended' : 'idle',
     endedAt: Number.isFinite(raw.endedAt) ? raw.endedAt : null,
@@ -243,7 +382,7 @@ export function normalizeChatSession(raw, opts = {}) {
     createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(),
     opencodeSessionId: typeof raw.opencodeSessionId === 'string' ? raw.opencodeSessionId : null,
     // The session's own composer picks — null means "never picked, use Settings".
-    options: normalizeSessionOptions(raw.options),
+    options: options || null,
     messages,
     live: null,
   };
@@ -254,8 +393,8 @@ export function normalizeChatSession(raw, opts = {}) {
  * is different from "picked the default": no file means Settings fills the pick
  * in, so a session that was never opened keeps inheriting Settings.
  */
-export function readSessionConfig(dir, sessionId) {
-  return normalizeSessionOptions(readJsonSafe(sessionConfigPath(dir, sessionId)));
+export function readSessionConfig(dir, sessionId, harness = null) {
+  return normalizeSessionOptions(readJsonSafe(sessionConfigPath(dir, sessionId, harness)));
 }
 
 /**
@@ -265,13 +404,18 @@ export function readSessionConfig(dir, sessionId) {
  * an empty merge writes no file at all — nothing here invents a pick, which is
  * what keeps a turn write from clearing a Rule the user chose.
  */
-export function writeSessionConfig(dir, sessionId, over = {}) {
+export function writeSessionConfig(dir, sessionId, over = {}, harness = null) {
+  const ref = harness
+    ? { harness, id: String(sessionId || '').trim() }
+    : resolveSessionRef(dir, sessionId);
+  const id = ref?.id || String(sessionId || '').trim();
+  const h = ref?.harness || KUSA_HARNESS;
   const merged = normalizeSessionOptions({
-    ...(readSessionConfig(dir, sessionId) || {}),
+    ...(readSessionConfig(dir, id, h) || {}),
     ...(over || {}),
   });
   if (!merged) return null;
-  atomicWriteFile(sessionConfigPath(dir, sessionId), `${JSON.stringify(merged, null, 2)}\n`);
+  atomicWriteFile(sessionConfigPath(dir, id, h), `${JSON.stringify(merged, null, 2)}\n`);
   return merged;
 }
 
@@ -299,7 +443,9 @@ export function slimChatSession(session, opts = {}) {
 
 /** Rebuild a minimal chat transcript from a monitor lane's prompts. */
 export function chatSessionFromLane(lane) {
-  if (!lane || lane.harness !== KUSA_HARNESS || !lane.id) return null;
+  if (!lane || !lane.id) return null;
+  const harness = CHAT_HARNESSES.includes(lane.harness) ? lane.harness : null;
+  if (!harness) return null;
   const messages = [];
   const prompts = Array.isArray(lane.prompts) ? lane.prompts : [];
   // Oldest first so the chat reads top-to-bottom.
@@ -326,18 +472,25 @@ export function chatSessionFromLane(lane) {
     }
   }
   return normalizeChatSession({
-    key: lane.key || laneKey(KUSA_HARNESS, lane.id),
+    key: lane.key || laneKey(harness, lane.id),
     id: lane.id,
+    harness,
+    provider: providerForHarness(harness),
+    // Lane-only Cursor chats are owned by Cursor UI — Kusă observes them.
+    external: isExternalOwnedHarness(harness),
     status: lane.active === false || lane.endedAtWall != null ? 'ended' : 'idle',
     endedAt: Number.isFinite(lane.endedAtWall) ? lane.endedAtWall : null,
     attempts: Number.isFinite(lane.promptToolAttempts) ? lane.promptToolAttempts : 0,
     createdAt: Number.isFinite(lane.startedAtWall) ? lane.startedAtWall : Date.now(),
+    // Cursor UI titles land on the lane when the IDE generates/renames them.
+    title: typeof lane.title === 'string' ? lane.title : null,
     messages,
   });
 }
 
 function listLaneFiles(dir) {
-  const folder = join(dir, KUSA_HARNESS);
+  try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
+  const folder = sessionsRoot(dir);
   if (!existsSync(folder)) return [];
   let entries = [];
   try {
@@ -346,37 +499,22 @@ function listLaneFiles(dir) {
     return [];
   }
   const out = [];
-  const consider = (path) => {
-    const raw = readJsonSafe(path);
-    if (!raw || (raw.harness && raw.harness !== KUSA_HARNESS)) return;
-    if (!raw.id) return;
-    out.push(raw);
-  };
   for (const entry of entries) {
-    if (entry.isDirectory()) {
-      // Session-named folder: `<id>/<id>.json` is the lane record.
-      const stem = entry.name;
-      const path = join(folder, stem, `${stem}.json`);
-      if (existsSync(path)) consider(path);
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const name = entry.name;
-    if (!name.endsWith('.json') || name.endsWith(CHAT_SUFFIX)) continue;
-    // Settings belong to a session, not to a lane: a sidecar must never be
-    // read as one, or a chat that only picked a Rule would show up as a lane
-    // with no prompts.
-    if (name.endsWith(SESSION_CONFIG_SUFFIX) || name === SESSION_CONFIG_FILE) continue;
-    if (/\.(corrupt|legacy)\.json$/.test(name)) continue;
-    if (name.endsWith('.events.jsonl')) continue;
-    if (name === 'tasks.json' || name === 'queues.json') continue;
-    consider(join(folder, name));
+    if (!entry.isDirectory()) continue;
+    const stem = entry.name;
+    const path = join(folder, stem, `${stem}.json`);
+    if (!existsSync(path)) continue;
+    const raw = readJsonSafe(path);
+    if (!raw?.id) continue;
+    const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
+    out.push({ ...raw, harness });
   }
   return out;
 }
 
 function listChatFiles(dir) {
-  const folder = join(dir, KUSA_HARNESS);
+  try { migrateHarnessSessionsToShared(dir); } catch { /* ignore */ }
+  const folder = sessionsRoot(dir);
   if (!existsSync(folder)) return [];
   let entries = [];
   try {
@@ -385,41 +523,68 @@ function listChatFiles(dir) {
     return [];
   }
   const out = [];
-  const consider = (path, sessionIdHint = '') => {
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const stem = entry.name;
+    const path = join(folder, stem, `${stem}${CHAT_SUFFIX}`);
+    if (!existsSync(path)) continue;
     const raw = readJsonSafe(path);
+    const harnessHint = CHAT_HARNESSES.includes(raw?.harness) ? raw.harness : null;
     const session = normalizeChatSession(raw, {
       dir,
       hydrate: true,
+      harness: harnessHint || undefined,
     });
     if (session) out.push(session);
-    else if (sessionIdHint) {
-      /* unreadable chat sidecar — skip */
-    }
-  };
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      const stem = entry.name;
-      const path = join(folder, stem, `${stem}${CHAT_SUFFIX}`);
-      if (existsSync(path)) consider(path, stem);
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const name = entry.name;
-    if (!name.endsWith(CHAT_SUFFIX)) continue;
-    consider(join(folder, name));
   }
   return out;
 }
 
 /**
- * All Kusă chats: prefer `.chat.json` sidecars; fall back to hydrating from
+ * When the same session id exists under more than one provider folder (a kusa
+ * hook shadow next to a cursor/copilot chat, etc.), pick the row the Agents
+ * list should keep. Richer transcripts win; a declared provider that matches
+ * the folder beats a shadow; non-kusa folders beat bare kusa copies.
+ */
+function chatSessionListScore(session) {
+  if (!session) return -1;
+  let score = 0;
+  const msgs = Array.isArray(session.messages) ? session.messages.length : 0;
+  score += msgs * 10;
+  const providerMeta = resolveChatProvider(session.provider || session.options?.provider);
+  if (providerMeta?.harness && providerMeta.harness === session.harness) score += 20;
+  if (session.harness && session.harness === providerMeta?.harness) score += 5;
+  if (session.harness && session.harness !== KUSA_HARNESS) score += 3;
+  if (session.title) score += 1;
+  return score;
+}
+
+function preferListedChatSession(current, next) {
+  if (!current) return next;
+  if (!next) return current;
+  const curScore = chatSessionListScore(current);
+  const nextScore = chatSessionListScore(next);
+  if (nextScore !== curScore) return nextScore > curScore ? next : current;
+  return sessionRankAt(next) > sessionRankAt(current) ? next : current;
+}
+
+/**
+ * All provider chats: prefer `.chat.json` sidecars; fall back to hydrating from
  * monitor lane prompts when a sidecar is missing (pre-persistence sessions).
+ * One row per session id — cross-harness copies of the same id collapse here
+ * so the consolidated Agents list never double-loads kusa+cursor twins.
  */
 export function listChatSessions(dir) {
-  const fromChat = listChatFiles(dir);
-  const byId = new Map(fromChat.map((s) => [s.id, s]));
+  const byId = new Map();
+  for (const session of listChatFiles(dir)) {
+    if (!session?.id) continue;
+    byId.set(session.id, preferListedChatSession(byId.get(session.id), session));
+  }
   for (const lane of listLaneFiles(dir)) {
-    if (byId.has(lane.id)) continue;
+    if (!lane?.id || byId.has(lane.id)) continue;
+    // Same gate as monitor buildView: prompt-less Cursor CLI/IDE blips must
+    // not appear as empty Agents rows (tools alone ≠ a chat).
+    if (!laneListedInSidebar(lane)) continue;
     const hydrated = chatSessionFromLane(lane);
     if (hydrated) byId.set(hydrated.id, hydrated);
   }
@@ -428,27 +593,35 @@ export function listChatSessions(dir) {
   // page refresh: the dashboard re-reads the sidecar, and no transcript writer
   // on the turn path can have cleared it.
   for (const session of sessions) {
-    const config = readSessionConfig(dir, session.id);
+    const config = readSessionConfig(dir, session.id, session.harness);
     if (config) session.options = config;
   }
+  // Adapter enrichers (e.g. Cursor IDE composer titles) overlay provider-specific
+  // metadata so the Agents list picks them up on the next /kusa/sessions poll.
+  enrichChatSessions(sessions);
   return sessions.sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
 }
 
-export function readChatSession(dir, sessionId) {
-  const id = String(sessionId || '').trim();
+export function readChatSession(dir, sessionId, harness = null) {
+  const ref = harness
+    ? { harness, id: String(sessionId || '').trim() }
+    : resolveSessionRef(dir, sessionId);
+  const id = ref?.id || '';
   if (!id) return null;
+  const h = ref.harness || KUSA_HARNESS;
   // The sidecar is the source of truth for picks; a transcript that still
   // carries them (written before the sidecar existed) is used only when no
   // sidecar is there, so an old file cannot shadow a newer pick.
-  const config = readSessionConfig(dir, id);
-  const fromFile = normalizeChatSession(readJsonSafe(chatFilePath(dir, id)), {
+  const config = readSessionConfig(dir, id, h);
+  const fromFile = normalizeChatSession(readJsonSafe(chatFilePath(dir, id, h)), {
     dir,
     hydrate: true,
+    harness: h,
   });
-  if (fromFile) return config ? { ...fromFile, options: config } : fromFile;
-  const lanePath = laneFiles(dir, { harness: KUSA_HARNESS, id }).json;
+  if (fromFile) return config ? { ...fromFile, options: { ...fromFile.options, ...config } } : fromFile;
+  const lanePath = laneFiles(dir, { harness: h, id }).json;
   const hydrated = chatSessionFromLane(readJsonSafe(lanePath));
-  return hydrated && config ? { ...hydrated, options: config } : hydrated;
+  return hydrated && config ? { ...hydrated, options: { ...hydrated.options, ...config } } : hydrated;
 }
 
 /**
@@ -469,40 +642,66 @@ export function writeChatSession(dir, session) {
     err.code = 'EINVAL';
     throw err;
   }
-  const stored = readSessionConfig(dir, slim.id);
+  const harness = slim.harness || KUSA_HARNESS;
+  const stored = readSessionConfig(dir, slim.id, harness);
+  const incoming = normalizeSessionOptions(session.options) || {};
   const merged = writeSessionConfig(dir, slim.id, {
     ...(stored || {}),
-    ...(normalizeSessionOptions(session.options) || {}),
-  });
+    ...incoming,
+  }, harness);
   const { options: _picks, ...transcript } = slim;
-  atomicWriteFile(chatFilePath(dir, slim.id), `${JSON.stringify(transcript, null, 2)}\n`);
+  atomicWriteFile(chatFilePath(dir, slim.id, harness), `${JSON.stringify(transcript, null, 2)}\n`);
   // Keep attachments/ and sub-sessions/ present once the session folder exists.
-  ensureSessionDirs(kusaSessionFiles(dir, slim.id));
+  ensureSessionDirs(chatSessionFiles(dir, harness, slim.id));
   // Hand back a hydrated view so the dashboard / agent still see dataUrls —
   // the on-disk transcript stays slim.
-  const hydrated = normalizeChatSession(transcript, { dir, hydrate: true }) || slim;
+  const hydrated = normalizeChatSession(transcript, { dir, hydrate: true, harness }) || slim;
   return { ...hydrated, options: merged };
 }
 
 /** Create an empty chat + monitor lane (sessionStart hook). */
-export function createChatSession(dir, { id, workspaceRoot = process.cwd(), createdAt } = {}) {
+export function createChatSession(dir, {
+  id,
+  workspaceRoot = process.cwd(),
+  createdAt,
+  provider = 'kusa',
+  kind = SESSION_KIND_STANDARD,
+  workflowId = null,
+} = {}) {
+  const meta = resolveChatProvider(provider) || CHAT_PROVIDERS.kusa;
+  const harness = meta.harness;
   const sessionId = (typeof id === 'string' && id.trim()) ? id.trim() : newId();
-  const existing = readChatSession(dir, sessionId);
-  if (existing && (existing.messages?.length || existsSync(chatFilePath(dir, sessionId)))) {
+  const existing = readChatSession(dir, sessionId, harness);
+  if (existing && (existing.messages?.length || existsSync(chatFilePath(dir, sessionId, harness)))) {
     return existing;
   }
+  const sessionKind = normalizeSessionKind(kind);
+  const createOptions = {
+    ...(meta.id !== 'kusa' ? { provider: meta.id } : {}),
+    ...(sessionKind !== SESSION_KIND_STANDARD ? { kind: sessionKind } : {}),
+    ...(typeof workflowId === 'string' && workflowId.trim()
+      ? { workflowId: workflowId.trim(), kind: sessionKind, provider: meta.id }
+      : {}),
+  };
   const session = writeChatSession(dir, {
-    key: laneKey(KUSA_HARNESS, sessionId),
+    key: laneKey(harness, sessionId),
     id: sessionId,
+    harness,
+    provider: meta.id,
+    kind: sessionKind,
+    // Created in Kusă (including Cursor via CLI) — not an external IDE chat.
+    external: false,
     status: 'idle',
     attempts: 0,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     messages: [],
+    ...(Object.keys(createOptions).length ? { options: createOptions } : {}),
   });
   const hooks = createKusaHookEmitter({
     dataDir: dir,
     sessionId,
     workspaceRoot,
+    harness,
   });
   if (hooks.enabled) hooks.sessionStart();
   return session;
@@ -543,11 +742,13 @@ export function migrateChatSessions(dir, sessions, { workspaceRoot = process.cwd
       messages: incomingLen >= existingLen ? incoming.messages : existing.messages,
     });
     // Ensure a monitor lane exists for sidebar/delete parity.
-    if (!existsSync(laneFiles(dir, { harness: KUSA_HARNESS, id: incoming.id }).json)) {
+    const migrateHarness = incoming.harness || KUSA_HARNESS;
+    if (!existsSync(laneFiles(dir, { harness: migrateHarness, id: incoming.id }).json)) {
       const hooks = createKusaHookEmitter({
         dataDir: dir,
         sessionId: incoming.id,
         workspaceRoot,
+        harness: migrateHarness,
       });
       if (hooks.enabled) hooks.sessionStart();
     }
@@ -567,9 +768,9 @@ export function deleteChatFiles(dir, sessionIds) {
   for (const raw of sessionIds || []) {
     const id = String(raw || '').trim();
     if (!id) continue;
-    // Accept either bare id or `kusa:id`.
-    const sessionId = id.startsWith(`${KUSA_HARNESS}:`) ? id.slice(KUSA_HARNESS.length + 1) : id;
-    const files = kusaSessionFiles(dir, sessionId);
+    const ref = resolveSessionRef(dir, id);
+    if (!ref?.id) continue;
+    const files = chatSessionFiles(dir, ref.harness, ref.id);
     let removed = false;
     for (const path of [files.chat, files.config]) {
       try {
@@ -586,7 +787,7 @@ export function deleteChatFiles(dir, sessionIds) {
     } catch {
       /* no attachments folder */
     }
-    if (removed) deleted.push(sessionId);
+    if (removed) deleted.push(ref.id);
   }
   return deleted;
 }

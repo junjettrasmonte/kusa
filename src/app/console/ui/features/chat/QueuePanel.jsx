@@ -18,7 +18,7 @@ import {
 /**
  * Prompt Queue rows — the composer's queued/steering prompt list.
  *
- * The switch and the auto-collapse decision stay with ChatHarness (see PopupList.jsx);
+ * The switch and the auto-collapse decision stay with SessionChat (see PopupList.jsx);
  * this file renders the box and its rows. The box is height-capped, never item-capped:
  * every queued prompt is listed and the stack scrolls inside its own box, so a long
  * queue can never push the composer or the transcript away.

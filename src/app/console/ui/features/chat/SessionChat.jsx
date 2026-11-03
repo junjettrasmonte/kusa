@@ -4,13 +4,15 @@ import {
   useRef,
   useState,
 } from 'react';
-import { shortId } from '#ui/shared/lib/format.js';
+import { CHAT_PROVIDER_GROUPS, HARNESS_NAMES, shortId } from '#ui/shared/lib/format.js';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import {
   AGENT_MODE_OPTIONS,
   AttachmentPicker,
   ComposerDropdown,
   ComposerOptionsMenu,
   ContextRing,
+  DEFAULT_CONTEXT_LIMIT,
   DictateIcon,
   RULE_OPTIONS,
   VoiceIcon,
@@ -27,8 +29,9 @@ import {
   transferHasFiles,
 } from '#ui/shared/lib/attachments.js';
 import { PopupToggle } from './PopupList.jsx';
-import { estimateContextTokens, truncate } from '#ui/shared/lib/chatText.js';
+import { estimateContextTokens, isCursorTrustError, truncate } from '#ui/shared/lib/chatText.js';
 import { readLocal, writeLocal } from '#ui/shared/lib/storage.js';
+import { SetupGuide } from '#ui/shared/SetupGuide.jsx';
 import {
   ArrowUpIcon,
   AttachmentsIcon,
@@ -42,6 +45,7 @@ import { ClippedGrow, lastPendingGate } from './ClippedGrow.jsx';
 import { QueueStack } from './QueuePanel.jsx';
 import { TaskStack } from './TaskPanel.jsx';
 import { ChatTurn } from './TranscriptTurns.jsx';
+import { startLiveVoiceSession } from '#ui/features/live-chat/voiceClient.js';
 
 /** Persist drawer dock across reloads — shared by Queue / Tasks / Attachments. */
 const DRAWER_DOCK_KEY = 'kusa.chat.drawerDock';
@@ -86,9 +90,11 @@ function initialComposerRule(options, defaults) {
   return defaults?.rules || 'ask-deny';
 }
 
-function initialComposerModel(options, defaults) {
+function initialComposerModel(options, defaults, { ownsModels = false } = {}) {
   const saved = options?.model;
   if (typeof saved === 'string' && saved.trim()) return saved.trim();
+  // Adapter catalogs (Cursor) default to Auto — never inherit the BYOK Settings model.
+  if (ownsModels) return 'auto';
   return defaults?.model || '';
 }
 
@@ -150,7 +156,7 @@ const DEFAULT_MODEL_GROUP = 'Default';
  * First-party Kusă chat surface — transcript styled like VS Code chat:
  * shimmering thinking header, progressive collapsible tool rows, then reply.
  */
-export function ChatHarness({
+export function SessionChat({
   session,
   queued = null,
   tasks = null,
@@ -193,13 +199,38 @@ export function ChatHarness({
   // Settings filling in only when nothing has been picked yet. Allow / Deny are
   // sticky: the pick holds until the Rules picker is used again.
   const sessionOptions = session?.options || null;
+  // Adapter/CAO providers (Cursor, Copilot, …) — BYOK endpoint credentials do
+  // not apply. Some adapters (Cursor) still own their own model catalog.
+  const cliBacked = Boolean(session?.cliBacked);
+  const ownsModels = Boolean(session?.ownsModels && session?.modelsPath);
+  const showModelPicker = ownsModels || !cliBacked;
+  // Workspace gate from the provider adapter (e.g. Cursor trust).
+  const workspaceTrust = session?.workspaceTrust || null;
+  const hasWorkspaceTrust = Boolean(workspaceTrust?.path);
+  // IDE-hooked sessions are observe-only — Kusă cannot prompt into the same
+  // chat, so the composer stays disabled with a notice.
+  const externalOwned = session?.external === true;
+  // Some CLIs block until the workspace is trusted once.
+  const [trustNeeded, setTrustNeeded] = useState(false);
+  const [trustBusy, setTrustBusy] = useState(false);
+  const [trustNote, setTrustNote] = useState('');
+  // After a successful Trust click, hide the banner even if older error rows
+  // in the transcript still mention trust — those rows stay for history.
+  const [trustGranted, setTrustGranted] = useState(false);
   const [agentMode, setAgentMode] = useState(() => initialComposerMode(sessionOptions, agentDefaults));
   const [approvalRules, setApprovalRules] = useState(() => initialComposerRule(sessionOptions, agentDefaults));
-  const [modelChoice, setModelChoice] = useState(() => initialComposerModel(sessionOptions, agentDefaults));
+  const [modelChoice, setModelChoice] = useState(() => initialComposerModel(
+    sessionOptions,
+    agentDefaults,
+    { ownsModels: Boolean(session?.ownsModels && session?.modelsPath) },
+  ));
   // Which Endpoints card the Model pick sat under (agentEndpoints[].id). Empty
   // means Default. Kept beside the model id so a probed-only Google / proxy
   // pick still routes there after refresh — resolveAgentEndpoint needs it.
-  const [endpointChoice, setEndpointChoice] = useState(() => initialComposerEndpointId(sessionOptions));
+  // Adapter-owned catalogs never use endpoint routing.
+  const [endpointChoice, setEndpointChoice] = useState(() => (
+    session?.ownsModels ? '' : initialComposerEndpointId(sessionOptions)
+  ));
   const [models, setModels] = useState([]);
   // Which backend the configured endpoint runs ('opencode' | 'native' | '').
   // OpenCode takes a prompt string, so it never receives an image part — the
@@ -216,6 +247,15 @@ export function ChatHarness({
   const [queueExpanded, setQueueExpanded] = useState(true);
   const [tasksExpanded, setTasksExpanded] = useState(false);
   const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
+  // Live voice (Pipecat): idle when the bot is down or unused; phase tracks the
+  // mic/session lifecycle while a call is open. handle holds stop().
+  const [voicePhase, setVoicePhase] = useState('idle');
+  const [voiceError, setVoiceError] = useState('');
+  const [liveChatUp, setLiveChatUp] = useState(false);
+  // Optimistic STT / TTS transcript lines while Live voice is open (also persisted
+  // via /live-chat/transcript when the bot has the session ids).
+  const [voiceMessages, setVoiceMessages] = useState([]);
+  const voiceHandleRef = useRef(null);
   // Shared dock for all three drawers: bottom (above the composer) or right
   // (flush left of the right rail). One icon on every open drawer toggles it.
   const [drawerDock, setDrawerDock] = useState(() => (
@@ -297,9 +337,80 @@ export function ChatHarness({
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
   }
-  const messages = session?.messages || [];
+  const baseMessages = session?.messages || [];
+  // Drop optimistic voice rows once the same text lands in the persisted transcript.
+  const messages = useMemo(() => {
+    if (!voiceMessages.length) return baseMessages;
+    const seen = new Set(
+      baseMessages
+        .filter((m) => m?.backend === 'live-chat' && typeof m.text === 'string')
+        .map((m) => `${m.role}:${m.text.trim()}`),
+    );
+    const extra = voiceMessages.filter((m) => !seen.has(`${m.role}:${m.text.trim()}`));
+    return extra.length ? [...baseMessages, ...extra] : baseMessages;
+  }, [baseMessages, voiceMessages]);
   const busy = session?.status === 'busy' || session?.status === 'thinking';
   const live = session?.live;
+  const trustFromMessages = useMemo(
+    () => messages.some((m) => isCursorTrustError(m)),
+    [messages],
+  );
+  const showWorkspaceTrust = hasWorkspaceTrust
+    && !trustGranted
+    && (trustNeeded || trustFromMessages);
+
+  useEffect(() => {
+    if (!hasWorkspaceTrust || !workspaceTrust?.path) {
+      setTrustNeeded(false);
+      setTrustNote('');
+      setTrustGranted(false);
+      return undefined;
+    }
+    setTrustGranted(false);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(workspaceTrust.path, { headers: { Accept: 'application/json' } });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        setTrustNeeded(Boolean(data?.needsTrust));
+        if (!data?.installed && data?.error) setTrustNote(String(data.error));
+        else if (!data?.needsTrust) setTrustNote('');
+      } catch (err) {
+        if (!cancelled) setTrustNote(err?.message || 'Could not check workspace trust');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [hasWorkspaceTrust, workspaceTrust?.path, session?.key]);
+
+  async function grantWorkspaceTrust() {
+    if (trustBusy || !workspaceTrust?.path) return;
+    setTrustBusy(true);
+    setTrustNote('');
+    try {
+      const res = await fetch(workspaceTrust.path, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        setTrustNeeded(true);
+        setTrustGranted(false);
+        setTrustNote(data?.error || `Trust failed (HTTP ${res.status})`);
+        return;
+      }
+      setTrustNeeded(false);
+      setTrustGranted(true);
+      setTrustNote('Workspace trusted — send again to continue.');
+    } catch (err) {
+      setTrustNeeded(true);
+      setTrustGranted(false);
+      setTrustNote(err?.message || 'Trust request failed');
+    } finally {
+      setTrustBusy(false);
+    }
+  }
   const liveToolKey = (live?.tools || []).map((t) => `${t.id}:${t.status}`).join('|');
   const livePartsKey = (live?.parts || [])
     .map((p) => {
@@ -351,10 +462,91 @@ export function ChatHarness({
   const hasPayload = hasDraft || Boolean(attachments.length);
   // The queue holds prompts the user typed: a row with no words is not a row
   // the queue can list, so only a typed draft may be held.
-  const canQueue = hasDraft && busy && Boolean(session) && Boolean(onQueue);
-  const canSend = hasPayload && !busy && Boolean(session) && !editingId;
+  const canQueue = !externalOwned && hasDraft && busy && Boolean(session) && Boolean(onQueue);
+  const canSend = !externalOwned && hasPayload && !busy && Boolean(session) && !editingId;
   // Stop only exists while a turn is actually running for this session.
-  const canStop = busy && Boolean(session) && Boolean(onStop);
+  const canStop = !externalOwned && busy && Boolean(session) && Boolean(onStop);
+  const voiceActive = voicePhase !== 'idle' && voicePhase !== 'error';
+  const canStartVoice = !externalOwned
+    && Boolean(session)
+    && !busy
+    && !hasPayload
+    && !voiceActive
+    && liveChatUp
+    && !editingId;
+
+  useEffect(() => {
+    let cancelled = false;
+    const probe = async () => {
+      try {
+        const res = await fetch('/live-chat', { headers: { Accept: 'application/json' } });
+        const data = res.ok ? await res.json() : null;
+        if (!cancelled) setLiveChatUp(Boolean(data?.serverUp));
+      } catch {
+        if (!cancelled) setLiveChatUp(false);
+      }
+    };
+    void probe();
+    const id = setInterval(probe, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    try { voiceHandleRef.current?.stop?.(); } catch { /* ignore */ }
+    voiceHandleRef.current = null;
+  }, []);
+
+  async function toggleLiveVoice() {
+    if (voiceActive) {
+      try { voiceHandleRef.current?.stop?.(); } catch { /* ignore */ }
+      voiceHandleRef.current = null;
+      setVoicePhase('idle');
+      setVoiceError('');
+      return;
+    }
+    if (!canStartVoice || !session) return;
+    setVoiceError('');
+    setVoiceMessages([]);
+    try {
+      const handle = await startLiveVoiceSession({
+        sessionId: session.id,
+        queueKey: session.key,
+        model: modelChoice || null,
+        endpointId: endpointChoice || null,
+        onPhase: (phase, detail) => {
+          setVoicePhase(phase);
+          if (phase === 'error' && detail) setVoiceError(detail);
+        },
+        onError: (err) => setVoiceError(err?.message || String(err)),
+        onTranscript: ({ role, text }) => {
+          const trimmed = String(text || '').trim();
+          if (!trimmed) return;
+          setVoiceMessages((prev) => [
+            ...prev,
+            {
+              id: `voice-live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              role: role === 'assistant' ? 'assistant' : 'user',
+              text: trimmed,
+              at: Date.now(),
+              backend: 'live-chat',
+            },
+          ]);
+        },
+        onEnded: () => {
+          voiceHandleRef.current = null;
+          setVoicePhase('idle');
+        },
+      });
+      voiceHandleRef.current = handle;
+    } catch (err) {
+      setVoiceError(err?.message || String(err));
+      setVoicePhase('error');
+      voiceHandleRef.current = null;
+    }
+  }
 
   // A long queue hides itself rather than crowding the composer: past the cap
   // the list is switched off, and the toolbar control (which still shows the
@@ -463,23 +655,27 @@ export function ChatHarness({
   // Reload whenever Settings changes an endpoint / declared model list — the
   // fingerprint is assembled in App.jsx from agentBaseUrl + agentEndpoints so
   // adding a provider refreshes the picker without a full page reload.
+  // Adapter-owned catalogs (Cursor `--list-models`) use session.modelsPath.
   const modelsRevision = agentDefaults?.modelsRevision || '';
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
+      if (!showModelPicker) {
+        setModelBackend('');
+        setModels([]);
+        return;
+      }
+      const catalogUrl = ownsModels && session?.modelsPath
+        ? session.modelsPath
+        : '/kusa/models';
       try {
-        const res = await fetch('/kusa/models', { headers: { Accept: 'application/json' } });
+        const res = await fetch(catalogUrl, { headers: { Accept: 'application/json' } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = await res.json();
-        // GET /kusa/models answers ONE GROUP PER ACTIVE ENDPOINT — the picker
-        // lists every endpoint's models under that endpoint's name, because the
-        // name is what tells the user which base URL and which key a pick would
-        // send. Each entry still carries whether it can see images (GET answers
-        // { id, vision }): the composer needs that BEFORE a prompt is sent, so
-        // attaching a picture can warn instead of quietly dropping it. The
-        // judgement is the agent loop's own (model-capabilities.mjs), so the
-        // picker and the request can never disagree about what reaches the model.
-        // An older page answers flat (`models` only) — that stays one group.
+        // GET /kusa/models (or /adapters/<provider>/models) answers ONE GROUP
+        // PER CATALOG — BYOK groups by endpoint name; Cursor is a single
+        // "Cursor" group. Each entry may carry vision + contextTokens so the
+        // composer can warn on images and sync the ContextRing limit.
         const groups = Array.isArray(body?.groups) && body.groups.length
           ? body.groups
           : (Array.isArray(body?.models) ? [{ name: DEFAULT_MODEL_GROUP, models: body.models }] : []);
@@ -493,27 +689,40 @@ export function ChatHarness({
               const vision = typeof entry === 'object' && typeof entry.vision === 'boolean'
                 ? entry.vision
                 : null;
-              return { id, vision, group: name, endpointId };
+              const label = typeof entry === 'object' && typeof entry.label === 'string' && entry.label.trim()
+                ? entry.label.trim()
+                : id;
+              const contextTokens = typeof entry === 'object' && Number.isFinite(Number(entry.contextTokens))
+                ? Math.max(1, Math.round(Number(entry.contextTokens)))
+                : null;
+              return { id, label, vision, contextTokens, group: name, endpointId };
             })
             .filter(Boolean);
         });
         if (cancelled) return;
-        const fallback = agentDefaults?.model || body?.default || '';
-        setModelBackend(body?.backend === 'opencode' ? 'opencode' : 'native');
+        const fallback = (ownsModels ? body?.default : null)
+          || agentDefaults?.model
+          || body?.default
+          || '';
+        setModelBackend(ownsModels ? 'adapter' : (body?.backend === 'opencode' ? 'opencode' : 'native'));
         setModels(records.length
           ? records
-          : (fallback ? [{ id: fallback, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }] : []));
+          : (fallback ? [{ id: fallback, label: fallback, vision: null, contextTokens: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }] : []));
       } catch {
         if (cancelled) return;
         setModelBackend('');
+        if (ownsModels) {
+          setModels([{ id: 'auto', label: 'Auto', vision: null, contextTokens: DEFAULT_CONTEXT_LIMIT, group: 'Cursor', endpointId: '' }]);
+          return;
+        }
         setModels(agentDefaults?.model
-          ? [{ id: agentDefaults.model, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }]
+          ? [{ id: agentDefaults.model, label: agentDefaults.model, vision: null, contextTokens: null, group: DEFAULT_MODEL_GROUP, endpointId: '' }]
           : []);
       }
     };
     void load();
     return () => { cancelled = true; };
-  }, [modelsRevision, agentDefaults?.model]);
+  }, [modelsRevision, agentDefaults?.model, showModelPicker, ownsModels, session?.modelsPath]);
 
   // A single-model endpoint still gets a picker — it defaults to that model. The
   // group each model came from rides through to the dropdown, which draws a
@@ -522,16 +731,20 @@ export function ChatHarness({
   const modelOptions = (models.length
     ? models
     : (modelChoice
-      ? [{ id: modelChoice, vision: null, group: DEFAULT_MODEL_GROUP, endpointId: endpointChoice }]
+      ? [{ id: modelChoice, label: modelChoice, vision: null, contextTokens: null, group: DEFAULT_MODEL_GROUP, endpointId: endpointChoice }]
       : []))
     .map((record) => ({
       id: record.id,
-      label: record.id,
+      label: record.label || record.id,
       group: record.group || DEFAULT_MODEL_GROUP,
       endpointId: record.endpointId || '',
+      contextTokens: record.contextTokens || null,
     }));
   const matchedModel = modelOptions.find((option) => option.id === modelChoice);
   const activeModel = matchedModel?.id || modelOptions[0]?.id || modelChoice;
+  const activeContextLimit = matchedModel?.contextTokens
+    || models.find((record) => record.id === activeModel)?.contextTokens
+    || DEFAULT_CONTEXT_LIMIT;
   // Prefer the live listing's endpoint for this id; fall back to the saved pick
   // so a send before /kusa/models returns still keeps the extra endpoint.
   const activeEndpointId = matchedModel
@@ -541,7 +754,8 @@ export function ChatHarness({
     mode: agentMode,
     approvalMode: approvalRules,
     model: activeModel,
-    endpointId: activeEndpointId,
+    // Adapter catalogs never route through BYOK endpoints.
+    endpointId: ownsModels ? '' : activeEndpointId,
   };
   // Whether an image attached to THIS draft can actually reach the model. A
   // text-only endpoint cannot see one, and OpenCode takes a prompt string, so
@@ -559,10 +773,11 @@ export function ChatHarness({
   const seededKeyRef = useRef('');
   if (session?.key && session.key !== seededKeyRef.current) {
     seededKeyRef.current = session.key;
+    const sessionOwnsModels = Boolean(session?.ownsModels && session?.modelsPath);
     setAgentMode(initialComposerMode(sessionOptions, agentDefaults));
     setApprovalRules(initialComposerRule(sessionOptions, agentDefaults));
-    setModelChoice(initialComposerModel(sessionOptions, agentDefaults));
-    setEndpointChoice(initialComposerEndpointId(sessionOptions));
+    setModelChoice(initialComposerModel(sessionOptions, agentDefaults, { ownsModels: sessionOwnsModels }));
+    setEndpointChoice(sessionOwnsModels ? '' : initialComposerEndpointId(sessionOptions));
   }
 
   const onSessionOptionsRef = useRef(onSessionOptions);
@@ -862,7 +1077,7 @@ export function ChatHarness({
     </>
   );
 
-  const drawerOpen = (
+  const drawerOpen = !externalOwned && (
     (queueExpanded && queueTotal > 0)
     || (tasksExpanded && taskTotal > 0)
     || (attachmentsExpanded && attachments.length > 0)
@@ -878,15 +1093,45 @@ export function ChatHarness({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
         ref={panelRef}
-        className="min-h-0 flex-1 overflow-y-auto px-6 py-6"
+        className="relative z-0 min-h-0 flex-1 overflow-y-auto px-6 py-6"
       >
+        {showWorkspaceTrust ? (
+          <div className="w-full pb-4">
+            <SetupGuide
+              title={workspaceTrust?.title || 'Workspace trust required'}
+              summary={workspaceTrust?.summary || 'This provider needs the workspace trusted before it can run.'}
+              steps={[
+                'Trusts only this workspace directory for the provider CLI',
+                'After it succeeds, send your message again',
+              ]}
+              action={{
+                label: workspaceTrust?.label || 'Trust workspace',
+                busyLabel: 'Trusting workspace…',
+                busy: trustBusy,
+                onClick: () => { void grantWorkspaceTrust(); },
+              }}
+              footnote={trustNote || undefined}
+            />
+          </div>
+        ) : null}
         {!messages.length && !busy ? (
           <div className="w-full flex flex-col items-start gap-3 pt-10">
-            <p className="text-sm font-medium text-gray-200">New Kusă chat</p>
+            <p className="text-sm font-medium text-gray-200">
+              {cliBacked
+                ? `New ${(
+                  CHAT_PROVIDER_GROUPS.find((g) => g.id === session?.provider)?.label
+                  || HARNESS_NAMES[session?.harness]
+                  || 'provider'
+                )} session`
+                : 'New Kusă chat'}
+            </p>
             <p className="text-sm leading-relaxed text-gray-500">
               Session <code className="font-mono text-gray-400">{shortId(session?.id)}</code>.
-              Configure the OpenAI-compatible endpoint under Settings, then send a message.
-              Thinking and tool calls appear inline like VS Code chat.
+              {cliBacked
+                ? (hasWorkspaceTrust
+                  ? ' Messages go through the provider CLI. Trust this workspace if prompted, then send.'
+                  : ' Messages go through the selected provider CLI.')
+                : ' Configure the OpenAI-compatible endpoint under Settings, then send a message. Thinking and tool calls appear inline like VS Code chat.'}
             </p>
           </div>
         ) : (
@@ -916,6 +1161,13 @@ export function ChatHarness({
                 agentMaxHeight={agentMaxHeight}
                 onApproval={null}
                 onAsk={null}
+                onTrustWorkspace={
+                  hasWorkspaceTrust && !trustGranted
+                    ? () => { void grantWorkspaceTrust(); }
+                    : null
+                }
+                trustBusy={trustBusy}
+                trustNote={trustNote}
               />
             ))}
             {busy && live ? (
@@ -951,6 +1203,13 @@ export function ChatHarness({
                     ? (decision) => onAsk(session.key, decision)
                     : null
                 }
+                onTrustWorkspace={
+                  hasWorkspaceTrust && !trustGranted
+                    ? () => { void grantWorkspaceTrust(); }
+                    : null
+                }
+                trustBusy={trustBusy}
+                trustNote={trustNote}
               />
             ) : busy ? (
               <div className="text-sm">
@@ -1010,9 +1269,32 @@ export function ChatHarness({
       ) : null}
 
       <form
-        className="@container shrink-0 border-t border-gray-800/80 bg-gray-950/70 px-4 py-3 backdrop-blur sm:px-6"
-        onSubmit={submit}
+        className="@container relative z-50 shrink-0 border-t border-gray-800/80 bg-gray-950/70 px-4 py-3 backdrop-blur sm:px-6"
+        onSubmit={externalOwned ? (event) => event.preventDefault() : submit}
       >
+        {externalOwned ? (
+          <div
+            className="flex items-start gap-3 rounded-2xl border border-amber-700/40 bg-amber-950/25 px-3.5 py-3"
+            role="status"
+          >
+            <LucideIcon
+              name="external-link"
+              className="mt-0.5 h-[18px] w-[18px] shrink-0 text-amber-400"
+              title="External session"
+            />
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium text-amber-100">
+                Owned by Cursor UI
+              </p>
+              <p className="text-xs leading-relaxed text-amber-200/80">
+                This session is mirrored from Cursor. Prompting is disabled here so Kusă
+                does not mix a separate Cursor CLI chat into the same transcript — continue
+                in Cursor.
+              </p>
+            </div>
+          </div>
+        ) : (
+        <>
         {/*
          * Composer chrome: Mode / Rule / Model + Queue / Tasks / Attachments.
          * The form is an @container so a narrow chat column collapses even when
@@ -1034,12 +1316,18 @@ export function ChatHarness({
               value={approvalRules}
               onSelect={selectApprovalRule}
             />
-            <ComposerDropdown
-              title="Model"
-              options={modelOptions}
-              value={activeModel}
-              onSelect={selectComposerModel}
-            />
+            {showModelPicker ? (
+              <ComposerDropdown
+                title="Model"
+                options={modelOptions}
+                value={activeModel}
+                onSelect={selectComposerModel}
+              />
+            ) : (
+              <span className="rounded-md border border-gray-800 px-2 py-1 text-[11px] text-gray-500">
+                via provider CLI
+              </span>
+            )}
           </div>
           <div className="@[36rem]:hidden">
             <ComposerOptionsMenu
@@ -1049,8 +1337,8 @@ export function ChatHarness({
               rule={approvalRules}
               ruleOptions={rulePickerOptions}
               onRuleSelect={selectApprovalRule}
-              model={activeModel}
-              modelOptions={modelOptions}
+              model={showModelPicker ? activeModel : ''}
+              modelOptions={showModelPicker ? modelOptions : []}
               onModelSelect={selectComposerModel}
             />
           </div>
@@ -1165,7 +1453,10 @@ export function ChatHarness({
                       )}
               </p>
               <div className="flex shrink-0 items-center gap-0.5">
-                <ContextRing used={estimateContextTokens(messages, live)} />
+                <ContextRing
+                  used={estimateContextTokens(messages, live)}
+                  limit={activeContextLimit}
+                />
                 <AttachmentPicker
                   onAction={(action) => {
                     void attachRequested(action);
@@ -1226,21 +1517,50 @@ export function ChatHarness({
                   >
                     <ArrowUpIcon />
                   </button>
+                ) : voiceActive ? (
+                  <button
+                    type="button"
+                    title={`End live voice (${voicePhase})`}
+                    aria-label="End live voice"
+                    onClick={() => { void toggleLiveVoice(); }}
+                    className="chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors bg-rose-600 text-white hover:bg-rose-500"
+                  >
+                    <StopIcon />
+                  </button>
                 ) : (
                   <button
                     type="button"
-                    disabled
-                    title="Live voice — not wired up yet"
+                    disabled={!canStartVoice}
+                    title={
+                      liveChatUp
+                        ? 'Live voice'
+                        : (voiceError || 'Live voice — start the Live Chat bot (Dev Tools › Live Chat)')
+                    }
                     aria-label="Live voice"
-                    className="chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full border border-gray-700 bg-gray-800/80 text-gray-400 disabled:cursor-not-allowed"
+                    onClick={() => { void toggleLiveVoice(); }}
+                    className={`chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full border transition-colors ${
+                      canStartVoice
+                        ? 'border-emerald-600/60 bg-emerald-900/40 text-emerald-300 hover:bg-emerald-800/50'
+                        : 'border-gray-700 bg-gray-800/80 text-gray-400 disabled:cursor-not-allowed'
+                    }`}
                   >
                     <VoiceIcon />
                   </button>
                 )}
               </div>
             </div>
+            {voiceError && !voiceActive ? (
+              <p className="mt-1 px-1 text-[11px] text-amber-400">{voiceError}</p>
+            ) : null}
+            {voiceActive ? (
+              <p className="mt-1 px-1 text-[11px] text-emerald-400/90">
+                Live voice · {voicePhase}
+              </p>
+            ) : null}
           </div>
         </div>
+        </>
+        )}
       </form>
       </div>
 

@@ -6,7 +6,7 @@ import { previewLine, truncate } from '#ui/shared/lib/chatText.js';
  * its own caps and its own rows.
  *
  * The row vocabulary (mark, status word, label, tone, body) is data, so it is
- * mapped here once; TaskRow only draws what a map says. State stays with ChatHarness.
+ * mapped here once; TaskRow only draws what a map says. State stays with SessionChat.
  */
 export const TASK_MAX_HEIGHT_PX = 168;
 

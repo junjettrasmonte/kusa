@@ -5,7 +5,7 @@
  *   kusa serve              Start the localhost dashboard
  *   kusa serve --live        Hot reload: rebuild the UI on save, restart on server edits
  *   kusa hook <event>       Record a harness hook event (stdin JSON)
- *   kusa open               Open dashboard.md / browser once per session
+ *   kusa open               Open the browser dashboard (hooks stay quiet unless KUSA_OPEN=browser)
  *   kusa demo               Write synthetic events to a temp dir
  *   kusa build              Rebuild the React dashboard assets
  *   kusa init [dir]         Install hook templates into a project
@@ -45,7 +45,7 @@ Commands:
   serve [--port <n>] Start dashboard (default http://127.0.0.1:1424/dashboard.html)
          [--live]     Rebuild the UI on save + restart on server source edits
   hook <event>       Harness hook entry (reads JSON on stdin)
-  open               Open Markdown preview / browser for this session
+  open               Open the browser dashboard (set KUSA_OPEN=browser for sessionStart)
   demo               Synthetic events → temp data dir
   build              vite build → dashboard.{html,js,css}
   init [dir]         Detect Cursor / Copilot, write hooks, add npm scripts
@@ -459,35 +459,6 @@ function initProject(targetDir, { cursor = null, copilot = null } = {}) {
 
   addPackageScripts(root);
 
-  // VS Code Markdown preview association for dashboard.md
-  const vscodeSettingsPath = join(root, '.vscode', 'settings.json');
-  const associationKey = '**/.kusa/dashboard.md';
-  const associationValue = 'vscode.markdown.preview.editor';
-  if (existsSync(vscodeSettingsPath)) {
-    try {
-      const raw = readFileSync(vscodeSettingsPath, 'utf8');
-      // Strip // comments for a best-effort merge
-      const json = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ''));
-      json['workbench.editorAssociations'] = {
-        ...(json['workbench.editorAssociations'] || {}),
-        [associationKey]: associationValue,
-      };
-      writeFileSync(vscodeSettingsPath, `${JSON.stringify(json, null, 2)}\n`);
-      process.stderr.write(`kusa: updated ${vscodeSettingsPath}\n`);
-    } catch {
-      process.stderr.write(`kusa: could not merge ${vscodeSettingsPath}; add editorAssociations manually\n`);
-    }
-  } else {
-    writeIfMissing(
-      vscodeSettingsPath,
-      `${JSON.stringify({
-        'workbench.editorAssociations': {
-          [associationKey]: associationValue,
-        },
-      }, null, 2)}\n`,
-    );
-  }
-
   // gitignore data dir
   const gi = join(root, '.gitignore');
   const ignoreLines = ['/.kusa/'];
@@ -522,6 +493,11 @@ switch (cmd) {
     runNode('hook', rest);
     break;
   case 'open':
+    // Hooks pipe stdin (not a TTY) and stay quiet under the default KUSA_OPEN=none.
+    // An interactive `kusa open` should still launch the browser.
+    if (process.stdin.isTTY && !process.env.KUSA_OPEN && !process.env.COPILOT_MONITOR_OPEN) {
+      process.env.KUSA_OPEN = 'browser';
+    }
     runNode('open', rest);
     break;
   case 'demo':

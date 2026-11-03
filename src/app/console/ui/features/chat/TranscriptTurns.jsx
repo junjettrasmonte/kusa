@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { MarkdownBody, looksLikeMarkdown } from '#ui/shared/MarkdownBody.jsx';
 import {
   agentErrorDisplayText,
+  isCursorTrustError,
   assistantParts,
   groupAssistantParts,
   isAgentErrorMessage,
@@ -29,7 +30,7 @@ import {
  *
  * ChatTurn routes a user row and an assistant row; AssistantTurn/AgentSegment lay
  * out the parts (see ../lib/chatText.js) and delegate the actual drawing to
- * ToolRows.jsx and GateBlocks.jsx. Height caps come in from ChatHarness, which
+ * ToolRows.jsx and GateBlocks.jsx. Height caps come in from SessionChat, which
  * owns the transcript scroll container.
  */
 export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onResendEdit }) {
@@ -152,7 +153,20 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
   );
 }
 
-export function ChatTurn({ msg, busy, editing, onStartEdit, onCancelEdit, onResendEdit, agentMaxHeight = null, onApproval = null, onAsk = null }) {
+export function ChatTurn({
+  msg,
+  busy,
+  editing,
+  onStartEdit,
+  onCancelEdit,
+  onResendEdit,
+  agentMaxHeight = null,
+  onApproval = null,
+  onAsk = null,
+  onTrustWorkspace = null,
+  trustBusy = false,
+  trustNote = '',
+}) {
   if (msg.role === 'user') {
     return (
       <UserMessage
@@ -166,7 +180,17 @@ export function ChatTurn({ msg, busy, editing, onStartEdit, onCancelEdit, onRese
     );
   }
 
-  return <AssistantTurn msg={msg} agentMaxHeight={agentMaxHeight} onApproval={onApproval} onAsk={onAsk} />;
+  return (
+    <AssistantTurn
+      msg={msg}
+      agentMaxHeight={agentMaxHeight}
+      onApproval={onApproval}
+      onAsk={onAsk}
+      onTrustWorkspace={onTrustWorkspace}
+      trustBusy={trustBusy}
+      trustNote={trustNote}
+    />
+  );
 }
 
 /**
@@ -231,27 +255,82 @@ export function splitAtVisibleRows(parts) {
  */
 /**
  * Settled model/endpoint failure — not an assistant reply. Keeps the user
- * prompt and prior turns above it; the next Send can retry.
+ * prompt and prior turns above it; the next Send can retry. Cursor trust
+ * failures also offer a one-click `agent -p --trust` via onTrustWorkspace.
+ * Starts collapsed (like finished tool rows); expand for the full body.
  */
-function AgentErrorCard({ text }) {
+function AgentErrorCard({
+  text,
+  code = '',
+  onTrustWorkspace = null,
+  trustBusy = false,
+  trustNote = '',
+}) {
   const body = agentErrorDisplayText(text);
+  const needsTrust = isCursorTrustError({ text, code })
+    || (typeof onTrustWorkspace === 'function' && isCursorTrustError(text));
+  const title = needsTrust ? 'Workspace trust required' : 'Model error';
+  const [open, setOpen] = useState(false);
+  const showTrust = needsTrust && typeof onTrustWorkspace === 'function';
+
   return (
     <div
       className="mt-1 rounded-md border border-rose-900/70 bg-rose-950/50 px-3 py-2.5 text-sm"
       role="alert"
     >
-      <div className="flex items-start gap-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="group flex w-full max-w-full items-start gap-1.5 rounded text-left"
+        aria-expanded={open}
+        aria-label={title}
+      >
+        <Chevron open={open} className="mt-0.5 shrink-0 text-rose-400/60 group-hover:text-rose-300" />
         <StatusGlyph status="error" className="mt-0.5" />
         <div className="min-w-0 flex-1">
-          <p className="font-medium text-rose-300">Model error</p>
-          <p className="mt-1 whitespace-pre-wrap leading-relaxed text-rose-100/90">{body}</p>
+          <p className="font-medium text-rose-300">{title}</p>
+          {!open && body ? (
+            <p className="mt-0.5 line-clamp-1 whitespace-pre-wrap leading-relaxed text-rose-100/70">
+              {body}
+            </p>
+          ) : null}
         </div>
-      </div>
+      </button>
+      {open && body ? (
+        <p className="mt-1.5 ml-5 whitespace-pre-wrap leading-relaxed text-rose-100/90">{body}</p>
+      ) : null}
+      {showTrust ? (
+        <div className="mt-3 ml-5 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={trustBusy}
+            onClick={onTrustWorkspace}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {trustBusy ? 'Trusting workspace…' : 'Trust workspace'}
+          </button>
+          {trustNote ? (
+            <span className="text-xs text-rose-200/80">{trustNote}</span>
+          ) : (
+            <span className="text-xs text-rose-200/70">
+              Runs <code className="font-mono text-rose-100">agent -p --trust</code> in this repo
+            </span>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
 
-export function AssistantTurn({ msg, onApproval = null, onAsk = null, agentMaxHeight = null }) {
+export function AssistantTurn({
+  msg,
+  onApproval = null,
+  onAsk = null,
+  agentMaxHeight = null,
+  onTrustWorkspace = null,
+  trustBusy = false,
+  trustNote = '',
+}) {
   const parts = assistantParts(msg);
   const blocks = splitAtVisibleRows(parts);
   const replyText = typeof msg.text === 'string' ? msg.text : '';
@@ -338,16 +417,28 @@ export function AssistantTurn({ msg, onApproval = null, onAsk = null, agentMaxHe
         streaming={streaming && isLast}
         stopped={stopped && isLast}
         error={errored && isLast}
+        errorCode={errored && isLast ? (msg?.code || '') : ''}
         isLast={isLast}
         gate={gateOf(gateRow)}
         agentMaxHeight={agentMaxHeight}
         onApproval={onApproval}
+        onTrustWorkspace={onTrustWorkspace}
+        trustBusy={trustBusy}
+        trustNote={trustNote}
       />
     );
   });
   // Pure failure with no thinking/tools: just the error card under the user turn.
   if (errored && !parts.length) {
-    return <AgentErrorCard text={replyText} />;
+    return (
+      <AgentErrorCard
+        text={replyText}
+        code={msg?.code || ''}
+        onTrustWorkspace={onTrustWorkspace}
+        trustBusy={trustBusy}
+        trustNote={trustNote}
+      />
+    );
   }
   // Unsplit turns keep their original DOM: no wrapper around a single container.
   if (blocks.length === 1) return rendered[0];
@@ -381,10 +472,14 @@ export function AgentSegment({
   streaming = false,
   stopped = false,
   error = false,
+  errorCode = '',
   isLast = true,
   gate = null,
   agentMaxHeight = null,
   onApproval = null,
+  onTrustWorkspace = null,
+  trustBusy = false,
+  trustNote = '',
 }) {
   const groups = groupAssistantParts(parts);
   const hasProgress = parts.length > 0 || (streaming && !replyText);
@@ -464,7 +559,13 @@ export function AgentSegment({
   if (error && !hasProgress) {
     return (
       <div className="text-sm">
-        <AgentErrorCard text={replyText} />
+        <AgentErrorCard
+          text={replyText}
+          code={errorCode}
+          onTrustWorkspace={onTrustWorkspace}
+          trustBusy={trustBusy}
+          trustNote={trustNote}
+        />
       </div>
     );
   }
@@ -584,7 +685,13 @@ export function AgentSegment({
           such an interruption owns no reply at all: that exchange ended with
           the user, so it gets no footer. */}
       {error ? (
-        <AgentErrorCard text={replyText} />
+        <AgentErrorCard
+          text={replyText}
+          code={errorCode}
+          onTrustWorkspace={onTrustWorkspace}
+          trustBusy={trustBusy}
+          trustNote={trustNote}
+        />
       ) : hasReply ? (
         <div className="mt-2">
           {looksLikeMarkdown(replyText) || streaming ? (

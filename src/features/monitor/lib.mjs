@@ -50,6 +50,7 @@ import {
   normalizeAuth,
 } from '#features/auth/normalize.mjs';
 import { loadTasks, saveTasks } from '#features/chat/data/task-store.mjs';
+import { applyCursorComposerTitles } from '#extensions/cursor-adapter/composer-titles.mjs';
 import { consoleAsset, dashboardHtmlPath } from '#shared/lib/pkg.mjs';
 
 export { publicSettings } from '#features/settings/secrets.mjs';
@@ -704,6 +705,8 @@ function emptyLane(harness, sessionId) {
     key: laneKey(harness, sessionId),
     harness: harness || 'github-copilot',
     id: sessionId || null,
+    // Cursor UI-generated (or renamed) chat title when known; null otherwise.
+    title: null,
     source: null,
     active: false,
     startObserved: false,
@@ -825,6 +828,15 @@ export function defaultMonitorSettings() {
     agentAllowDenyRevertMinutes: 15,
     /** Console login gate (local password+TOTP, OIDC, or SAML). */
     auth: defaultAuthSettings(),
+    /**
+     * Live Chat (Pipecat) prefs — transport + TTS for the voice extension.
+     * The bot process is external; baseUrl overrides LIVE_CHAT_BASE_URL when set.
+     */
+    liveChat: {
+      transport: 'websocket',
+      tts: 'piper',
+      baseUrl: '',
+    },
   };
 }
 
@@ -946,6 +958,18 @@ export function approvalTimeoutMsFromSettings(settings = {}) {
   return normalizeApprovalTimeoutMinutes(settings?.agentApprovalTimeoutMinutes) * 60_000;
 }
 
+/** Live Chat prefs — keep in sync with src/features/live-chat/index.mjs. */
+function normalizeLiveChatBlock(raw = {}) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const transport = String(src.transport ?? '').trim().toLowerCase();
+  const tts = String(src.tts ?? '').trim().toLowerCase();
+  return {
+    transport: transport === 'webrtc' ? 'webrtc' : 'websocket',
+    tts: tts === 'kokoro' ? 'kokoro' : 'piper',
+    baseUrl: typeof src.baseUrl === 'string' ? src.baseUrl.trim().replace(/\/+$/, '') : '',
+  };
+}
+
 function normalizeMonitorSettings(raw = {}) {
   // Accept legacy detectGraft / enforceGraft from settings written before the rename.
   const detectTrail = (raw.detectTrail ?? raw.detectGraft) !== false;
@@ -986,6 +1010,7 @@ function normalizeMonitorSettings(raw = {}) {
     agentApprovalTimeoutMinutes: normalizeApprovalTimeoutMinutes(raw.agentApprovalTimeoutMinutes),
     agentAllowDenyRevertMinutes: normalizeAllowDenyRevertMinutes(raw.agentAllowDenyRevertMinutes),
     auth: normalizeAuth(raw.auth),
+    liveChat: normalizeLiveChatBlock(raw.liveChat),
   };
 }
 
@@ -1473,7 +1498,7 @@ function slimTodoRows(todos) {
 
 /**
  * Write each session's Task List into that session's `tasks.json` (per-session
- * folder — the prompt queue is the workspace-shared one).
+ * folder — held prompts live beside it in `queues.json`; parked stay shared).
  */
 function persistTasksSidecar(dir, state) {
   if (!dir || !state) return;
@@ -2302,29 +2327,51 @@ export function deleteSessions(dir, keys, { config, origin, nowWall = Date.now()
     const { state } = readState(dir, loaded.config, origin || 'hooks');
     const deleted = [];
     const missing = [];
+    const cleanupKeys = new Set();
     let lostFocus = false;
     for (const key of wanted) {
-      const lane = state.sessions[key];
+      // Chat provider key may differ from the monitor lane harness (e.g. chat
+      // is cursor:id while the lane was minted as kusa:id before the provider
+      // switch). Match exact key first, then any lane with the same session id.
+      let lane = state.sessions[key] || null;
+      let laneKeyFound = key;
       if (!lane) {
-        // Kusă chat sidecar may exist without a monitor lane — still remove it.
+        const id = idFromSessionKey(key);
+        if (id) {
+          const match = Object.values(state.sessions).find((row) => row?.id === id);
+          if (match) {
+            lane = match;
+            laneKeyFound = match.key;
+          }
+        }
+      }
+      if (!lane) {
+        // Session folder / chat sidecar may exist without a monitor lane.
         const chatGone = removeOrphanChat(dir, key);
-        if (chatGone) deleted.push(key);
-        else missing.push(key);
+        if (chatGone) {
+          deleted.push(key);
+          cleanupKeys.add(key);
+        } else {
+          missing.push(key);
+        }
         continue;
       }
-      if (state.focus === key) lostFocus = true;
-      delete state.sessions[key];
-      state.open = state.open.filter((inv) => inv.laneKey !== key);
-      // Explicit delete may also remove the Kusă chat sidecar.
-      if (lane.harness === 'kusa') lane._dropChat = true;
+      if (state.focus === key || state.focus === laneKeyFound) lostFocus = true;
+      delete state.sessions[laneKeyFound];
+      if (key !== laneKeyFound) delete state.sessions[key];
+      state.open = state.open.filter((inv) => inv.laneKey !== key && inv.laneKey !== laneKeyFound);
+      // Explicit delete always drops chat / attachments with the lane folder.
+      lane._dropChat = true;
       (state.pruned ||= []).push(lane);
       deleted.push(key);
+      cleanupKeys.add(key);
+      cleanupKeys.add(laneKeyFound);
     }
     // A session owns its Task List rows and its Settings sidecar as well: drop
     // them with it, before persist re-reads tasks.json, so neither can orphan a
     // session the dashboard no longer lists.
-    dropTaskRows(dir, deleted);
-    for (const key of deleted) removeSessionConfig(dir, key);
+    dropTaskRows(dir, [...cleanupKeys]);
+    for (const key of cleanupKeys) removeSessionConfig(dir, key);
     if (lostFocus || (state.focus && !state.sessions[state.focus])) {
       const remaining = Object.values(state.sessions)
         .sort((a, b) => (b.lastEventAtWall ?? 0) - (a.lastEventAtWall ?? 0));
@@ -2337,31 +2384,44 @@ export function deleteSessions(dir, keys, { config, origin, nowWall = Date.now()
   });
 }
 
-/** Best-effort remove of a Kusă session folder when no lane record exists. */
+/** `harness:id` → id. Empty when the key is not that shape. */
+function idFromSessionKey(key) {
+  const text = String(key || '');
+  const i = text.indexOf(':');
+  if (i <= 0 || i === text.length - 1) return '';
+  return text.slice(i + 1);
+}
+
+/** Best-effort remove of a session folder when no lane record exists. */
 function removeOrphanChat(dir, key) {
   const text = String(key || '');
-  if (!text.startsWith('kusa:')) return false;
-  const id = text.slice('kusa:'.length);
+  const i = text.indexOf(':');
+  if (i <= 0) return false;
+  const harness = text.slice(0, i) || 'kusa';
+  const id = text.slice(i + 1);
   if (!id) return false;
-  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id });
-  const had = existsSync(files.dir) || existsSync(files.chat) || existsSync(files.config);
+  const files = migrateFlatSessionFiles(dir, { harness, id });
+  const had = existsSync(files.dir) || existsSync(files.chat) || existsSync(files.config)
+    || existsSync(files.json) || existsSync(files.events);
   if (!had) return false;
-  removeSessionFiles(dir, { harness: 'kusa', id }, { dropChat: true });
+  removeSessionFiles(dir, { harness, id }, { dropChat: true });
   return true;
 }
 
 /**
- * Best-effort remove of a Kusă Settings sidecar. A deleted chat must not leave
+ * Best-effort remove of a Settings sidecar. A deleted chat must not leave
  * its composer picks behind: the id could otherwise be reused with a Rule the
  * user made in a chat they already threw away. When the rest of the session
  * folder is still present (lane / chat), only the config file is dropped.
  */
 function removeSessionConfig(dir, key) {
   const text = String(key || '');
-  if (!text.startsWith('kusa:')) return false;
-  const id = text.slice('kusa:'.length);
+  const i = text.indexOf(':');
+  if (i <= 0) return false;
+  const harness = text.slice(0, i) || 'kusa';
+  const id = text.slice(i + 1);
   if (!id) return false;
-  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id });
+  const files = migrateFlatSessionFiles(dir, { harness, id });
   try {
     unlinkSync(files.config);
     return true;
@@ -2380,6 +2440,8 @@ function dropTaskRows(dir, keys) {
   const wanted = new Set((Array.isArray(keys) ? keys : [])
     .map((key) => String(key || '').trim()).filter(Boolean));
   if (!dir || !wanted.size) return;
+  // Chat/lane harness can disagree for the same id — drop either key shape.
+  const wantedIds = new Set([...wanted].map(idFromSessionKey).filter(Boolean));
   let stored = {};
   try {
     stored = loadTasks(dir);
@@ -2388,7 +2450,8 @@ function dropTaskRows(dir, keys) {
   }
   let dropped = false;
   for (const key of Object.keys(stored)) {
-    if (!wanted.has(key)) continue;
+    const id = idFromSessionKey(key);
+    if (!wanted.has(key) && !(id && wantedIds.has(id))) continue;
     delete stored[key];
     dropped = true;
   }
@@ -2407,6 +2470,25 @@ function dropTaskRows(dir, keys) {
  * current lane. The previous lane of that harness is kept, so the dashboard can
  * list every session the hooks have seen.
  */
+/** Composer modes Cursor puts on real chat sessionStart (vs ephemeral CLI runs). */
+function isComposerSessionStart(event) {
+  if (event?.name !== 'sessionStart') return false;
+  const src = String(event.source || '').toLowerCase();
+  return src === 'agent' || src === 'ask' || src === 'edit' || src === 'new' || src === 'startup';
+}
+
+/**
+ * Whether this event should move dashboard focus. Ephemeral Cursor runs
+ * (CLI probes, tool-only blips) used to steal focus from the chat you were
+ * watching every time they fired a hook.
+ */
+function shouldTakeFocus(state, event, key) {
+  if (!state.focus || state.focus === key) return true;
+  if (event.name === 'userPromptSubmitted') return true;
+  if (isComposerSessionStart(event)) return true;
+  return false;
+}
+
 function bindLane(state, event, clocks) {
   const harness = event.harness || 'github-copilot';
   if (!state.sessions || typeof state.sessions !== 'object' || Array.isArray(state.sessions)) state.sessions = {};
@@ -2422,16 +2504,104 @@ function bindLane(state, event, clocks) {
     lane.bootId = clocks.bootId || '';
     state.sessions[key] = lane;
   }
+  // Keep per-harness "current" for routing, but do not let noise steal focus.
   state.current[harness] = key;
-  state.focus = key;
+  if (shouldTakeFocus(state, event, key)) state.focus = key;
   state.session = lane;
   syncAliases(state);
   pruneLanes(state, harness);
 }
 
+/** Resolve the lane key an event would bind to, without creating a lane. */
+function eventLaneKey(state, event) {
+  const harness = event.harness || 'github-copilot';
+  if (event.sessionId) return laneKey(harness, event.sessionId);
+  return state.current?.[harness] || null;
+}
+
+/**
+ * A real chat has a user prompt. Tool-only Cursor blips (CLI `-p` probes,
+ * short-lived agent runs that never received beforeSubmitPrompt) must not
+ * linger in the sidebar after sessionEnd — tools alone are not enough.
+ */
+export function laneHasUserPrompt(lane) {
+  if (!lane) return false;
+  if ((lane.promptIndex || 0) > 0) return true;
+  return Array.isArray(lane.prompts) && lane.prompts.length > 0;
+}
+
+/**
+ * Cursor fires hooks for CLI probes and short tool-only runs that are not
+ * chats. Hide those from the sidebar until a user prompt arrives. Other
+ * harnesses (Kusă explicit create, Copilot) still list on sessionStart.
+ * Shared by monitor `buildView` and chat `listChatSessions` so Agents cannot
+ * resurrect prompt-less Cursor ghosts via lane hydration.
+ */
+export function laneListedInSidebar(lane) {
+  if (!lane?.id) return false;
+  if (lane.harness === 'cursor') return laneHasUserPrompt(lane);
+  return true;
+}
+
+/** Tool-only / prompt-less Cursor noise — observe in memory, never leave files. */
+export function isEphemeralCursorLane(lane) {
+  return Boolean(lane?.id && lane.harness === 'cursor' && !laneHasUserPrompt(lane));
+}
+
+/**
+ * Drop prompt-less Cursor lanes from memory once the turn/session has ended
+ * (sessionEnd, agentStop leftovers, or inactive). Files are scrubbed separately
+ * on persist/load so active mid-flight blips never stick on disk either.
+ */
+function prunePromptlessEndedCursorLanes(state) {
+  const victims = Object.values(state.sessions || {}).filter((lane) => (
+    isEphemeralCursorLane(lane)
+    && (
+      lane.active === false
+      || lane.endedAtWall != null
+      || lane.lastEventName === 'agentStop'
+      || lane.lastEventName === 'sessionEnd'
+    )
+  ));
+  for (const lane of victims) dropLane(state, lane.key);
+  return victims.length;
+}
+
+/** Drop a lane from in-memory state (files go via state.pruned on persist). */
+function dropLane(state, key) {
+  const lane = state.sessions?.[key];
+  if (!lane) return false;
+  delete state.sessions[key];
+  state.open = (state.open || []).filter((inv) => inv.laneKey !== key);
+  (state.pruned ||= []).push(lane);
+  if (state.current?.[lane.harness] === key) {
+    const next = Object.values(state.sessions)
+      .filter((row) => row.harness === lane.harness)
+      .sort((a, b) => (b.lastEventAtWall ?? 0) - (a.lastEventAtWall ?? 0))[0];
+    state.current[lane.harness] = next?.key || null;
+  }
+  if (state.focus === key) {
+    const remaining = Object.values(state.sessions)
+      .sort((a, b) => (b.lastEventAtWall ?? 0) - (a.lastEventAtWall ?? 0));
+    state.focus = remaining[0]?.key || null;
+  }
+  if (state.focus && state.sessions[state.focus]) {
+    state.session = state.sessions[state.focus];
+  } else {
+    state.session = emptyLane(lane.harness, null);
+    state.focus = null;
+  }
+  syncAliases(state);
+  return true;
+}
+
 function matchOpen(state, event) {
+  // Match against the lane receiving this event (state.session), not dashboard
+  // focus — background Cursor runs no longer steal focus, but their tools must
+  // still correlate on their own lane.
+  const laneNow = state.session?.key || state.focus;
   const sameAgent = (inv) => (inv.agentId || '') === (event.agentId || '')
-    && (inv.laneKey || state.focus) === state.focus;
+    && (inv.laneKey || laneNow) === laneNow;
   if (event.callId) {
     const index = state.open.findIndex((inv) => inv.callId === event.callId && sameAgent(inv));
     if (index >= 0) return { index, correlation: 'call-id' };
@@ -2653,6 +2823,66 @@ function applyCopilotEvent(state, event, clocks) {
   }
   state.seen.push(event.dedupKey);
   if (state.seen.length > 300) state.seen.splice(0, state.seen.length - 300);
+
+  // sessionEnd must never invent a sidebar row. Cursor fires it when a
+  // composer is closed/deleted — including chats this monitor never saw.
+  // Creating a lane here is what made "delete in Cursor → new row in Kusa".
+  if (event.name === 'sessionEnd') {
+    const key = eventLaneKey(state, event);
+    const existing = key ? state.sessions?.[key] : null;
+    if (!existing) {
+      recompute(state);
+      return;
+    }
+    // Cursor with no user prompt → ephemeral noise (delete, CLI probe,
+    // tool-only blip). Drop instead of listing an ended ghost.
+    if (existing.harness === 'cursor' && !laneHasUserPrompt(existing)) {
+      dropLane(state, key);
+      recompute(state);
+      return;
+    }
+    bindLane(state, event, clocks);
+    state.session.lastEventAtWall = event.wall;
+    state.session.lastEventName = event.name;
+    if (event.transcriptPath) state.session.transcriptPath = event.transcriptPath;
+    state.session.active = false;
+    state.session.endedAtWall = event.wall;
+    state.session.endReason = event.reason || 'unknown';
+    state.session.turnOpen = false;
+    closeOpenPrompt(state.session, event.wall);
+    pushRecent(state, {
+      atWall: event.wall,
+      event: 'sessionEnd',
+      toolName: '',
+      invocationId: '',
+      durationMs: null,
+      durationSource: '',
+      correlation: 'n/a',
+      outcome: state.session.endReason,
+    }, maxEvents);
+    closeOpenAsIncomplete(state, event, clocks, () => true, 'incomplete-at-session-end');
+    // Leaving focus on an ended chat is useless — jump to another listed lane.
+    if (state.focus === key) {
+      const others = Object.values(state.sessions || {}).filter((lane) => lane.key !== key);
+      const next = others
+        .filter((lane) => laneListedInSidebar(lane) && lane.active !== false && lane.endedAtWall == null)
+        .sort((a, b) => (b.lastEventAtWall ?? 0) - (a.lastEventAtWall ?? 0))[0]
+        || others
+          .filter((lane) => laneListedInSidebar(lane))
+          .sort((a, b) => sessionRankAt(b) - sessionRankAt(a))[0]
+        || others[0]
+        || null;
+      if (next) {
+        state.focus = next.key;
+        state.session = next;
+        syncAliases(state);
+      }
+    }
+    checkThresholds(state, clocks);
+    recompute(state);
+    return;
+  }
+
   bindLane(state, event, clocks);
 
   if (event.name === 'sessionStart') {
@@ -2679,25 +2909,6 @@ function applyCopilotEvent(state, event, clocks) {
   state.session.lastEventAtWall = event.wall;
   state.session.lastEventName = event.name;
   if (event.transcriptPath) state.session.transcriptPath = event.transcriptPath;
-
-  if (event.name === 'sessionEnd') {
-    state.session.active = false;
-    state.session.endedAtWall = event.wall;
-    state.session.endReason = event.reason || 'unknown';
-    state.session.turnOpen = false;
-    closeOpenPrompt(state.session, event.wall);
-    pushRecent(state, {
-      atWall: event.wall,
-      event: 'sessionEnd',
-      toolName: '',
-      invocationId: '',
-      durationMs: null,
-      durationSource: '',
-      correlation: 'n/a',
-      outcome: state.session.endReason,
-    }, maxEvents);
-    closeOpenAsIncomplete(state, event, clocks, () => true, 'incomplete-at-session-end');
-  }
 
   if (event.name === 'userPromptSubmitted') {
     closeOpenPrompt(state.session, event.wall);
@@ -2853,6 +3064,11 @@ function applyCopilotEvent(state, event, clocks) {
       correlation: 'n/a',
       outcome: event.stopReason || 'end_turn',
     }, maxEvents);
+    // CLI probes / tool-only Cursor runs often stop without sessionEnd — drop
+    // them here so they cannot linger as active ghosts in memory or on disk.
+    if (isEphemeralCursorLane(state.session)) {
+      dropLane(state, state.session.key);
+    }
   }
 
   // Reply text + token fields — does not close the turn (stop / agentStop does that).
@@ -2971,33 +3187,38 @@ function applyCopilotEvent(state, event, clocks) {
  *
  *   index.json                        shared state: focus, current lane per harness,
  *                                     in-flight calls, dedup keys, monitoring errors
- *   <harness>/<session>/              one folder per session (all related files)
- *     <session>.json                  counters, tools, warnings
+ *   sessions/<session>/               one folder per session (all related files)
+ *     <session>.json                  counters, tools, warnings (harness in the JSON)
  *     <session>.events.jsonl          that session's recent event metadata
- *     <session>.chat.json             Kusă transcript (kusa harness only)
- *     session.json                    Kusă composer picks (kusa harness only)
+ *     <session>.chat.json             chat transcript sidecar
+ *     session.json                    composer Mode / Rule / Model picks
  *     tasks.json                      that session's Task List (plan/todo rows)
+ *     queues.json                     that session's held/steering composer prompts
  *     attachments/                    files attached to messages in this session
  *     sub-sessions/                   reserved for nested sub-sessions (later)
+ *   queues.json                       workspace-shared parked (paused) prompts only
  *   dashboard.{md,html,css}, monitor-data.js   derived views, rewritten on every event
  *
- * <harness> is the fixed harness id (github-copilot, vscode-local, cursor, kusa);
- * <session> is the session id when it is already a safe file name, otherwise a hash
- * of it. Flat pre-folder files (`<harness>/<session>.json`) are migrated into the
- * session folder on the next read or write that touches them.
+ * Provider/harness is a field on the session record (and in lane keys), not a
+ * disk folder. Older trees under `<harness>/<session>/` and shared
+ * `kusa/queues.json` are migrated into this layout on the next read/write.
  */
 
 const SAFE_NAME = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const EVENTS_SUFFIX = '.events.jsonl';
 const ATTACHMENTS_DIR = 'attachments';
 const SUB_SESSIONS_DIR = 'sub-sessions';
+/** Shared folder for every session under the data dir. */
+export const SESSIONS_DIR = 'sessions';
+/** Top-level data dirs that are not old per-harness session parents. */
+const RESERVED_DATA_DIRS = new Set([SESSIONS_DIR, 'skills']);
 /** Composer picks for a Kusă session — lives inside the session folder. */
 const SESSION_CONFIG_FILE = 'session.json';
 const LANE_ALIASES = ['session', 'tools', 'recent', 'warnings', 'subagents', 'agentErrors', 'attemptTimes', 'repeatWarnedAt', 'summary'];
 /**
- * Shared sidecars that live under a harness root, not inside a session folder.
- * `queues.json` is workspace-shared. Legacy shared `tasks.json` may still sit
- * here until the task store migrates it into each session folder.
+ * Shared sidecars that may still sit under a legacy harness root (`kusa/`)
+ * until migration moves parked queues to `<dataDir>/queues.json` and per-session
+ * tasks into each session folder.
  */
 const HARNESS_ROOT_FILES = new Set(['tasks.json', 'queues.json']);
 
@@ -3008,7 +3229,12 @@ export function sessionFileStem(sessionId) {
   return `h-${createHash('sha256').update(id).digest('hex').slice(0, 16)}`;
 }
 
-/** Folder for one harness under the data dir. */
+/** Absolute `<dataDir>/sessions` root. */
+export function sessionsRoot(dir) {
+  return join(dir, SESSIONS_DIR);
+}
+
+/** Legacy folder for one harness under the data dir (pre-shared-sessions layout). */
 function harnessDir(dir, harness) {
   const name = String(harness || 'github-copilot');
   return join(dir, SAFE_NAME.test(name) ? name : sessionFileStem(name));
@@ -3016,18 +3242,19 @@ function harnessDir(dir, harness) {
 
 /**
  * Absolute folder that owns every file for one session:
- * `<dataDir>/<harness>/<stem>/`.
+ * `<dataDir>/sessions/<stem>/`.
  */
 export function sessionDir(dir, lane) {
   const stem = sessionFileStem(lane?.id);
-  return join(harnessDir(dir, lane?.harness), stem);
+  return join(sessionsRoot(dir), stem);
 }
 
 /**
- * `{ dir, json, events, chat, config, tasks, attachments, subSessions }` paths
- * for a lane. Everything for one session lives under `dir`; `attachments` holds
- * composer files; `tasks` is that session's Task List; `subSessions` is reserved
- * for nested sub-sessions later.
+ * `{ dir, json, events, chat, config, tasks, queues, attachments, subSessions }`
+ * paths for a lane. Everything for one session lives under `dir`; `attachments`
+ * holds composer files; `tasks` is that session's Task List; `queues` is that
+ * session's held/steering prompts (parked prompts stay in the shared
+ * `queues.json`); `subSessions` is reserved for nested sub-sessions later.
  */
 export function laneFiles(dir, lane) {
   const stem = sessionFileStem(lane.id);
@@ -3039,6 +3266,7 @@ export function laneFiles(dir, lane) {
     chat: join(folder, `${stem}.chat.json`),
     config: join(folder, SESSION_CONFIG_FILE),
     tasks: join(folder, 'tasks.json'),
+    queues: join(folder, 'queues.json'),
     attachments: join(folder, ATTACHMENTS_DIR),
     subSessions: join(folder, SUB_SESSIONS_DIR),
   };
@@ -3054,23 +3282,35 @@ export function ensureSessionDirs(files) {
 }
 
 /**
- * Move flat pre-folder session files into the session-named folder when they
- * still sit beside each other under the harness root. Idempotent: a folder that
- * already holds the lane record is left alone, and a missing flat file is fine.
- * Always ensures `attachments/` and `sub-sessions/` exist once the session
- * folder is in play.
+ * Move a legacy `<harness>/<stem>/` folder (or flat files beside it) into
+ * `sessions/<stem>/`. Idempotent. Always ensures `attachments/` and
+ * `sub-sessions/` exist once the session folder is in play.
  */
 export function migrateFlatSessionFiles(dir, lane) {
   if (!dir || !lane?.id) return laneFiles(dir, lane);
   const stem = sessionFileStem(lane.id);
-  const harness = harnessDir(dir, lane.harness);
+  const oldHarness = harnessDir(dir, lane.harness);
+  const oldFolder = join(oldHarness, stem);
   const files = laneFiles(dir, lane);
+
+  // Whole session folder under the old harness root → sessions/<stem>/.
+  if (existsSync(oldFolder) && oldFolder !== files.dir) {
+    mkdirSync(sessionsRoot(dir), { recursive: true });
+    if (!existsSync(files.dir)) {
+      try {
+        renameSync(oldFolder, files.dir);
+      } catch {
+        /* leave it; flat-file pass / next write still targets sessions/ */
+      }
+    }
+  }
+
   const flat = {
-    json: join(harness, `${stem}.json`),
-    events: join(harness, `${stem}${EVENTS_SUFFIX}`),
-    chat: join(harness, `${stem}.chat.json`),
+    json: join(oldHarness, `${stem}.json`),
+    events: join(oldHarness, `${stem}${EVENTS_SUFFIX}`),
+    chat: join(oldHarness, `${stem}.chat.json`),
     // Pre-folder settings sidecar, and the short-lived in-folder stem name.
-    config: join(harness, `${stem}.session.json`),
+    config: join(oldHarness, `${stem}.session.json`),
   };
   const legacyInFolderConfig = join(files.dir, `${stem}.session.json`);
   const anyFlat = Object.values(flat).some((path) => existsSync(path))
@@ -3088,12 +3328,9 @@ export function migrateFlatSessionFiles(dir, lane) {
           /* leave the flat file; the next write recreates under the folder */
         }
       } else if (from !== to) {
-        // Folder already has the canonical file — drop the flat leftover so a
-        // session cannot keep two copies of its config / lane.
         try { unlinkSync(from); } catch { /* ignore */ }
       }
     }
-    // Rename `<stem>.session.json` inside the folder → `session.json`.
     if (existsSync(legacyInFolderConfig) && legacyInFolderConfig !== files.config) {
       if (!existsSync(files.config)) {
         try {
@@ -3106,8 +3343,6 @@ export function migrateFlatSessionFiles(dir, lane) {
       }
     }
   }
-  // Folder already in play (lane, chat, config, or a prior write) — keep
-  // reserved subfolders present even when there was nothing flat to migrate.
   if (
     existsSync(files.json)
     || existsSync(files.chat)
@@ -3118,6 +3353,57 @@ export function migrateFlatSessionFiles(dir, lane) {
     return ensureSessionDirs(files);
   }
   return files;
+}
+
+/**
+ * One-shot layout upgrade: move every legacy `<harness>/<stem>/` tree into
+ * `sessions/<stem>/`, and hoist shared parked queues / legacy tasks to the
+ * data-dir root. Safe to call on every boot.
+ */
+export function migrateHarnessSessionsToShared(dir) {
+  if (!dir || !existsSync(dir)) return;
+
+  const legacySharedQueues = join(dir, 'kusa', 'queues.json');
+  const sharedQueues = join(dir, 'queues.json');
+  if (existsSync(legacySharedQueues) && !existsSync(sharedQueues)) {
+    try { renameSync(legacySharedQueues, sharedQueues); } catch { /* ignore */ }
+  }
+  const legacySharedTasks = join(dir, 'kusa', 'tasks.json');
+  const sharedTasks = join(dir, 'tasks.json');
+  if (existsSync(legacySharedTasks) && !existsSync(sharedTasks)) {
+    try { renameSync(legacySharedTasks, sharedTasks); } catch { /* ignore */ }
+  }
+
+  mkdirSync(sessionsRoot(dir), { recursive: true });
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.') || RESERVED_DATA_DIRS.has(entry.name)) continue;
+    const harnessName = entry.name;
+    const harnessFolder = join(dir, harnessName);
+    let children = [];
+    try { children = readdirSync(harnessFolder, { withFileTypes: true }); } catch { continue; }
+    for (const child of children) {
+      if (child.isDirectory()) {
+        const stem = child.name;
+        migrateFlatSessionFiles(dir, { harness: harnessName, id: stem });
+        continue;
+      }
+      if (!child.isFile()) continue;
+      const name = child.name;
+      if (HARNESS_ROOT_FILES.has(name)) continue;
+      if (!name.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(name)) continue;
+      if (name.endsWith('.chat.json') || name.endsWith('.session.json') || name.endsWith(EVENTS_SUFFIX)) continue;
+      const stem = name.slice(0, -'.json'.length);
+      if (!stem) continue;
+      migrateFlatSessionFiles(dir, { harness: harnessName, id: stem });
+    }
+    // Drop an emptied legacy harness folder (ignore if anything remains).
+    try {
+      const left = readdirSync(harnessFolder);
+      if (!left.length) rmSync(harnessFolder, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  }
 }
 
 /** Best-effort remove of an entire session folder (and any leftover flat files). */
@@ -3131,21 +3417,28 @@ export function removeSessionFiles(dir, lane, { dropChat = true } = {}) {
   } catch {
     /* already gone */
   }
-  // Flat leftovers from a half-migrated install.
+  // Flat / old-harness leftovers from a half-migrated install.
   const flatPaths = [
     join(harness, `${stem}.json`),
     join(harness, `${stem}${EVENTS_SUFFIX}`),
+    join(harness, stem, `${stem}.json`),
+    join(harness, stem, `${stem}${EVENTS_SUFFIX}`),
   ];
   if (dropChat) {
     flatPaths.push(
       join(harness, `${stem}.chat.json`),
       join(harness, `${stem}.session.json`),
       join(harness, SESSION_CONFIG_FILE),
+      join(harness, stem, `${stem}.chat.json`),
+      join(harness, stem, SESSION_CONFIG_FILE),
     );
   }
   for (const path of flatPaths) {
     try { unlinkSync(path); } catch { /* missing is fine */ }
   }
+  try {
+    rmSync(join(harness, stem), { recursive: true, force: true });
+  } catch { /* ignore */ }
 }
 
 /** Fill a lane read from disk with the fields the current code expects. */
@@ -3274,6 +3567,10 @@ function readState(dir, config, origin) {
   const legacy = readLegacyState(dir, config, origin);
   if (legacy) return legacy;
 
+  // Promote legacy <harness>/<stem>/ trees into sessions/<stem>/ first so the
+  // scan below only has to walk the shared folder (plus any stubborn leftovers).
+  try { migrateHarnessSessionsToShared(dir); } catch { /* best-effort */ }
+
   const indexPath = join(dir, 'index.json');
   let state = emptyState(config, origin);
   let corrupted = false;
@@ -3289,32 +3586,58 @@ function readState(dir, config, origin) {
   }
   for (const alias of LANE_ALIASES) delete state[alias];
 
-  // Every session lane lives under <harness>/<session>/<session>.json (folder
-  // layout). Flat pre-folder files (<harness>/<session>.json) are still read and
-  // migrated into the session folder. Folder and file names are not trusted; the
-  // harness and id come from the record itself.
+  // Every session lane lives under sessions/<session>/<session>.json. Folder and
+  // file names are not trusted; the harness and id come from the record itself.
+  const loadLaneFile = (path, label) => {
+    try {
+      const lane = normalizeLane(readJsonFile(path));
+      if (!lane) throw new Error('unexpected shape');
+      state.sessions[lane.key] = lane;
+    } catch {
+      setAside(path, '.corrupt');
+      corrupted = true;
+      noteError(state, `session file ${label} was corrupt and was set aside`, Date.now());
+    }
+  };
+
+  const sessionsFolder = sessionsRoot(dir);
+  let sessionEntries = [];
+  try { sessionEntries = readdirSync(sessionsFolder, { withFileTypes: true }); } catch { /* none yet */ }
+  for (const child of sessionEntries) {
+    if (!child.isDirectory()) continue;
+    const sessionFolder = join(sessionsFolder, child.name);
+    let sessionFiles = [];
+    try { sessionFiles = readdirSync(sessionFolder); } catch { continue; }
+    for (const file of sessionFiles) {
+      if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
+      if (file.endsWith('.chat.json') || file.endsWith('.session.json')) continue;
+      if (file === 'tasks.json' || file === 'queues.json' || file === SESSION_CONFIG_FILE) continue;
+      loadLaneFile(join(sessionFolder, file), `${SESSIONS_DIR}/${child.name}/${file}`);
+    }
+  }
+
+  // Leftover legacy harness folders (migration failed mid-way) — still read them.
   let entries = [];
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { /* no data yet */ }
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    if (!entry.isDirectory() || entry.name.startsWith('.') || RESERVED_DATA_DIRS.has(entry.name)) continue;
     const harnessFolder = join(dir, entry.name);
     let children = [];
     try { children = readdirSync(harnessFolder, { withFileTypes: true }); } catch { continue; }
     for (const child of children) {
       if (child.isDirectory()) {
-        // Session-named folder: look for its lane record inside.
         const sessionFolder = join(harnessFolder, child.name);
         let sessionFiles = [];
         try { sessionFiles = readdirSync(sessionFolder); } catch { continue; }
         for (const file of sessionFiles) {
           if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
           if (file.endsWith('.chat.json') || file.endsWith('.session.json')) continue;
-          // Task List / composer picks — not lane records.
-          if (file === 'tasks.json' || file === SESSION_CONFIG_FILE) continue;
+          if (file === 'tasks.json' || file === 'queues.json' || file === SESSION_CONFIG_FILE) continue;
           const path = join(sessionFolder, file);
           try {
             const lane = normalizeLane(readJsonFile(path));
             if (!lane) throw new Error('unexpected shape');
+            migrateFlatSessionFiles(dir, lane);
             state.sessions[lane.key] = lane;
           } catch {
             setAside(path, '.corrupt');
@@ -3327,16 +3650,12 @@ function readState(dir, config, origin) {
       if (!child.isFile()) continue;
       const file = child.name;
       if (!file.endsWith('.json') || /\.(corrupt|legacy)\.json$/.test(file)) continue;
-      // Kusă chat / settings sidecars are not lanes.
       if (file.endsWith('.chat.json') || file.endsWith('.session.json')) continue;
-      // Shared sidecars under the kusa harness folder (not session lanes).
       if (HARNESS_ROOT_FILES.has(file)) continue;
       const path = join(harnessFolder, file);
       try {
         const lane = normalizeLane(readJsonFile(path));
         if (!lane) throw new Error('unexpected shape');
-        // Promote flat files into the session folder so the next persist writes
-        // only under the new layout.
         migrateFlatSessionFiles(dir, lane);
         state.sessions[lane.key] = lane;
       } catch {
@@ -3348,6 +3667,13 @@ function readState(dir, config, origin) {
   }
   // Overlay per-session Task Lists from each session's tasks.json (newer wins).
   hydrateTasksFromSidecar(dir, state);
+  // Prompt-less Cursor blips left on disk from older builds — drop them on
+  // load so Agents / chat hydration cannot resurrect empty ghosts.
+  for (const lane of Object.values(state.sessions || {})) {
+    if (!isEphemeralCursorLane(lane)) continue;
+    delete state.sessions[lane.key];
+    try { removeSessionFiles(dir, lane, { dropChat: true }); } catch { /* ignore */ }
+  }
   return { state: finishState(state), corrupted };
 }
 
@@ -3360,15 +3686,24 @@ function persist(dir, state) {
   // Secrets stay in settings.json (encrypted); index only gets the public view.
   index.settings = publicSettings(state.settings || defaultMonitorSettings());
   index.sessionFiles = {};
+  // Mirror Cursor UI titles onto cursor lanes before we write them, so a
+  // generated name sticks in the lane JSON once it appears in the IDE.
+  applyCursorComposerTitles(Object.values(state.sessions || {}));
   for (const lane of Object.values(state.sessions)) {
     syncPlanTodos(lane);
     syncTrailSavings(lane);
     syncPromptRoles(lane);
     syncPlansOntoPrompts(lane);
   }
-  // Per-session Task List sidecar (prompt queue is the workspace-shared one).
+  // Per-session Task List sidecar (held prompts sit beside it in queues.json).
   persistTasksSidecar(dir, state);
   for (const lane of Object.values(state.sessions)) {
+    // Tool-only Cursor noise stays in memory for the running process only —
+    // never write lane/events files, and scrub any leftover folder from disk.
+    if (isEphemeralCursorLane(lane)) {
+      try { removeSessionFiles(dir, lane, { dropChat: true }); } catch { /* ignore */ }
+      continue;
+    }
     // Promote any leftover flat files before writing so we never leave a
     // second copy beside the session folder, and keep attachments/ +
     // sub-sessions/ present for later use.
@@ -3395,9 +3730,8 @@ function persist(dir, state) {
     }
   }
   state.pruned = [];
-  // Written in place on purpose: VS Code's Markdown preview tab refreshes on a
-  // file *change* event, and a rename over the path is reported as a create.
-  writeFileSync(join(dir, 'dashboard.md'), renderMarkdown(state), { mode: 0o600 });
+  // Drop the old in-editor markdown snapshot if a prior version left one behind.
+  try { unlinkSync(join(dir, 'dashboard.md')); } catch { /* already gone */ }
   atomicWrite(join(dir, 'dashboard.html'), renderHtml(state));
   atomicWrite(join(dir, 'monitor-data.js'), renderDataScript(state));
   // The runtime page links dashboard.css / dashboard.js / favicon.svg next to itself; keep copies fresh.
@@ -4023,6 +4357,7 @@ export function refreshMonitorArtifacts(dir, { config, origin = 'hooks', nowWall
   return withLock(dir, () => {
     const loaded = loadThresholds(dir, config);
     const { state } = readState(dir, loaded.config, origin);
+    prunePromptlessEndedCursorLanes(state);
     state.generatedAtWall = nowWall;
     recompute(state);
     persist(dir, state);
@@ -4084,6 +4419,7 @@ export function runHook({
       try { recompute(state); } catch { /* keep the previous summary */ }
       void err;
     }
+    prunePromptlessEndedCursorLanes(state);
     state.generatedAtWall = clocks.wall;
     if (corrupted) noteError(state, 'recovered after a corrupt state file', clocks.wall);
     persist(dir, state);
@@ -4196,232 +4532,6 @@ function qualityNotes(state, lane = state.session) {
   }
   if (!state.liveSessionVerified) notes.push('No check in this repository has confirmed that a live agent harness fired these hooks.');
   return notes;
-}
-
-export function renderMarkdown(state) {
-  const session = state.session;
-  const summary = state.summary;
-  const elapsed = session.startedAtWall != null && state.generatedAtWall != null
-    ? (session.active ? state.generatedAtWall : session.endedAtWall ?? state.generatedAtWall) - session.startedAtWall
-    : null;
-  const promptElapsed = session.promptStartedAtWall != null && session.turnOpen && state.generatedAtWall != null
-    ? state.generatedAtWall - session.promptStartedAtWall
-    : null;
-  const idle = session.lastEventAtWall != null && state.generatedAtWall != null
-    ? state.generatedAtWall - session.lastEventAtWall
-    : null;
-  const lines = [
-    '# Kusă Console',
-    '',
-    state.origin === 'synthetic-demo'
-      ? 'Synthetic demonstration data. This is not a live agent session.'
-      : 'Figures below are hook and/or Copilot SDK session-listener events from connected agent harnesses, recorded in this folder. A live session has not been verified here.',
-    '',
-    `Snapshot written at ${state.generatedAtWall ? new Date(state.generatedAtWall).toLocaleTimeString() : '—'}. This view refreshes only when a hook or SDK event rewrites it; it has no ticking timer. For a live timer run \`kusa serve\` and open the dashboard in a browser.`,
-    '',
-    '## SDK listener',
-    '',
-    (() => {
-      const L = state.sdkListener || emptySdkListener();
-      return `- Status: **${L.status || 'idle'}**${L.target ? ` · target \`${L.target}\`` : ''}${L.sessionId ? ` · session \`${L.sessionId}\`` : ''}${L.lastEventType ? ` · last \`${L.lastEventType}\`` : ''}${L.detail ? ` — ${L.detail}` : ''}`;
-    })(),
-    '',
-    '## Sessions',
-    '',
-  ];
-  const statusMark = { busy: '●', thinking: '◐', idle: '○', ended: '◌' };
-  // Same order as the sidebar tree: a row only moves at session start/end, and
-  // the same rows — an id-less bucket has no name to print, so it stays out.
-  for (const lane of Object.values(state.sessions || {}).sort((a, b) => sessionRankAt(b) - sessionRankAt(a))) {
-    if (!lane.id) continue;
-    const running = state.open.filter((inv) => (inv.laneKey || state.focus) === lane.key).length;
-    const status = laneStatus(lane, running);
-    const marker = lane.key === state.focus ? ' ← latest' : '';
-    lines.push(`- ${statusMark[status]} ${HARNESS_LABELS[lane.harness] || lane.harness} › \`${mdCell(lane.id)}\` · ${status} · ${lane.summary.attempts} tool calls${marker}`);
-  }
-  if (!Object.keys(state.sessions || {}).length) lines.push('None yet.');
-  lines.push(
-    '',
-    `## Latest session: ${HARNESS_LABELS[session.harness] || session.harness} › ${mdCell(session.id || '(none)')}`,
-    '',
-    `- Session: ${session.id || '(none)'} · ${session.active ? 'active' : 'inactive'} · start ${session.startObserved ? 'observed' : 'not observed'}`,
-    `- Session elapsed at last hook: ${formatDuration(elapsed)}`,
-    `- Prompt elapsed at last hook: ${session.promptIndex ? formatDuration(promptElapsed) : '—'} (prompt ${session.promptIndex})`,
-    `- Estimated idle at last hook: ${formatDuration(idle)} since \`${session.lastEventName || 'n/a'}\``,
-    `- Turn: ${session.turnOpen ? 'open (prompt submitted, agentStop not seen)' : 'not open'}`,
-    `- Notification waiting: ${session.notificationsSeen ? String(session.notificationWaiting) : 'not observed'}`,
-    `- Attempts ${summary.attempts} · running ${summary.running} · success ${summary.success} · failed ${summary.failed} · denied ${summary.denied} · distinct ${summary.distinct}`,
-    `- Subagents started ${session.subagents.started} · stopped ${session.subagents.stopped} · agent errors ${session.agentErrors} · console errors ${state.monitoringErrors.length}`,
-    session.currentIntent ? `- Current intent: ${mdCell(session.currentIntent)}` : '- Current intent: (none)',
-    session.turnStartedAtWall
-      ? `- SDK turn: ${session.currentTurnId || '—'} · started ${new Date(session.turnStartedAtWall).toISOString()}${session.turnEndedAtWall ? ` · ended ${new Date(session.turnEndedAtWall).toISOString()}` : ' · open'}`
-      : '- SDK turn: not observed',
-    session.apiCallDurationCount
-      ? `- Model API-call duration (SDK usage): avg ${formatDuration(session.apiCallDurationMsSum / session.apiCallDurationCount)} · max ${formatDuration(session.apiCallDurationMaxMs)} · n=${session.apiCallDurationCount}`
-      : '- Model API-call duration (SDK usage): not observed',
-    session.reasoning?.seen
-      ? `- Reasoning activity: seen · blocks ${session.reasoning.blocks} · ${session.reasoning.active ? 'in progress' : 'idle'} (text ${session.reasoning.textPersisted ? 'persisted' : 'not persisted'})`
-      : '- Reasoning activity: not observed',
-    '',
-    'Durations are time between observed hooks or SDK events. Model API-call duration comes only from assistant.usage. They are not hidden chain-of-thought.',
-    '',
-    '## Prompts',
-    '',
-  );
-  const prompts = session.prompts || [];
-  if (!prompts.length) {
-    lines.push('None yet.', '');
-  } else {
-    for (const prompt of prompts.slice(0, 40)) {
-      const preview = mdCell((prompt.text || '').replace(/\s+/g, ' ').slice(0, 160));
-      const more = (prompt.text || '').length > 160 || prompt.truncated ? '…' : '';
-      const trailSaved = prompt.trailSavedTokens != null ? ` · trail saved ~${prompt.trailSavedTokens}` : '';
-      const replyChars = prompt.responseChars || (prompt.response || '').length;
-      const replyNote = replyChars ? ` · reply ${replyChars} chars` : '';
-      const roleNote = prompt.role === 'plan' || prompt.role === 'system' ? prompt.role : 'user';
-      const planNote = prompt.plan?.name ? ` · plan ${mdCell(prompt.plan.name)}` : prompt.plan ? ' · plan' : '';
-      lines.push(
-        `- #${prompt.index} · ${roleNote} · ${prompt.atWall != null ? new Date(prompt.atWall).toISOString() : '—'} · ` +
-        `${prompt.open ? 'open' : formatDuration(prompt.durationMs)} · ${prompt.toolAttempts} tools · ${prompt.chars} chars${trailSaved}${replyNote}${planNote}` +
-        (preview ? ` — ${preview}${more}` : ''),
-      );
-    }
-    lines.push('');
-  }
-  lines.push('## Plan & todos', '');
-  if (session.plan) {
-    lines.push(`### ${mdCell(session.plan.name || 'Plan')}`, '');
-    if (session.plan.overview) lines.push(mdCell(session.plan.overview), '');
-    const planPreview = mdCell((session.plan.body || '').replace(/\s+/g, ' ').slice(0, 240));
-    if (planPreview) lines.push(`${planPreview}${(session.plan.body || '').length > 240 ? '…' : ''}`, '');
-  } else {
-    lines.push('No plan observed yet.', '');
-  }
-  if ((session.todos || []).length) {
-    const doneTodos = session.todos.filter((todo) => todo.status === 'completed').length;
-    lines.push(`Progress: ${doneTodos}/${session.todos.length} done`, '');
-    for (const todo of session.todos) {
-      const mark = todo.status === 'completed' ? 'x' : todo.status === 'in_progress' ? '~' : todo.status === 'cancelled' ? '-' : ' ';
-      lines.push(`- [${mark}] ${mdCell(todo.content)} (${todo.status})`);
-    }
-    lines.push('');
-  } else {
-    lines.push('No todo list yet.', '');
-  }
-  const trailReady = snapshotTrailStatus(repoRoot);
-  const trail = session.trail || emptyTrail();
-  lines.push('## Trail', '');
-  if (!trailReady.ok) {
-    lines.push(`- Not ready${trailReady.error ? `: ${mdCell(trailReady.error)}` : '.'}`);
-    for (const step of trailReady.steps) lines.push(`  1. ${mdCell(step)}`);
-    lines.push('');
-  } else {
-    lines.push(
-      `- Ready · graph present`
-        + (trail.savedTokens || trail.trailReads || trail.sourceReads
-          ? ` · tokens saved ~${trail.savedTokens} · trail reads ${trail.trailReads} · source reads ${trail.sourceReads}`
-          : ' · no session savings observed yet.'),
-      '',
-    );
-  }
-  const git = collectGitStatus(repoRoot);
-  lines.push('## Git', '');
-  if (!git.ok) {
-    lines.push(`- Not ready${git.error ? `: ${mdCell(git.error)}` : '.'}`);
-    for (const step of git.steps) lines.push(`  1. ${mdCell(step)}`);
-    lines.push('');
-  } else {
-    const track = git.upstream
-      ? `${git.upstream}${git.ahead || git.behind ? ` · ahead ${git.ahead} · behind ${git.behind}` : ''}`
-      : 'no upstream';
-    lines.push(
-      `- ${git.clean ? 'Clean' : 'Dirty'} · ${git.detached ? 'detached ' : ''}${mdCell(git.branch || '—')}`
-        + (git.head ? ` @ ${git.head}` : '')
-        + ` · ${track}`,
-    );
-    if (git.subject) lines.push(`- HEAD: ${mdCell(git.subject)}`);
-    lines.push(
-      `- Staged ${git.staged.length} · unstaged ${git.unstaged.length}`
-        + ` · untracked ${git.untracked.length} · conflicted ${git.conflicted.length}`
-        + (git.truncated ? ' (list truncated)' : ''),
-      '',
-    );
-    const showPaths = (label, rows) => {
-      if (!rows.length) return;
-      lines.push(`### ${label}`, '');
-      for (const row of rows.slice(0, 40)) {
-        lines.push(`- \`${mdCell(row.code)}\` ${mdCell(row.path)}`);
-      }
-      if (rows.length > 40) lines.push(`- … ${rows.length - 40} more`);
-      lines.push('');
-    };
-    showPaths('Conflicted', git.conflicted);
-    showPaths('Staged', git.staged);
-    showPaths('Unstaged', git.unstaged);
-    showPaths('Untracked', git.untracked);
-  }
-  const tokens = session.tokens || emptyTokens();
-  lines.push(
-    '## Token usage',
-    '',
-    tokens.turns
-      ? `- Session totals: input ${tokens.input} · output ${tokens.output} · cache read ${tokens.cacheRead} · cache write ${tokens.cacheWrite} · ${tokens.turns} turn(s)`
-      : '- No token fields observed yet (Cursor stop / afterAgentResponse only).',
-    '',
-  );
-  for (const turn of (session.tokenTurns || []).slice(0, 40)) {
-    lines.push(
-      `- prompt #${turn.promptIndex ?? '—'} · ${turn.model || 'model?'} · in ${turn.input} · out ${turn.output} · cache r/w ${turn.cacheRead}/${turn.cacheWrite}`,
-    );
-  }
-  if ((session.tokenTurns || []).length) lines.push('');
-  lines.push(
-    '| Tool | Total | Running | Success | Failed | Denied | Incomplete | Avg duration | Max | Last |',
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |',
-  );
-  const rows = flatRows(session);
-  if (!rows.length) lines.push('| (no tool calls yet) | 0 | 0 | 0 | 0 | 0 | 0 | — | — | — |');
-  for (const row of rows) {
-    const label = row.depth ? `&nbsp;&nbsp;&nbsp;↳ \`${mdCell(row.name)}\`` : mdCell(row.name);
-    lines.push(`| ${label} | ${row.total} | ${row.running} | ${row.success} | ${row.failed} | ${row.denied} | ${row.incomplete} | ${formatDuration(row.avg)} | ${formatDuration(row.max)} | ${row.last ? new Date(row.last).toISOString() : '—'} |`);
-  }
-  if (rows.some((row) => row.depth)) {
-    lines.push('', 'Indented rows are terminal commands (program name) or files (path relative to the workspace). The HTML dashboard expands a terminal name to the full command line. Other tool arguments are not recorded.');
-  }
-  lines.push('', '## In flight', '');
-  const openHere = state.open.filter((inv) => (inv.laneKey || state.focus) === session.key);
-  if (!openHere.length) lines.push('None.');
-  for (const inv of openHere) {
-    const age = invocationAge(inv, { wall: state.generatedAtWall, mono: null, bootId: inv.bootId });
-    const overdue = age != null && age >= state.config.toolDurationWarnMs;
-    lines.push(`- ${mdCell(inv.toolName)} \`${inv.id}\` age ${formatDuration(age)}${overdue ? ' · long-running' : ''} · correlation ${inv.callId ? 'call-id' : 'pending'}`);
-  }
-  lines.push('', '## Recent events', '');
-  lines.push('| When | Event | Tool | Duration | Correlation | Outcome |');
-  lines.push('| --- | --- | --- | ---: | --- | --- |');
-  for (const entry of state.recent.slice(0, 40)) {
-    lines.push(`| ${new Date(entry.atWall).toISOString()} | ${mdCell(entry.event)} | ${mdCell(entry.toolName || '')} | ${formatDuration(entry.durationMs)} | ${mdCell(entry.correlation)} | ${mdCell(entry.outcome)} |`);
-  }
-  lines.push('', '## Warnings', '');
-  if (!state.warnings.length) lines.push('None.');
-  for (const warning of state.warnings.slice(0, 30)) {
-    lines.push(`- ${new Date(warning.atWall).toISOString()} · ${warning.message}`);
-  }
-  lines.push('', '## Data quality', '');
-  for (const note of qualityNotes(state)) lines.push(`- ${note}`);
-  if (state.monitoringErrors.length) {
-    lines.push('', '## Console errors', '');
-    lines.push('These are Kusă Console failures, not agent or tool failures.');
-    for (const error of state.monitoringErrors.slice(0, 20)) {
-      lines.push(`- ${new Date(error.atWall).toISOString()} · ${error.message}`);
-    }
-  }
-  lines.push('');
-  return lines.join('\n');
-}
-
-function mdCell(value) {
-  return String(value ?? '').replace(/\|/g, '/').replace(/[\r\n]+/g, ' ');
 }
 
 function sessionView(lane) {
@@ -4609,17 +4719,23 @@ export function sessionRankAt(row) {
  * or delete, so listing it would only offer a row they can never act on.
  */
 export function buildView(state) {
+  // Keep sidebar titles in sync with Cursor UI even between hook writes.
+  applyCursorComposerTitles(Object.values(state.sessions || {}));
   const lanes = {};
   const byHarness = new Map();
   const ordered = Object.values(state.sessions || {}).sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
   for (const lane of ordered) {
     const view = laneView(state, lane);
     lanes[lane.key] = view;
-    if (!lane.id) continue; // id-less bucket — see the note above: figures only.
+    // Id-less bucket: figures only. External harness lanes without a user
+    // prompt stay out of the tree — Cursor otherwise lists every CLI probe /
+    // tool-only blip as a new session.
+    if (!laneListedInSidebar(lane)) continue;
     if (!byHarness.has(lane.harness)) byHarness.set(lane.harness, []);
     byHarness.get(lane.harness).push({
       key: lane.key,
       id: lane.id,
+      title: typeof lane.title === 'string' && lane.title.trim() ? lane.title : null,
       status: view.status,
       active: lane.active,
       turnOpen: lane.turnOpen,
@@ -4640,7 +4756,13 @@ export function buildView(state) {
     current: state.current?.[harness] || null,
     sessions,
   }));
-  const focus = (state.focus && lanes[state.focus]) || laneView(state, state.session);
+  // If focus landed on a hidden Cursor blip, prefer a listed session instead.
+  let focusKey = state.focus;
+  if (focusKey && state.sessions?.[focusKey] && !laneListedInSidebar(state.sessions[focusKey])) {
+    const listed = ordered.find((lane) => laneListedInSidebar(lane));
+    focusKey = listed?.key || null;
+  }
+  const focus = (focusKey && lanes[focusKey]) || laneView(state, state.session);
   // settings.json is authoritative; publicSettings strips secrets for the browser payload.
   const settings = publicSettings(loadMonitorSettings(defaultMonitorDir()));
   const sdkListener = state.sdkListener && typeof state.sdkListener === 'object'

@@ -56,7 +56,6 @@ self.addEventListener('fetch', (event) => {
     || url.pathname.startsWith('/learnings')
     || url.pathname.startsWith('/monitor-data')
     || url.pathname === '/index.json'
-    || url.pathname === '/dashboard.md'
     || url.pathname.includes('/rpc')
   ) {
     return;

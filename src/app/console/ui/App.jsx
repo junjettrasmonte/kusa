@@ -5,6 +5,7 @@ import { MonitorsPanel } from './shared/MonitorsPanel.jsx';
 import { SessionPanel } from './shared/SessionPanel.jsx';
 import { SettingsPanel } from './features/settings/SettingsPanel.jsx';
 import { UserPanel } from './features/user/UserPanel.jsx';
+import { ExtensionPage } from './features/extensions/ExtensionPage.jsx';
 import {
   extensionNavEntries,
   getBuiltinExtension,
@@ -20,8 +21,8 @@ import {
   HARNESS_NAMES,
   HARNESS_SUBTAB_IDS,
   HARNESS_SUBTAB_LABELS,
+  isChatSessionKey,
   isKusaKey,
-  KUSA_HARNESS,
   MONITOR_SUBTAB_IDS,
   MONITOR_SUBTAB_LABELS,
   SESSION_SUBTAB_IDS,
@@ -88,10 +89,13 @@ function initialActiveExtensionId() {
   return null;
 }
 
-/** Open an installed extension at its configured nav placement (or catalog-only). */
+/**
+ * Open an extension’s info & config page in the main pane.
+ * If it declares a Dev Tools nav placement, remember that sub-tab so the rail
+ * can return to the same panel later — catalog selection itself owns the main pane.
+ */
 function openExtension(id, {
   setActiveExtensionId,
-  setTab,
   setDevtoolsSubTab,
 }) {
   setActiveExtensionId(id);
@@ -99,7 +103,6 @@ function openExtension(id, {
   const resolved = resolveExtensionNav(ext);
   if (!resolved) return;
   if (resolved.nav.placement === 'devtools') {
-    setTab('devtools');
     setDevtoolsSubTab(resolved.nav.id || resolved.ext.id);
   }
 }
@@ -109,16 +112,17 @@ function initialSettingsSubTab() {
   if (SETTINGS_SUBTAB_IDS.includes(savedTab)) return savedTab;
   const saved = readLocal('monitor.settingsSubTab', 'agent');
   // Auth moved to the Account (user) page — stale 'auth' must not stick.
-  if (saved === 'auth') return 'agent';
+  // Playback (Follow latest) was removed — session stays until the user picks another.
+  if (saved === 'auth' || saved === 'playback') return 'agent';
   return SETTINGS_SUBTAB_IDS.includes(saved) ? saved : 'agent';
 }
 
-const KUSA_SESSIONS_KEY = 'monitor.kusaSessions';
+const CHAT_SESSIONS_KEY = 'monitor.chatSessions';
 
 /** Legacy browser-local chats (pre disk persistence). Cleared after migrate. */
 function readLegacyKusaSessions() {
   try {
-    const raw = JSON.parse(localStorage.getItem(KUSA_SESSIONS_KEY) || '[]');
+    const raw = JSON.parse(localStorage.getItem(CHAT_SESSIONS_KEY) || '[]');
     if (!Array.isArray(raw)) return [];
     return raw.filter((s) => s && typeof s === 'object' && isKusaKey(s.key) && s.id);
   } catch {
@@ -127,10 +131,10 @@ function readLegacyKusaSessions() {
 }
 
 function clearLegacyKusaSessions() {
-  try { localStorage.removeItem(KUSA_SESSIONS_KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(CHAT_SESSIONS_KEY); } catch { /* ignore */ }
 }
 
-function slimKusaSession(session) {
+function slimUiChatSession(session) {
   if (!session || !session.id) return null;
   const { live, status, ...rest } = session;
   return {
@@ -233,8 +237,8 @@ function mergeKusaSessions(prev, incoming) {
   return merged.sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
 }
 
-async function persistKusaSession(session) {
-  const slim = slimKusaSession(session);
+async function persistChatSession(session) {
+  const slim = slimUiChatSession(session);
   if (!slim) return null;
   const res = await fetch('/kusa/sessions', {
     method: 'PUT',
@@ -494,7 +498,6 @@ export default function App() {
   const [lastLoadOk, setLastLoadOk] = useState(() => (readBootstrap() ? Date.now() : 0));
   const [loadFailed, setLoadFailed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const [follow, setFollow] = useState(true);
   const [selected, setSelected] = useState(null);
   /** In-flight chat live snapshots — kept in sync when the user resolves an Approval CTA. */
   const liveSnapBySession = useRef(new Map());
@@ -534,7 +537,6 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => readLocal('monitor.sidebar', 'open') === 'collapsed',
   );
-  const [collapsedHarnesses, setCollapsedHarnesses] = useState(() => new Set());
   const [expandedTools, setExpandedTools] = useState(() => readJsonSet('monitor.expandedTools'));
   const [expandedPrompts, setExpandedPrompts] = useState(() => readJsonSet('monitor.expandedPrompts'));
   const [sessionFilter, setSessionFilter] = useState(() => {
@@ -553,7 +555,7 @@ export default function App() {
    */
   const [pendingDelete, setPendingDelete] = useState(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
-  const [kusaSessions, setKusaSessions] = useState([]);
+  const [chatSessions, setChatSessions] = useState([]);
   /**
    * Composer queue mirror, keyed by session key: { queued, steering }.
    * The monitor server owns the real queue (POST/GET /kusa/queue) so a
@@ -562,6 +564,8 @@ export default function App() {
   const [queueByKey, setQueueByKey] = useState(new Map());
   /** Live Trail/Git readiness from GET /ready (HTTP serve only). */
   const [ready, setReady] = useState(null);
+  /** Live CAO / Live Chat readiness for the Dev Tools rail badge. */
+  const [devtoolsExtReady, setDevtoolsExtReady] = useState({ cao: null, liveChat: null });
   const canDelete = typeof location !== 'undefined' && location.protocol !== 'file:';
   const canPersistSettings = canDelete;
 
@@ -589,7 +593,7 @@ export default function App() {
         }
         const queues = await fetchKusaQueues().catch(() => []);
         if (!cancelled) {
-          setKusaSessions((prev) => mergeKusaSessions(prev, sessions));
+          setChatSessions((prev) => mergeKusaSessions(prev, sessions));
           setQueueByKey(queuesToMap(queues));
         }
       } catch {
@@ -611,7 +615,7 @@ export default function App() {
           fetchKusaQueues().catch(() => null),
         ]);
         if (!cancelled) {
-          setKusaSessions((prev) => mergeKusaSessions(prev, sessions));
+          setChatSessions((prev) => mergeKusaSessions(prev, sessions));
           // Server is the queue owner — adopt its full map when the poll succeeds.
           if (queues) setQueueByKey(queuesToMap(queues));
         }
@@ -627,17 +631,17 @@ export default function App() {
 
   // After a refresh (or another tab), reattach SSE to any turn still running
   // on the server. Sessions GET overlays busy + live from the turn job map.
-  // Skip keys that sendKusaMessage already owns (liveSnap set before busy).
+  // Skip keys that sendChatMessage already owns (liveSnap set before busy).
   useEffect(() => {
     if (!canPersistSettings) return;
-    for (const session of kusaSessions) {
+    for (const session of chatSessions) {
       const busy = session.status === 'busy' || session.status === 'thinking' || session.live;
       if (!busy || !session.key) continue;
       if (attachedTurns.current.has(session.key)) continue;
       if (liveSnapBySession.current.has(session.key)) continue;
       void resumeKusaTurn(session.key);
     }
-  }, [canPersistSettings, kusaSessions]);
+  }, [canPersistSettings, chatSessions]);
 
   useEffect(() => {
     writeLocal('monitor.tab', tab);
@@ -739,48 +743,99 @@ export default function App() {
     };
   }, [canDelete, detectTrail, detectGit]);
 
+  // Dev Tools extension hosts (CAO, Live Chat) — badge the rail when any is down.
+  useEffect(() => {
+    if (!canDelete) {
+      setDevtoolsExtReady({ cao: null, liveChat: null });
+      return undefined;
+    }
+    let cancelled = false;
+    async function checkExt() {
+      const next = { cao: null, liveChat: null };
+      try {
+        const res = await fetch('/cao', { headers: { Accept: 'application/json' } });
+        if (res.ok) next.cao = await res.json();
+      } catch { /* ignore */ }
+      try {
+        const res = await fetch('/live-chat', { headers: { Accept: 'application/json' } });
+        if (res.ok) next.liveChat = await res.json();
+      } catch { /* ignore */ }
+      if (!cancelled) setDevtoolsExtReady(next);
+    }
+    checkExt();
+    const id = setInterval(checkExt, 8_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [canDelete]);
+
   const trailStatus = detectTrail ? (ready?.trail || data?.trailStatus) : null;
   const gitStatus = detectGit ? (ready?.git || data?.git) : null;
-  const trailBadge = enforceTrail && trailStatus && !trailStatus.ok;
-  const gitBadge = enforceGit && gitStatus && !gitStatus.ok;
-
-  const laneKey = useMemo(() => {
-    if (selected && isKusaKey(selected) && kusaSessions.some((s) => s.key === selected)) {
-      return selected;
-    }
-    if (!data) return null;
-    if (follow || !selected || isKusaKey(selected) || !data.lanes[selected]) return data.focus;
-    return selected;
-  }, [data, follow, selected, kusaSessions]);
-
-  const kusaSession = useMemo(
-    () => (laneKey && isKusaKey(laneKey)
-      ? kusaSessions.find((s) => s.key === laneKey) || null
-      : null),
-    [kusaSessions, laneKey],
+  const devtoolsNav = extensionNavEntries('devtools');
+  const caoOnRail = devtoolsNav.some((e) => e.extensionId === 'cao');
+  const liveChatOnRail = devtoolsNav.some((e) => e.extensionId === 'live-chat');
+  // Rail badge: any detected Dev Tools host that is not ok (not only when enforced).
+  const trailBadge = Boolean(detectTrail && trailStatus && !trailStatus.ok);
+  const gitBadge = Boolean(detectGit && gitStatus && !gitStatus.ok);
+  const caoBadge = Boolean(caoOnRail && devtoolsExtReady.cao && !devtoolsExtReady.cao.ok);
+  const liveChatBadge = Boolean(
+    liveChatOnRail && devtoolsExtReady.liveChat && !devtoolsExtReady.liveChat.ok,
   );
 
-  // When a Kusă session is selected, land on Chat; leave Chat when it isn't.
+  // Which session the console is showing. Always the user's selection —
+  // never auto-jumps to `data.focus` while they are looking at a session.
+  // Focus is only a seed when nothing is selected yet (first load / after
+  // deleting the open session).
+  const laneKey = useMemo(() => {
+    if (selected) {
+      if (isChatSessionKey(selected)) return selected;
+      if (data?.lanes?.[selected]) return selected;
+    }
+    return data?.focus ?? null;
+  }, [data, selected]);
+
+  // A monitor lane pruned off-disk is no longer selectable — clear so we can
+  // reseed once. Chat deletes already clear `selected` in runDelete.
   useEffect(() => {
-    if (kusaSession) {
+    if (!selected || isChatSessionKey(selected) || !data) return;
+    if (!data.lanes?.[selected]) setSelected(null);
+  }, [data, selected]);
+
+  // Land on the latest session once when nothing is selected, then stick.
+  useEffect(() => {
+    if (selected != null) return;
+    if (data?.focus) setSelected(data.focus);
+  }, [data?.focus, selected]);
+
+  const chatSession = useMemo(
+    () => (laneKey && isChatSessionKey(laneKey)
+      ? chatSessions.find((s) => s.key === laneKey) || null
+      : null),
+    [chatSessions, laneKey],
+  );
+
+  // When a chat session is selected, land on Chat; leave Chat when it isn't.
+  useEffect(() => {
+    if (chatSession) {
       setSessionSubTab('chat');
       return;
     }
     setSessionSubTab((prev) => (prev === 'chat' ? 'prompts' : prev));
-  }, [kusaSession?.key]);
+  }, [chatSession?.key]);
 
   // Session-bound held prompts flush on the *selected* idle session only.
   // Parked (cross-session) rows are skipped until resumed onto this chat.
   useEffect(() => {
-    if (!canPersistSettings || !kusaSession?.key) return;
-    const session = kusaSession;
+    if (!canPersistSettings || !chatSession?.key) return;
+    const session = chatSession;
     const busy = session.status === 'busy' || session.status === 'thinking' || session.live;
     if (busy) return;
     const held = queueForSession(queueByKey, session.key)?.queued || [];
     // Parked prompts stay visible but are never auto-sent.
     if (!held.some((entry) => !entry?.paused)) return;
     void (async () => { await flushQueuedMessages(session.key); })();
-  }, [canPersistSettings, kusaSession, queueByKey]);
+  }, [canPersistSettings, chatSession, queueByKey]);
 
   // Kusă chat transcript is under .kusa/kusa/<id>.chat.json; hooks fill data.lanes[kusa:id].
   const lane = laneKey && data?.lanes?.[laneKey] ? data.lanes[laneKey] : null;
@@ -840,38 +895,18 @@ export default function App() {
     }
   }
 
-  function toggleHarness(name) {
-    if (sidebarCollapsed) {
-      setSidebarCollapsed(false);
-      writeLocal('monitor.sidebar', 'open');
-      setCollapsedHarnesses((prev) => {
-        const next = new Set(prev);
-        next.delete(name);
-        return next;
-      });
-      return;
-    }
-    setCollapsedHarnesses((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  }
-
   function selectLane(key) {
     setActiveExtensionId(null);
     setSelected(key);
-    setFollow(!isKusaKey(key) && key === data?.focus);
-    if (isKusaKey(key)) {
+    if (isChatSessionKey(key) && chatSessions.some((s) => s.key === key)) {
       setSessionSubTab('chat');
       setTab('session');
     }
   }
 
-  async function createKusaSession() {
+  async function createSession({ provider = 'kusa', kind = 'standard', workflowId = null } = {}) {
     if (!canPersistSettings) {
-      window.alert('Kusă chat needs the local server (npm run kusa:serve).');
+      window.alert('Chat sessions need the local server (npm run kusa:serve).');
       return;
     }
     let session;
@@ -879,7 +914,11 @@ export default function App() {
       const res = await fetch('/kusa/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          provider,
+          kind,
+          ...(workflowId ? { workflowId } : {}),
+        }),
       });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
@@ -888,20 +927,14 @@ export default function App() {
       const body = await res.json();
       session = body?.session;
     } catch (err) {
-      window.alert(`Could not create Kusă session: ${err?.message || err}`);
+      window.alert(`Could not create session: ${err?.message || err}`);
       return;
     }
     if (!session?.key) return;
-    setKusaSessions((prev) => [session, ...prev.filter((s) => s.key !== session.key)]);
+    setChatSessions((prev) => [session, ...prev.filter((s) => s.key !== session.key)]);
     setSelected(session.key);
-    setFollow(false);
     setSessionSubTab('chat');
     setTab('session');
-    setCollapsedHarnesses((prev) => {
-      const next = new Set(prev);
-      next.delete(KUSA_HARNESS);
-      return next;
-    });
     if (sidebarCollapsed) {
       setSidebarCollapsed(false);
       writeLocal('monitor.sidebar', 'open');
@@ -923,7 +956,7 @@ export default function App() {
    * GET /kusa/chat/live after refresh). Finalizes the transcript on done/stop;
    * a dropped stream leaves the session busy so a later attach can resume.
    */
-  async function attachKusaTurn(sessionKey, res) {
+  async function attachChatTurn(sessionKey, res) {
     if (!sessionKey || !res) return;
     if (attachedTurns.current.has(sessionKey)) return;
     attachedTurns.current.add(sessionKey);
@@ -940,7 +973,7 @@ export default function App() {
       const mirrors = mirrorsFromParts(liveSnap.parts);
       liveSnap.thinking = mirrors.thinking;
       liveSnap.tools = mirrors.tools;
-      patchKusaSession(setKusaSessions, sessionKey, (s) => ({
+      patchKusaSession(setChatSessions, sessionKey, (s) => ({
         ...s,
         status: 'busy',
         live: {
@@ -955,7 +988,7 @@ export default function App() {
       if (!res.ok) {
         if (res.status === 404) {
           // No active turn — clear a stale busy overlay from a finished race.
-          patchKusaSession(setKusaSessions, sessionKey, (s) => ({
+          patchKusaSession(setChatSessions, sessionKey, (s) => ({
             ...s,
             status: s.status === 'busy' || s.status === 'thinking' ? 'idle' : s.status,
             live: null,
@@ -978,7 +1011,7 @@ export default function App() {
           const userMessage = ev.userMessage && typeof ev.userMessage.text === 'string'
             ? ev.userMessage
             : null;
-          patchKusaSession(setKusaSessions, sessionKey, (s) => {
+          patchKusaSession(setChatSessions, sessionKey, (s) => {
             const messages = [...(s.messages || [])];
             // Opening prompt for this turn (server persists it; refresh may load
             // disk before the client's own PUT, so reinject from the snapshot).
@@ -1103,7 +1136,7 @@ export default function App() {
             at: Date.now(),
             steered: true,
           };
-          patchKusaSession(setKusaSessions, sessionKey, (s) => {
+          patchKusaSession(setChatSessions, sessionKey, (s) => {
             const msgs = [...(turnMessages || s.messages || []), row];
             turnMessages = msgs;
             return { ...s, messages: msgs };
@@ -1177,10 +1210,13 @@ export default function App() {
         turnId: turnId || undefined,
         backend: payload?.backend || null,
         stopped: payload?.type === 'stopped' ? true : undefined,
-        ...(isError ? { error: true } : {}),
+        ...(isError ? {
+          error: true,
+          ...(payload?.code ? { code: String(payload.code) } : {}),
+        } : {}),
       };
 
-      setKusaSessions((prev) => {
+      setChatSessions((prev) => {
         const next = prev.map((s) => {
           if (s.key !== sessionKey) return s;
           const baseMessages = turnMessages || s.messages || [];
@@ -1208,7 +1244,7 @@ export default function App() {
             messages,
           };
           // Server already persisted; mirror locally for snappy UI.
-          persistKusaSession(done).catch(() => {});
+          persistChatSession(done).catch(() => {});
           return done;
         });
         return next;
@@ -1222,7 +1258,7 @@ export default function App() {
     } catch (err) {
       // Page refresh / navigation aborts the fetch — do not poison the transcript.
       if (err?.name === 'AbortError') return;
-      setKusaSessions((prev) => prev.map((s) => {
+      setChatSessions((prev) => prev.map((s) => {
         if (s.key !== sessionKey) return s;
         const msgs = turnMessages || s.messages || [];
         const done = {
@@ -1242,7 +1278,7 @@ export default function App() {
             },
           ],
         };
-        persistKusaSession(done).catch(() => {});
+        persistChatSession(done).catch(() => {});
         return done;
       }));
     } finally {
@@ -1272,7 +1308,7 @@ export default function App() {
         `/kusa/chat/live?queueKey=${encodeURIComponent(sessionKey)}`,
         { headers: { Accept: 'text/event-stream' } },
       );
-      await attachKusaTurn(sessionKey, res);
+      await attachChatTurn(sessionKey, res);
     } catch (err) {
       if (err?.name === 'AbortError') return;
       // Leave busy state; the next sessions poll may clear or retry.
@@ -1285,7 +1321,7 @@ export default function App() {
    * `attachments` are the files the composer staged for this prompt — they ride
    * with it, so a picture or a text file reaches the model exactly as staged.
    */
-  async function sendKusaMessage(
+  async function sendChatMessage(
     sessionKey,
     text,
     {
@@ -1302,7 +1338,7 @@ export default function App() {
       return;
     }
 
-    const session = kusaSessions.find((s) => s.key === sessionKey);
+    const session = chatSessions.find((s) => s.key === sessionKey);
     if (!session) return;
 
     const prior = session.messages || [];
@@ -1354,10 +1390,10 @@ export default function App() {
     // Claim the turn before flipping busy so the resume effect does not race
     // GET /kusa/chat/live before POST /kusa/chat registers the job.
     liveSnapBySession.current.set(sessionKey, emptyLive());
-    setKusaSessions((prev) => prev.map((s) => (s.key === sessionKey ? busySession : s)));
+    setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? busySession : s)));
     // Persist the user turn before starting the agent so a refresh mid-flight
     // still sees the prompt (server also writes it on POST /kusa/chat).
-    await persistKusaSession(busySession).catch(() => {});
+    await persistChatSession(busySession).catch(() => {});
 
     try {
       const res = await fetch('/kusa/chat', {
@@ -1389,7 +1425,7 @@ export default function App() {
           promptMessageId: userMsg.id,
         }),
       });
-      await attachKusaTurn(sessionKey, res);
+      await attachChatTurn(sessionKey, res);
     } catch (err) {
       if (err?.name === 'AbortError') return;
       const assistantMsg = {
@@ -1407,14 +1443,14 @@ export default function App() {
         live: null,
         messages: [...turnMessages, assistantMsg],
       };
-      setKusaSessions((prev) => prev.map((s) => (s.key === sessionKey ? errSession : s)));
-      persistKusaSession(errSession).catch(() => {});
+      setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? errSession : s)));
+      persistChatSession(errSession).catch(() => {});
       liveSnapBySession.current.delete(sessionKey);
     }
   }
 
   /** Resolve a gated-tool pause; agent stays blocked until this POST settles. */
-  async function resolveKusaApproval(sessionKey, { approvalId, allowed }) {
+  async function resolveChatApproval(sessionKey, { approvalId, allowed }) {
     if (!approvalId) return;
     const nextStatus = allowed ? 'allowed' : 'denied';
     const markApproval = (parts) => (parts || []).map((p) => {
@@ -1428,7 +1464,7 @@ export default function App() {
     const snap = liveSnapBySession.current.get(sessionKey);
     if (snap) snap.parts = markApproval(snap.parts);
 
-    patchKusaSession(setKusaSessions, sessionKey, (s) => {
+    patchKusaSession(setChatSessions, sessionKey, (s) => {
       if (!s?.live?.parts) return s;
       const parts = markApproval(s.live.parts);
       const mirrors = mirrorsFromParts(parts);
@@ -1460,7 +1496,7 @@ export default function App() {
    * One of optionIndex / optionLabel / freeText is sent; the server resolves
    * the choice in that order and the gate returns the answer to the model.
    */
-  async function resolveKusaAsk(sessionKey, { askId, optionIndex = null, optionLabel = null, freeText = null }) {
+  async function resolveChatAsk(sessionKey, { askId, optionIndex = null, optionLabel = null, freeText = null }) {
     if (!askId) return;
     const markAsk = (parts) => (parts || []).map((p) => {
       if (p.type !== 'ask' || p.ask?.id !== askId) return p;
@@ -1480,7 +1516,7 @@ export default function App() {
     const snap = liveSnapBySession.current.get(sessionKey);
     if (snap) snap.parts = markAsk(snap.parts);
 
-    patchKusaSession(setKusaSessions, sessionKey, (s) => {
+    patchKusaSession(setChatSessions, sessionKey, (s) => {
       if (!s?.live?.parts) return s;
       const parts = markAsk(s.live.parts);
       const mirrors = mirrorsFromParts(parts);
@@ -1517,7 +1553,7 @@ export default function App() {
    * Settings → Kusă agent. Written straight to disk so a refresh — even mid-turn —
    * reopens the chat with the same pickers.
    */
-  async function updateKusaSessionOptions(sessionKey, {
+  async function updateChatSessionOptions(sessionKey, {
     mode = null,
     rules = null,
     model = null,
@@ -1532,7 +1568,7 @@ export default function App() {
       ...(endpointId != null ? { endpointId: String(endpointId).trim() } : {}),
     };
     if (!Object.keys(patch).length) return;
-    const session = kusaSessions.find((s) => s.key === sessionKey);
+    const session = chatSessions.find((s) => s.key === sessionKey);
     if (!session) return;
     // Merge with what the record already says: one picker changing must never
     // erase the others, or a refresh would reopen the chat half-picked.
@@ -1540,9 +1576,9 @@ export default function App() {
     // Allow / Deny are sticky, so the record carries no expiry at all: nothing
     // here can disagree with a live picker about whether a rule is still in
     // effect, and a refresh reopens the chat on the rule the user chose.
-    setKusaSessions((prev) => prev.map((s) => (s.key === sessionKey ? { ...s, options } : s)));
+    setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? { ...s, options } : s)));
     try {
-      await persistKusaSession({ ...session, options });
+      await persistChatSession({ ...session, options });
     } catch {
       /* the pickers still apply this session; only a refresh could lose them */
     }
@@ -1553,7 +1589,7 @@ export default function App() {
    * step boundary (tools + system prompt + approval gate), so a picker change
    * while busy does not wait for the turn to finish.
    */
-  async function updateKusaTurnOptions(sessionKey, { mode = null, approvalMode = null } = {}) {
+  async function updateChatTurnOptions(sessionKey, { mode = null, approvalMode = null } = {}) {
     if (!canPersistSettings || !sessionKey) return null;
     try {
       const res = await fetch('/kusa/chat/options', {
@@ -1640,7 +1676,7 @@ export default function App() {
     return (async () => {
       try {
         if (action === 'send' && opts?.id) {
-          const session = kusaSessions.find((s) => s.key === sessionKey);
+          const session = chatSessions.find((s) => s.key === sessionKey);
           const busy = Boolean(
             session
             && (session.status === 'busy' || session.status === 'thinking' || session.live),
@@ -1655,7 +1691,7 @@ export default function App() {
             const staged = Array.isArray(options.attachments) ? options.attachments : [];
             // A held prompt may be nothing but a picture — it still sends.
             if (!text && !staged.length) return body;
-            await sendKusaMessage(sessionKey, text, {
+            await sendChatMessage(sessionKey, text, {
               mode: options.mode || null,
               model: options.model || null,
               endpointId: options.endpointId || null,
@@ -1719,7 +1755,7 @@ export default function App() {
           return;
         }
         const options = entry?.options || {};
-        await sendKusaMessage(sessionKey, text, {
+        await sendChatMessage(sessionKey, text, {
           mode: options.mode || null,
           model: options.model || null,
           endpointId: options.endpointId || null,
@@ -1741,7 +1777,7 @@ export default function App() {
    * mirror current, so the idle-flush effect above immediately sends the next
    * held prompt: one click stops the current prompt AND loads the next one.
    */
-  async function stopKusaTurn(sessionKey) {
+  async function stopChatTurn(sessionKey) {
     if (!canPersistSettings || !sessionKey) return;
     try {
       const res = await fetch('/kusa/stop', {
@@ -1798,7 +1834,7 @@ export default function App() {
   async function runDelete() {
     const list = pendingDelete?.keys || [];
     if (!list.length || deleteBusy) return;
-    const kusaKeys = list.filter(isKusaKey);
+    const chatKeys = list.filter(isChatSessionKey);
 
     setDeleteBusy(true);
     try {
@@ -1811,15 +1847,37 @@ export default function App() {
         const detailText = await res.text().catch(() => '');
         throw new Error(detailText || `HTTP ${res.status}`);
       }
-      // The gate closes only once the files are gone.
-      setPendingDelete(null);
-      if (kusaKeys.length) {
-        setKusaSessions((prev) => prev.filter((s) => !kusaKeys.includes(s.key)));
+      const body = await res.json().catch(() => ({}));
+      const deleted = Array.isArray(body?.deleted) ? body.deleted.filter(Boolean) : [];
+      const missing = Array.isArray(body?.missing) ? body.missing.filter(Boolean) : [];
+      // HTTP 200 with an empty deleted list used to close the dialog while the
+      // row came straight back on the next poll (chat key ≠ monitor lane key).
+      if (!deleted.length) {
+        throw new Error(
+          missing.length
+            ? `session not found on disk (${missing.join(', ')})`
+            : 'session not found on disk',
+        );
+      }
+      const deletedSet = new Set(deleted);
+      const deletedChatKeys = chatKeys.filter((key) => deletedSet.has(key));
+      // The gate closes only once the files are gone. Partial deletes keep the
+      // missing keys in the dialog so the user can see what still failed.
+      if (missing.length) {
+        setPendingDelete({
+          keys: missing,
+          error: `Deleted ${deleted.length}, but could not remove: ${missing.join(', ')}`,
+        });
+      } else {
+        setPendingDelete(null);
+      }
+      if (deletedChatKeys.length) {
+        setChatSessions((prev) => prev.filter((s) => !deletedSet.has(s.key)));
         // Drop that session's held + steering mirrors. Keep workspace parked
         // visible on remaining chats (do not leak the deleted chat's held).
         setQueueByKey((prev) => {
           const next = new Map(prev);
-          for (const key of kusaKeys) {
+          for (const key of deletedChatKeys) {
             const snap = next.get(key);
             next.delete(key);
             const parked = (snap?.queued || []).filter((entry) => entry?.paused);
@@ -1837,12 +1895,11 @@ export default function App() {
       }
       setCheckedKeys((prev) => {
         const next = new Set(prev);
-        for (const key of list) next.delete(key);
+        for (const key of deleted) next.delete(key);
         return next;
       });
-      if (list.includes(selected) || list.includes(laneKey)) {
+      if (deleted.includes(selected) || deleted.includes(laneKey)) {
         setSelected(null);
-        setFollow(true);
       }
       poll();
     } catch (err) {
@@ -1878,8 +1935,8 @@ export default function App() {
     });
   }
 
-  const sessionChatFill = Boolean(kusaSession) && tab === 'session';
-  const sessionSubTabIds = kusaSession
+  const sessionChatFill = Boolean(chatSession) && tab === 'session';
+  const sessionSubTabIds = chatSession
     ? SESSION_SUBTAB_IDS
     : SESSION_SUBTAB_IDS.filter((id) => id !== 'chat');
 
@@ -1942,6 +1999,48 @@ export default function App() {
       },
       idPrefix: 'devtools',
       ariaLabel: 'Developer tool views',
+      itemStatus: {
+        ...(detectTrail && trailStatus
+          ? {
+              trail: {
+                tone: trailStatus.ok ? 'ok' : 'down',
+                title: trailStatus.ok
+                  ? 'Trail is ready'
+                  : 'Trail is missing, needs upgrade from Graft, or is not initialized in this workspace',
+              },
+            }
+          : {}),
+        ...(detectGit && gitStatus
+          ? {
+              git: {
+                tone: gitStatus.ok ? 'ok' : 'down',
+                title: gitStatus.ok
+                  ? 'Git is ready'
+                  : 'Git is not installed or this workspace is not a git repository',
+              },
+            }
+          : {}),
+        ...(caoOnRail && devtoolsExtReady.cao
+          ? {
+              cao: {
+                tone: devtoolsExtReady.cao.ok ? 'ok' : 'down',
+                title: devtoolsExtReady.cao.ok
+                  ? 'CLI Agent Orchestrator is ready'
+                  : 'CLI Agent Orchestrator is not ready (cao CLI missing or cao-server down)',
+              },
+            }
+          : {}),
+        ...(liveChatOnRail && devtoolsExtReady.liveChat
+          ? {
+              'live-chat': {
+                tone: devtoolsExtReady.liveChat.ok ? 'ok' : 'down',
+                title: devtoolsExtReady.liveChat.ok
+                  ? 'Live Chat bot is ready'
+                  : 'Live Chat bot is not ready (not installed or server down)',
+              },
+            }
+          : {}),
+      },
     },
     settings: {
       ids: SETTINGS_SUBTAB_IDS,
@@ -1970,7 +2069,7 @@ export default function App() {
     for (const h of data?.harnesses || []) {
       for (const s of h.sessions || []) byKey.set(s.key, sessionLabel(s));
     }
-    for (const s of kusaSessions) byKey.set(s.key, sessionLabel(s));
+    for (const s of chatSessions) byKey.set(s.key, sessionLabel(s));
     const labels = keys.map((key) => byKey.get(key) || key);
     return {
       open: true,
@@ -1981,7 +2080,7 @@ export default function App() {
       cancelLabel: keys.length === 1 ? 'Keep it' : 'Keep them',
       error: pendingDelete.error,
     };
-  }, [pendingDelete, data, kusaSessions]);
+  }, [pendingDelete, data, chatSessions]);
 
   return (
     <div className="flex h-full min-h-screen">
@@ -1994,11 +2093,9 @@ export default function App() {
           setSidebarCollapsed(next);
           writeLocal('monitor.sidebar', next ? 'collapsed' : 'open');
         }}
-        collapsedHarnesses={collapsedHarnesses}
-        onToggleHarness={toggleHarness}
         onSelectLane={selectLane}
-        onNewKusaSession={createKusaSession}
-        kusaSessions={kusaSessions}
+        onNewSession={createSession}
+        chatSessions={chatSessions}
         sessionFilter={sessionFilter}
         onSessionFilterChange={(next) => {
           setSessionFilter(next);
@@ -2014,11 +2111,11 @@ export default function App() {
         deleteGate={Boolean(pendingDelete)}
         statusLine={statusLine}
         statusLane={lane}
-        statusKusaSession={kusaSession}
+        statusChatSession={chatSession}
         canPersistExtensions={canDelete}
         activeExtensionId={activeExtensionId}
         onSelectExtension={(id) => {
-          openExtension(id, { setActiveExtensionId, setTab, setDevtoolsSubTab });
+          openExtension(id, { setActiveExtensionId, setDevtoolsSubTab });
           if (sidebarCollapsed) {
             setSidebarCollapsed(false);
             writeLocal('monitor.sidebar', 'open');
@@ -2026,121 +2123,124 @@ export default function App() {
         }}
       />
 
-      <main className={`min-w-0 flex-1 ${sessionChatFill ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'}`}>
+      <main className={`min-w-0 flex-1 ${sessionChatFill && !activeExtensionId ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'}`}>
         <div
-          id={`panel-${tab}`}
+          id={activeExtensionId ? `extension-panel-${activeExtensionId}` : `panel-${tab}`}
           role="tabpanel"
-          aria-labelledby={`tab-${tab}`}
+          aria-labelledby={activeExtensionId ? 'sidebar-view-extensions' : `tab-${tab}`}
           className={
-            sessionChatFill
+            sessionChatFill && !activeExtensionId
               ? 'flex min-h-0 flex-1 flex-col'
               : 'space-y-8 px-6 py-4 pb-6'
           }
         >
-          {tab === 'monitors' && (
-            <MonitorsPanel
-              subTab={monitorsSubTab}
-              lane={lane}
-              now={now}
-              sdkListener={data?.sdkListener}
-              tokens={lane?.tokens}
-              tokenTurns={lane?.tokenTurns}
-              recent={lane?.recent}
-              warnings={lane?.warnings}
-              notes={lane?.notes}
-              errors={data?.errors}
-            />
-          )}
-          {tab === 'session' && (
-            <SessionPanel
-              subTab={sessionSubTab}
-              prompts={lane?.prompts || []}
-              expandedPrompts={expandedPrompts}
-              onTogglePrompt={togglePrompt}
-              lane={lane}
-              toolWarnMs={data?.toolWarnMs ?? 1e12}
-              now={now}
-              expandedTools={expandedTools}
-              onToggleTool={toggleTool}
-              kusaSession={kusaSession}
-              kusaQueue={queueForSession(queueByKey, kusaSession?.key)}
-              onSendKusaMessage={sendKusaMessage}
-              onQueueKusaMessage={queueFromComposer}
-              onStopKusaTurn={stopKusaTurn}
-              onKusaApproval={resolveKusaApproval}
-              onKusaAsk={resolveKusaAsk}
-              onKusaTurnOptions={updateKusaTurnOptions}
-              onKusaSessionOptions={updateKusaSessionOptions}
-              agentDefaults={{
-                mode: 'agent',
-                rules: settings.agentApprovalMode || 'ask-deny',
-                model: settings.agentModel || '',
-                approvalTimeoutMinutes: settings.agentApprovalTimeoutMinutes ?? 2,
-                allowDenyRevertMinutes: settings.agentAllowDenyRevertMinutes ?? 15,
-                // Fingerprint of every active endpoint so ChatHarness reloads
-                // /kusa/models after Settings adds, renames, or re-lists models.
-                modelsRevision: [
-                  settings.agentBaseUrl || '',
-                  settings.agentModel || '',
-                  ...(Array.isArray(settings.agentModels) ? settings.agentModels : []),
-                  ...(Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : []).flatMap((entry) => ([
-                    entry?.id || '',
-                    entry?.name || '',
-                    entry?.baseUrl || '',
-                    ...(Array.isArray(entry?.models) ? entry.models : []),
-                  ])),
-                ].join('\0'),
-              }}
-            />
-          )}
-          {tab === 'harness' && (
-            <HarnessPanel subTab={harnessSubTab} canPersist={canPersistSettings} />
-          )}
-          {tab === 'devtools' && (
-            <DevToolsPanel
-              subTab={devtoolsSubTab}
-              trail={lane?.trail}
-              trailStatus={trailStatus}
-              detectTrail={detectTrail}
-              enforceTrail={enforceTrail}
-              canLiveRefreshTrail={canDelete && detectTrail}
-              git={gitStatus}
-              detectGit={detectGit}
-              enforceGit={enforceGit}
-              canLiveRefreshGit={canDelete && detectGit}
-              canPersistCao={canDelete}
-            />
-          )}
-          {tab === 'settings' && (
-            <SettingsPanel
-              subTab={settingsSubTab}
-              follow={follow}
-              onFollowChange={(checked) => {
-                setFollow(checked);
-                if (checked && data) setSelected(data.focus);
-              }}
-              settings={data?.settings}
-              sdkListener={data?.sdkListener}
-              canPersist={canPersistSettings}
-              settingsBusy={settingsBusy}
-              onSettingsChange={saveSettings}
-            />
-          )}
-          {tab === 'user' && (
-            <UserPanel
-              settings={data?.settings}
-              canPersist={canPersistSettings}
-              settingsBusy={settingsBusy}
-              onSettingsChange={saveSettings}
-              theme={theme}
-              onThemeChange={setTheme}
-            />
+          {activeExtensionId ? (
+            <ExtensionPage extensionId={activeExtensionId} canPersist={canDelete} />
+          ) : (
+            <>
+              {tab === 'monitors' && (
+                <MonitorsPanel
+                  subTab={monitorsSubTab}
+                  lane={lane}
+                  now={now}
+                  sdkListener={data?.sdkListener}
+                  tokens={lane?.tokens}
+                  tokenTurns={lane?.tokenTurns}
+                  recent={lane?.recent}
+                  warnings={lane?.warnings}
+                  notes={lane?.notes}
+                  errors={data?.errors}
+                />
+              )}
+              {tab === 'session' && (
+                <SessionPanel
+                  subTab={sessionSubTab}
+                  prompts={lane?.prompts || []}
+                  expandedPrompts={expandedPrompts}
+                  onTogglePrompt={togglePrompt}
+                  lane={lane}
+                  toolWarnMs={data?.toolWarnMs ?? 1e12}
+                  now={now}
+                  expandedTools={expandedTools}
+                  onToggleTool={toggleTool}
+                  chatSession={chatSession}
+                  chatQueue={queueForSession(queueByKey, chatSession?.key)}
+                  onSendMessage={sendChatMessage}
+                  onQueueMessage={queueFromComposer}
+                  onStopTurn={stopChatTurn}
+                  onApproval={resolveChatApproval}
+                  onAsk={resolveChatAsk}
+                  onTurnOptions={updateChatTurnOptions}
+                  onSessionOptions={updateChatSessionOptions}
+                  agentDefaults={{
+                    mode: 'agent',
+                    rules: settings.agentApprovalMode || 'ask-deny',
+                    model: settings.agentModel || '',
+                    approvalTimeoutMinutes: settings.agentApprovalTimeoutMinutes ?? 2,
+                    allowDenyRevertMinutes: settings.agentAllowDenyRevertMinutes ?? 15,
+                    // Fingerprint of every active endpoint so SessionChat reloads
+                    // /kusa/models after Settings adds, renames, or re-lists models.
+                    modelsRevision: [
+                      settings.agentBaseUrl || '',
+                      settings.agentModel || '',
+                      ...(Array.isArray(settings.agentModels) ? settings.agentModels : []),
+                      ...(Array.isArray(settings.agentEndpoints) ? settings.agentEndpoints : []).flatMap((entry) => ([
+                        entry?.id || '',
+                        entry?.name || '',
+                        entry?.baseUrl || '',
+                        ...(Array.isArray(entry?.models) ? entry.models : []),
+                      ])),
+                    ].join('\0'),
+                  }}
+                />
+              )}
+              {tab === 'harness' && (
+                <HarnessPanel subTab={harnessSubTab} canPersist={canPersistSettings} />
+              )}
+              {tab === 'devtools' && (
+                <DevToolsPanel
+                  subTab={devtoolsSubTab}
+                  trail={lane?.trail}
+                  trailStatus={trailStatus}
+                  detectTrail={detectTrail}
+                  enforceTrail={enforceTrail}
+                  canLiveRefreshTrail={canDelete && detectTrail}
+                  git={gitStatus}
+                  detectGit={detectGit}
+                  enforceGit={enforceGit}
+                  canLiveRefreshGit={canDelete && detectGit}
+                  canPersistCao={canDelete}
+                />
+              )}
+              {tab === 'settings' && (
+                <SettingsPanel
+                  subTab={settingsSubTab}
+                  settings={data?.settings}
+                  sdkListener={data?.sdkListener}
+                  canPersist={canPersistSettings}
+                  settingsBusy={settingsBusy}
+                  onSettingsChange={saveSettings}
+                />
+              )}
+              {tab === 'user' && (
+                <UserPanel
+                  settings={data?.settings}
+                  canPersist={canPersistSettings}
+                  settingsBusy={settingsBusy}
+                  onSettingsChange={saveSettings}
+                  theme={theme}
+                  onThemeChange={setTheme}
+                />
+              )}
+            </>
           )}
         </div>
       </main>
 
       <RightRail
-        tab={tab}
+        // Catalog select owns the main pane — deselect the rail unless we're
+        // already on Dev Tools (extension nav placement / rail › CAO).
+        tab={activeExtensionId && tab !== 'devtools' ? null : tab}
         onTabChange={(next) => {
           setActiveExtensionId(null);
           setTab(next);
@@ -2151,6 +2251,8 @@ export default function App() {
         userName={data?.settings?.authUsername || ''}
         trailBadge={trailBadge}
         gitBadge={gitBadge}
+        caoBadge={caoBadge}
+        liveChatBadge={liveChatBadge}
       />
 
       {deleteDialog ? (

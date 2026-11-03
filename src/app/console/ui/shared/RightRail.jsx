@@ -35,7 +35,7 @@ const BOTTOM_TABS = TAB_IDS.filter((id) => id === 'user');
  * absolutely positioned box that spills past the viewport grows the document,
  * which is what put a scrollbar on the whole page.
  */
-function TabButton({ id, on, badge, badgeTitle, onSelect, submenu, avatarName = '' }) {
+function TabButton({ id, on, badge = false, badgeTone = 'down', badgeTitle = '', onSelect, submenu, avatarName = '' }) {
   const icon = id === 'user' ? (
     <span
       className={`flex h-[18px] w-[18px] items-center justify-center rounded-full text-[9px] font-semibold leading-none ${
@@ -49,6 +49,10 @@ function TabButton({ id, on, badge, badgeTitle, onSelect, submenu, avatarName = 
     </span>
   ) : ICONS[id];
 
+  const badgeClass = badgeTone === 'ok'
+    ? 'bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.25)]'
+    : 'bg-rose-500 shadow-[0_0_0_2px_rgba(244,63,94,0.25)]';
+
   return (
     <div className="rail-submenu-group relative flex h-9 w-9 items-center justify-center">
       <button
@@ -57,8 +61,8 @@ function TabButton({ id, on, badge, badgeTitle, onSelect, submenu, avatarName = 
         id={`tab-${id}`}
         aria-controls={`panel-${id}`}
         aria-selected={on}
-        title={TAB_LABELS[id]}
-        aria-label={badge ? `${TAB_LABELS[id]} — ${badgeTitle}` : TAB_LABELS[id]}
+        title={badgeTitle ? `${TAB_LABELS[id]} — ${badgeTitle}` : TAB_LABELS[id]}
+        aria-label={badgeTitle ? `${TAB_LABELS[id]} — ${badgeTitle}` : TAB_LABELS[id]}
         className={`relative flex h-9 w-9 items-center justify-center rounded-md transition-colors ${
           on
             ? 'bg-emerald-500/15 text-emerald-400'
@@ -69,7 +73,7 @@ function TabButton({ id, on, badge, badgeTitle, onSelect, submenu, avatarName = 
         {icon}
         {badge ? (
           <span
-            className="absolute right-1 top-1 inline-block h-1.5 w-1.5 rounded-full bg-rose-500 shadow-[0_0_0_2px_rgba(244,63,94,0.25)]"
+            className={`absolute right-1 top-1 inline-block h-1.5 w-1.5 rounded-full ${badgeClass}`}
             title={badgeTitle}
             aria-hidden="true"
           />
@@ -87,6 +91,8 @@ export function RightRail({
   onThemeChange,
   trailBadge = false,
   gitBadge = false,
+  caoBadge = false,
+  liveChatBadge = false,
   /** Display name for the Account avatar initials (auth username). */
   userName = '',
   // Per-section sub-views ({ ids, labels, value, onChange, idPrefix, ariaLabel })
@@ -97,7 +103,7 @@ export function RightRail({
   subTabs = null,
 }) {
   function badgeFor(id) {
-    if (id !== 'devtools') return { badge: false, badgeTitle: '' };
+    if (id !== 'devtools') return { badge: false, badgeTone: 'down', badgeTitle: '' };
     const parts = [];
     if (trailBadge) {
       parts.push('Trail is missing, needs upgrade from Graft, or is not initialized in this workspace');
@@ -105,8 +111,17 @@ export function RightRail({
     if (gitBadge) {
       parts.push('Git is not installed or this workspace is not a git repository');
     }
-    if (!parts.length) return { badge: false, badgeTitle: '' };
-    return { badge: true, badgeTitle: parts.join(' · ') };
+    if (caoBadge) {
+      parts.push('CLI Agent Orchestrator is not ready (cao CLI missing or cao-server down)');
+    }
+    if (liveChatBadge) {
+      parts.push('Live Chat bot is not ready (not installed or server down)');
+    }
+    // Always show a status dot on Dev Tools: green when every checked host is up.
+    if (!parts.length) {
+      return { badge: true, badgeTone: 'ok', badgeTitle: 'All Dev Tools hosts are ready' };
+    }
+    return { badge: true, badgeTone: 'down', badgeTitle: parts.join(' · ') };
   }
 
   const themeLabel = theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
@@ -123,13 +138,14 @@ export function RightRail({
         className="flex flex-1 flex-col items-center gap-1 py-2"
       >
         {PRIMARY_TABS.map((id) => {
-          const { badge, badgeTitle } = badgeFor(id);
+          const { badge, badgeTone, badgeTitle } = badgeFor(id);
           return (
             <TabButton
               key={id}
               id={id}
               on={id === tab}
               badge={badge}
+              badgeTone={badgeTone}
               badgeTitle={badgeTitle}
               onSelect={onTabChange}
               submenu={subTabs?.[id]}
@@ -159,13 +175,14 @@ export function RightRail({
         className="flex flex-col items-center gap-1 border-t border-gray-800 py-2"
       >
         {BOTTOM_TABS.map((id) => {
-          const { badge, badgeTitle } = badgeFor(id);
+          const { badge, badgeTone, badgeTitle } = badgeFor(id);
           return (
             <TabButton
               key={id}
               id={id}
               on={id === tab}
               badge={badge}
+              badgeTone={badgeTone}
               badgeTitle={badgeTitle}
               onSelect={onTabChange}
               avatarName={userName}

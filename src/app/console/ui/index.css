@@ -367,7 +367,7 @@ html[data-theme="light"] .btn-danger {
  * then settles back, because it is a statement about a change that already
  * happened — a looping pulse would read as "still changing" forever.
  *
- * The beat exists twice under two names. ChatHarness alternates between them on
+ * The beat exists twice under two names. SessionChat alternates between them on
  * every change, and a CSS animation only restarts when its animation-NAME changes
  * (re-applying the same class on the same node does nothing), so the alternation
  * is what lets a status update land inside a beat that is still running.

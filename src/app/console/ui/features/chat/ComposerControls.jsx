@@ -1,11 +1,19 @@
 import { useState } from 'react';
+import {
+  modelFamilyBackLabel,
+  modelFamilyOptions,
+  modelMenuRows,
+} from '#ui/shared/lib/modelFamily.js';
 
 /**
  * Composer pickers + action icons — Mode / Rules / Model dropdowns above the
  * input (or, on a narrow composer, one ComposerOptionsMenu that drills into
  * each picker); context ring, attach, dictate, and live/send sit in the
- * composer footer. Values live in ChatHarness state; these components only
+ * composer footer. Values live in SessionChat state; these components only
  * render and route a selection back through onSelect.
+ *
+ * Model menus keep provider (endpoint) headings, then nest multi-model
+ * families (Claude / GPT / Gemini / …) as selectable submenus.
  */
 export const AGENT_MODE_OPTIONS = [
   {
@@ -88,7 +96,7 @@ function Chevron({ open }) {
  *   endpoint, and a heading is emitted the first time each group appears, so the
  *   menu reads as one block per endpoint and a pick can never be read as
  *   another endpoint's credentials. Options without a group (Mode / Rule) keep
- *   the flat menu.
+ *   the flat menu. Model also nests multi-model families as drill-in submenus.
  * @param {string} value
  * @param {(id) => void} [onSelect]
  *
@@ -96,7 +104,7 @@ function Chevron({ open }) {
  * button, and any blur (selecting an option, typing in the composer, tabbing away)
  * closes it automatically — so a picker can never get stuck expanded.
  */
-/** Build the flat/heading row list a picker menu renders (Mode flat; Model grouped). */
+/** Build the flat/heading row list a picker menu renders (Mode / Rule). */
 function optionMenuRows(options) {
   const rows = [];
   let lastGroup = null;
@@ -116,11 +124,175 @@ function optionLabel(options, value) {
   return current?.label || value || '—';
 }
 
+function isPrimaryMouse(e) {
+  return !(e && typeof e.button === 'number' && e.button !== 0);
+}
+
+function MenuHeading({ label, stickyClass = 'top-0' }) {
+  return (
+    <p
+      className={`sticky ${stickyClass} z-10 px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-gray-500 border-b border-gray-800 bg-gray-900`}
+    >
+      {label}
+    </p>
+  );
+}
+
+function MenuOptionButton({
+  option,
+  selected,
+  onPick,
+  role = undefined,
+}) {
+  return (
+    <button
+      type="button"
+      role={role}
+      onMouseDown={(e) => {
+        // Press, not release: the trigger's blur can close the menu before
+        // `click` is dispatched, and a released click would then land on
+        // whatever sits behind the removed menu. mousedown always fires
+        // while the option is still in the DOM, so the selection cannot
+        // be lost. Left button only (right-click is a context menu).
+        if (!isPrimaryMouse(e)) return;
+        e.preventDefault();
+        onPick?.(option.id);
+      }}
+      className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
+        selected
+          ? 'bg-gray-800/70 font-medium text-emerald-300'
+          : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+      }`}
+    >
+      <span className="font-medium break-all">{option.label}</span>
+      {option.blurb ? (
+        <span className="ml-1.5 text-gray-500">· {option.blurb}</span>
+      ) : null}
+    </button>
+  );
+}
+
+function MenuFamilyButton({
+  label,
+  selected,
+  onOpen,
+  role = undefined,
+}) {
+  return (
+    <button
+      type="button"
+      role={role}
+      onMouseDown={(e) => {
+        if (!isPrimaryMouse(e)) return;
+        // preventDefault keeps the trigger focused so the deferred blur
+        // close never fires while opening a family submenu.
+        e.preventDefault();
+        onOpen?.();
+      }}
+      className={`flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-left ${
+        selected
+          ? 'bg-gray-800/70 font-medium text-emerald-300'
+          : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+      }`}
+    >
+      <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
+      <Chevron open />
+    </button>
+  );
+}
+
+function MenuBackButton({ label, onBack, stickyClass = 'top-0' }) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onMouseDown={(e) => {
+        if (!isPrimaryMouse(e)) return;
+        e.preventDefault();
+        onBack?.();
+      }}
+      className={`sticky ${stickyClass} z-10 flex w-full items-center gap-1.5 border-b border-gray-800 bg-gray-900 px-2.5 py-1.5 text-[11px] font-medium text-gray-400 hover:text-gray-200`}
+    >
+      <span className="inline-flex rotate-180">
+        <Chevron open={false} />
+      </span>
+      <span className="min-w-0 truncate">{label}</span>
+    </button>
+  );
+}
+
+/** Render Mode/Rule flat rows, or Model provider+family rows. */
+function PickerMenuBody({
+  title,
+  options,
+  value,
+  familyKey,
+  onFamilyOpen,
+  onSelect,
+  headingStickyClass = 'top-0',
+  role = undefined,
+}) {
+  if (title === 'Model' && familyKey) {
+    return modelFamilyOptions(options, familyKey).map((option) => (
+      <MenuOptionButton
+        key={option.id}
+        option={option}
+        selected={option.id === value}
+        onPick={onSelect}
+        role={role}
+      />
+    ));
+  }
+
+  const rows = title === 'Model'
+    ? modelMenuRows(options, value)
+    : optionMenuRows(options);
+
+  return rows.map((row) => {
+    if (row.heading) {
+      return (
+        <MenuHeading
+          key={`heading:${row.heading}`}
+          label={row.heading}
+          stickyClass={headingStickyClass}
+        />
+      );
+    }
+    if (row.family) {
+      return (
+        <MenuFamilyButton
+          key={`family:${row.key}`}
+          label={row.family}
+          selected={row.selected}
+          onOpen={() => onFamilyOpen?.(row.key)}
+          role={role}
+        />
+      );
+    }
+    return (
+      <MenuOptionButton
+        key={row.option.id}
+        option={row.option}
+        selected={row.option.id === value}
+        onPick={onSelect}
+        role={role}
+      />
+    );
+  });
+}
+
 export function ComposerDropdown({ title, options, value, onSelect }) {
   // Focus-driven, not a toggle: blur is the only way the menu closes itself.
   const [open, setOpen] = useState(false);
+  // Model-only: null at provider/family list; family key while drilled in.
+  const [familyKey, setFamilyKey] = useState(null);
   const label = optionLabel(options, value);
-  const rows = optionMenuRows(options);
+  const isModel = title === 'Model';
+
+  function close() {
+    setOpen(false);
+    setFamilyKey(null);
+  }
 
   return (
     <div className="relative inline-flex items-center">
@@ -128,6 +300,7 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
         type="button"
         onClick={(e) => {
           setOpen(true);
+          setFamilyKey(null);
           // Focus it explicitly: browsers are inconsistent about moving focus on a
           // mouse click, and without focus there is no blur event to close the menu.
           e.currentTarget.focus();
@@ -140,7 +313,7 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
           // the next input event is dispatched, so the menu stays reachable for
           // the rest of the click, and it still self-closes when the user types
           // in the composer or tabs away.
-          if (open) setTimeout(() => setOpen(false), 0);
+          if (open) setTimeout(close, 0);
         }}
         title={`${title}: ${label}`}
         aria-label={title}
@@ -153,45 +326,28 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
       </button>
       {open ? (
         <div
-          className={`absolute left-0 bottom-[100%] z-20 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg ${
-            title === 'Model' ? 'divide-y divide-gray-800' : ''
+          className={`absolute left-0 bottom-[100%] z-50 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg ${
+            isModel ? 'divide-y divide-gray-800' : ''
           }`}
         >
-          {rows.map((row) =>
-            row.heading ? (
-              <p
-                key={`heading:${row.heading}`}
-                className="sticky top-0 z-10 px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-gray-500 border-b border-gray-800 bg-gray-900"
-              >
-                {row.heading}
-              </p>
-            ) : (
-              <button
-                key={row.option.id}
-                type="button"
-                onMouseDown={(e) => {
-                  // Press, not release: the trigger's blur can close the menu before
-                  // `click` is dispatched, and a released click would then land on
-                  // whatever sits behind the removed menu. mousedown always fires
-                  // while the option is still in the DOM, so the selection cannot
-                  // be lost. Left button only (right-click is a context menu).
-                  if (e && typeof e.button === 'number' && e.button !== 0) return;
-                  setOpen(false);
-                  onSelect?.(row.option.id);
-                }}
-                className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
-                  row.option.id === value
-                    ? 'bg-gray-800/70 font-medium text-emerald-300'
-                    : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
-                }`}
-              >
-                <span className="font-medium break-all">{row.option.label}</span>
-                {row.option.blurb ? (
-                  <span className="ml-1.5 text-gray-500">· {row.option.blurb}</span>
-                ) : null}
-              </button>
-            )
-          )}
+          {isModel && familyKey ? (
+            <MenuBackButton
+              label={modelFamilyBackLabel(familyKey)}
+              onBack={() => setFamilyKey(null)}
+            />
+          ) : null}
+          <PickerMenuBody
+            title={title}
+            options={options}
+            value={value}
+            familyKey={isModel ? familyKey : null}
+            onFamilyOpen={setFamilyKey}
+            onSelect={(id) => {
+              close();
+              onSelect?.(id);
+            }}
+            headingStickyClass={isModel && familyKey ? 'top-8' : 'top-0'}
+          />
         </div>
       ) : null}
     </div>
@@ -228,7 +384,7 @@ function ComposerOptionsIcon() {
  * Narrow-composer Mode / Rule / Model control. One icon opens a menu whose
  * first level is the three pickers; each picker's options are a drill-in
  * submenu (tap Mode → Ask/Plan/Agent). Wide composers keep the three
- * ComposerDropdowns instead — ChatHarness swaps on a container query so a
+ * ComposerDropdowns instead — SessionChat swaps on a container query so a
  * narrow chat column collapses even when the window itself is wide.
  *
  * Focus-driven like ComposerDropdown: the trigger holds focus, menu presses
@@ -249,6 +405,8 @@ export function ComposerOptionsMenu({
   const [open, setOpen] = useState(false);
   // null = top level (Mode / Rule / Model); otherwise which picker's options.
   const [panel, setPanel] = useState(null);
+  // Model-only: family drill-in under the Model panel.
+  const [familyKey, setFamilyKey] = useState(null);
 
   const pickers = [
     {
@@ -279,7 +437,21 @@ export function ComposerOptionsMenu({
   function close() {
     setOpen(false);
     setPanel(null);
+    setFamilyKey(null);
   }
+
+  function backFromActive() {
+    if (active?.id === 'model' && familyKey) {
+      setFamilyKey(null);
+      return;
+    }
+    setPanel(null);
+    setFamilyKey(null);
+  }
+
+  const backLabel = active?.id === 'model' && familyKey
+    ? modelFamilyBackLabel(familyKey)
+    : (active?.title || '');
 
   return (
     <div className="relative inline-flex items-center">
@@ -288,6 +460,7 @@ export function ComposerOptionsMenu({
         onClick={(e) => {
           setOpen(true);
           setPanel(null);
+          setFamilyKey(null);
           e.currentTarget.focus();
         }}
         onBlur={() => {
@@ -309,59 +482,24 @@ export function ComposerOptionsMenu({
         <div
           role="menu"
           aria-label="Mode, Rule, and Model"
-          className="absolute left-0 bottom-[100%] z-20 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg"
+          className="absolute left-0 bottom-[100%] z-50 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg"
         >
           {active ? (
             <>
-              <button
-                type="button"
-                role="menuitem"
-                onMouseDown={(e) => {
-                  // Keep focus on the trigger so blur does not tear the menu down
-                  // while the user is only stepping back to the picker list.
-                  if (e && typeof e.button === 'number' && e.button !== 0) return;
-                  e.preventDefault();
-                  setPanel(null);
+              <MenuBackButton label={backLabel} onBack={backFromActive} />
+              <PickerMenuBody
+                title={active.title}
+                options={active.options}
+                value={active.value}
+                familyKey={active.id === 'model' ? familyKey : null}
+                onFamilyOpen={setFamilyKey}
+                onSelect={(id) => {
+                  close();
+                  active.onSelect?.(id);
                 }}
-                className="sticky top-0 z-10 flex w-full items-center gap-1.5 border-b border-gray-800 bg-gray-900 px-2.5 py-1.5 text-[11px] font-medium text-gray-400 hover:text-gray-200"
-              >
-                <span className="inline-flex rotate-180">
-                  <Chevron open={false} />
-                </span>
-                <span>{active.title}</span>
-              </button>
-              {optionMenuRows(active.options).map((row) =>
-                row.heading ? (
-                  <p
-                    key={`heading:${row.heading}`}
-                    className="sticky top-8 z-10 px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-gray-500 border-b border-gray-800 bg-gray-900"
-                  >
-                    {row.heading}
-                  </p>
-                ) : (
-                  <button
-                    key={row.option.id}
-                    type="button"
-                    role="menuitem"
-                    onMouseDown={(e) => {
-                      if (e && typeof e.button === 'number' && e.button !== 0) return;
-                      e.preventDefault();
-                      close();
-                      active.onSelect?.(row.option.id);
-                    }}
-                    className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
-                      row.option.id === active.value
-                        ? 'bg-gray-800/70 font-medium text-emerald-300'
-                        : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
-                    }`}
-                  >
-                    <span className="font-medium break-all">{row.option.label}</span>
-                    {row.option.blurb ? (
-                      <span className="ml-1.5 text-gray-500">· {row.option.blurb}</span>
-                    ) : null}
-                  </button>
-                )
-              )}
+                headingStickyClass="top-8"
+                role="menuitem"
+              />
             </>
           ) : (
             pickers.map((picker) => (
@@ -370,10 +508,11 @@ export function ComposerOptionsMenu({
                 type="button"
                 role="menuitem"
                 onMouseDown={(e) => {
-                  if (e && typeof e.button === 'number' && e.button !== 0) return;
+                  if (!isPrimaryMouse(e)) return;
                   // preventDefault keeps the trigger focused so the deferred blur
                   // close never fires while opening a submenu.
                   e.preventDefault();
+                  setFamilyKey(null);
                   setPanel(picker.id);
                 }}
                 className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-left text-gray-400 hover:bg-gray-800/50 hover:text-gray-200"
@@ -532,7 +671,7 @@ function ClipboardIcon() {
  * panel, so a menu that grew down or to the right would always run past the
  * viewport.
  *
- * State stays with ChatHarness — this component only routes which action the
+ * State stays with SessionChat — this component only routes which action the
  * user picked, exactly like ComposerDropdown routes a picker selection.
  * @param {Array<{ id, label, hint, icon }>} actions
  * @param {(id: string) => void} onAction
@@ -549,7 +688,7 @@ export function AttachmentPicker({ actions = ATTACHMENT_ACTIONS, onAction }) {
       <div
         role="menu"
         aria-label="Attach a file to this message"
-        className="chat-attach-menu absolute right-0 bottom-[100%] z-30 w-[15rem] rounded-lg border border-gray-700 bg-gray-950 shadow-lg divide-y divide-gray-800"
+        className="chat-attach-menu absolute right-0 bottom-[100%] z-50 w-[15rem] rounded-lg border border-gray-700 bg-gray-950 shadow-lg divide-y divide-gray-800"
       >
         {actions.map((action) => (
           <button

@@ -14,14 +14,16 @@ export const KUSA_HOOK_VERSION = '1';
  * @param {string} options.sessionId
  * @param {string} [options.workspaceRoot]
  */
-export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = process.cwd() }) {
+export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = process.cwd(), harness = KUSA_HARNESS }) {
   const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const harnessName = typeof harness === 'string' && harness.trim() ? harness.trim() : KUSA_HARNESS;
   if (!dataDir || !id) {
     return {
       enabled: false,
       dataDir: '',
       sessionId: '',
       sessionKey: '',
+      harness: '',
       sessionStart() {},
       userPrompt() {},
       preToolUse() {},
@@ -37,7 +39,7 @@ export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = proc
       const clock = readMonoClock();
       const body = {
         kusa_version: KUSA_HOOK_VERSION,
-        harness: 'kusa',
+        harness: harnessName,
         sessionId: id,
         timestamp: Date.now(),
         cwd: workspaceRoot,
@@ -50,7 +52,7 @@ export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = proc
         nowWall: body.timestamp,
         nowMono: clock.mono,
         bootId: clock.bootId,
-        origin: 'kusa-agent',
+        origin: harnessName === KUSA_HARNESS ? 'kusa-agent' : 'chat-session',
       });
     } catch {
       // Monitoring must never break the chat agent.
@@ -64,7 +66,8 @@ export function createKusaHookEmitter({ dataDir, sessionId, workspaceRoot = proc
     // the per-session sidecar under this lane key).
     dataDir,
     sessionId: id,
-    sessionKey: laneKey(KUSA_HARNESS, id),
+    harness: harnessName,
+    sessionKey: laneKey(harnessName, id),
     sessionStart(extra = {}) {
       emit('sessionStart', { source: 'new', ...extra });
     },

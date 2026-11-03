@@ -184,7 +184,7 @@ async function prepare(page) {
     localStorage.setItem('monitor.sessionSubTab', 'chat');
     localStorage.setItem('monitor.sessionFilter', 'all');
     localStorage.setItem('monitor.sidebarView', 'sessions');
-    localStorage.removeItem('monitor.kusaSessions');
+    localStorage.removeItem('monitor.chatSessions');
     document.documentElement.dataset.theme = 'light';
     const res = await fetch('/kusa/sessions', {
       method: 'PUT',

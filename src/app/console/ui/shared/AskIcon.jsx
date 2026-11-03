@@ -9,7 +9,7 @@
  * It is the plain reading of "the model is asking": a question mark inside the
  * speech bubble the model actually spoke in, so the glyph and the transcript row
  * it marks agree on where the question came from — and it pairs with ApprovalIcon
- * as the same bubble with a check.
+ * (shield-check) as the gate glyph for the other pending user decision.
  *
  * The URI is painted through a CSS mask rather than an <img src> for one reason:
  * the card tints this glyph by state — violet while asking, emerald once

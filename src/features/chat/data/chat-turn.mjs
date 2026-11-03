@@ -251,6 +251,7 @@ export function ingestTurnEvent(job, ev) {
 export function createTurnJob({
   queueKey,
   sessionId,
+  harness = '',
   turnId = null,
   prompt = '',
   promptMessageId = null,
@@ -262,6 +263,7 @@ export function createTurnJob({
   return {
     queueKey: String(queueKey || ''),
     sessionId: String(sessionId || ''),
+    harness: String(harness || ''),
     turnId: turnId || randomUUID(),
     prompt: String(prompt || ''),
     promptMessageId: promptMessageId || newMessageId(),
@@ -283,6 +285,16 @@ export function createTurnJob({
     listeners: new Set(),
     terminal: null,
   };
+}
+
+/** Prefer `harness:id` queueKey so persist hits the right sidecar folder. */
+function turnSessionRef(job) {
+  const queueKey = String(job?.queueKey || '').trim();
+  if (queueKey) return queueKey;
+  const harness = String(job?.harness || '').trim();
+  const sessionId = String(job?.sessionId || '').trim();
+  if (harness && sessionId && !sessionId.includes(':')) return `${harness}:${sessionId}`;
+  return sessionId;
 }
 
 /** User row for the prompt that started this turn (for snapshot / sessions overlay). */
@@ -315,10 +327,10 @@ function messagesHaveUserPrompt(messages, userMsg) {
  * own PUT lands; the server owns this write when POST /kusa/chat starts.
  */
 export function persistTurnPrompt(dataDir, job) {
-  const sessionId = String(job?.sessionId || '').trim();
+  const sessionRef = turnSessionRef(job);
   const userMsg = turnUserMessage(job);
-  if (!sessionId || !dataDir || !userMsg) return null;
-  const session = readChatSession(dataDir, sessionId);
+  if (!sessionRef || !dataDir || !userMsg) return null;
+  const session = readChatSession(dataDir, sessionRef);
   if (!session) return null;
   if (messagesHaveUserPrompt(session.messages, userMsg)) return session;
   return writeChatSession(dataDir, {
@@ -376,11 +388,11 @@ export function subscribeTurn(job, listener) {
  * Idempotent on `turnId` so a reconnecting client and the server can both persist.
  */
 export function persistTurnCompletion(dataDir, job, terminal) {
-  const sessionId = String(job?.sessionId || '').trim();
-  if (!sessionId || !dataDir) return null;
+  const sessionRef = turnSessionRef(job);
+  if (!sessionRef || !dataDir) return null;
   // Make sure the opening user prompt is present even if the client never PUT it.
   persistTurnPrompt(dataDir, job);
-  const session = readChatSession(dataDir, sessionId);
+  const session = readChatSession(dataDir, sessionRef);
   if (!session) return null;
 
   const parts = Array.isArray(job.live?.parts) ? job.live.parts : [];
@@ -418,7 +430,13 @@ export function persistTurnCompletion(dataDir, job, terminal) {
     turnId: job.turnId,
     backend: terminal?.backend || null,
     ...(terminal?.type === 'stopped' || terminal?.stopped ? { stopped: true } : {}),
-    ...(terminal?.type === 'error' ? { error: true } : {}),
+    ...(terminal?.type === 'error' ? {
+      error: true,
+      ...(terminal?.code ? { code: String(terminal.code) } : {}),
+      ...(typeof terminal?.message === 'string' && terminal.message.trim()
+        ? { errorMessage: terminal.message.trim() }
+        : {}),
+    } : {}),
   };
 
   let messages = Array.isArray(session.messages) ? [...session.messages] : [];

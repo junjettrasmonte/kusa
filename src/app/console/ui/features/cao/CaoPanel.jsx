@@ -262,6 +262,8 @@ export function CaoPanel({ canPersist = false }) {
   const [editable, setEditable] = useState(true);
   const [showAllProviders, setShowAllProviders] = useState(false);
   const [installInfoId, setInstallInfoId] = useState(null);
+  const [starting, setStarting] = useState(false);
+  const [startNote, setStartNote] = useState('');
 
   const dirty = useMemo(() => serializeDraft(draft) !== baseline, [draft, baseline]);
   const creating = selectedName == null;
@@ -353,6 +355,28 @@ export function CaoPanel({ canPersist = false }) {
       setBusy(false);
     }
   }, [canPersist, refreshStatus, refreshProfiles]);
+
+  const startServer = useCallback(async () => {
+    if (!canPersist || starting) return;
+    setStarting(true);
+    setStartNote('');
+    try {
+      const result = await api('/cao/server/start', { method: 'POST' });
+      if (result?.status) setStatus(result.status);
+      else await refreshStatus();
+      setStartNote(result?.alreadyUp
+        ? 'cao-server was already up.'
+        : 'cao-server started.');
+      await refreshProfiles();
+    } catch (err) {
+      const data = err?.data;
+      if (data?.status) setStatus(data.status);
+      else await refreshStatus();
+      setStartNote(data?.error || err?.message || 'Could not start cao-server');
+    } finally {
+      setStarting(false);
+    }
+  }, [canPersist, starting, refreshStatus, refreshProfiles]);
 
   useEffect(() => {
     if (!canPersist) return undefined;
@@ -530,7 +554,18 @@ export function CaoPanel({ canPersist = false }) {
             title={s.installed ? 'Start cao-server' : 'Install CAO'}
             summary={s.error}
             steps={s.steps}
-            footnote="After installing or starting the server, click Refresh — this panel polls /cao while open."
+            action={s.installed ? {
+              label: 'Start cao-server',
+              busyLabel: 'Starting cao-server…',
+              busy: starting,
+              disabled: busy,
+              onClick: startServer,
+            } : null}
+            footnote={
+              startNote
+                ? startNote
+                : 'After installing or starting the server, click Refresh — this panel polls /cao while open.'
+            }
           />
         ) : null}
       </section>

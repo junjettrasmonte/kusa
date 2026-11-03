@@ -40,6 +40,49 @@ export const BUILTIN_EXTENSIONS = [
       icon: 'network',
     },
   },
+  {
+    id: 'live-chat',
+    name: 'Live Chat',
+    shortName: 'Live Chat',
+    /** On-disk home: extensions/live-chat/ */
+    root: 'extensions/live-chat',
+    builtin: true,
+    installed: true,
+    description:
+      'Voice live chat via Pipecat (Silero → Whisper → Strata → Piper/Kokoro). WebSocket or WebRTC transport.',
+    detail:
+      'Run the local Pipecat bot from extensions/live-chat, then use the empty-composer Live voice button. This panel shows server status and transport/TTS preferences. Requires the bot process up (LIVE_CHAT_BASE_URL).',
+    nav: {
+      placement: 'devtools',
+      id: 'live-chat',
+      label: 'Live Chat',
+      icon: 'audio-lines',
+    },
+  },
+  {
+    id: 'cursor-adapter',
+    name: 'Cursor Adapter',
+    shortName: 'Cursor',
+    root: 'extensions/cursor-adapter',
+    builtin: true,
+    installed: true,
+    description:
+      'Connects Cursor Agent CLI as a standard chat provider (stream turns, workspace trust, IDE titles).',
+    detail:
+      'Registers provider `cursor` (harness `cursor`, CAO `cursor_cli`). Headless stream-json turns, `/adapters/cursor/trust`, and composer titles from Cursor state.vscdb live here so core Kusă stays provider-agnostic.',
+  },
+  {
+    id: 'github-copilot-adapter',
+    name: 'GitHub Copilot Adapter',
+    shortName: 'Copilot',
+    root: 'extensions/github-copilot-adapter',
+    builtin: true,
+    installed: true,
+    description:
+      'Connects GitHub Copilot CLI as a standard chat provider (JSONL stream turns).',
+    detail:
+      'Registers provider `copilot` (harness `github-copilot`, CAO `copilot_cli`). Headless `copilot -p --stream on` turns live here so core Kusă stays provider-agnostic.',
+  },
 ];
 
 export function getBuiltinExtension(id) {

@@ -1,23 +1,11 @@
 import { STATUS_TEXT } from '#ui/shared/lib/format.js';
 import { AskIcon } from '#ui/shared/AskIcon.jsx';
 import { ApprovalIcon } from '#ui/shared/ApprovalIcon.jsx';
-import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
 
-// The sidebar's per-session indicator: one glyph that answers two questions at
-// once. The COLOUR is unchanged from StatusDot and answers "what is this session
-// doing" — emerald running, amber prompt open, sky idle, gray ended. The SHAPE
-// is the provider mark (kusa / cursor / …) by default, and only swaps at the
-// moments the row is worth reading: the question-mark bubble of an open ask,
-// the check bubble of an open approval, or lucide's square-check-big once the
-// assistant has finished the prompt it was running. A finished turn is the one
-// state this column exists to be read for — "the model is done, this row is
-// ready for your next prompt" — so it gets a shape of its own rather than the
-// provider mark alone. Running, prompt-open, and ended rows keep the provider
-// icon tinted by status. Nothing about the hue moves, so a session that is
-// waiting or done never looks like a different kind of session — it looks like
-// the same session, waiting or done. Resolved gates (answered, refused,
-// allowed, denied) are not marked: the user already spoke, and the row goes
-// back to its provider glyph.
+// Right-side status glyph for a sidebar session row. The provider (or multi-agent)
+// mark lives to the LEFT of the label; this column only answers "what needs you"
+// or "the turn is done" — ask, approval, or turn-complete. Busy / thinking /
+// ended rows stay blank here so the provider mark is never displaced.
 //
 // Same hues as StatusDot's DOT map, written as text-* because every glyph here
 // paints through currentColor.
@@ -35,16 +23,15 @@ const GATE_LABEL = {
 
 const TURN_LABEL = 'turn complete';
 
-// Matches the sidebar top-bar / right-rail 18px glyph box (see learnings).
-const ICON_SIZE = 'h-[18px] w-[18px]';
+// Sidebar session status glyphs (ask / approval / turn-complete).
+const ICON_SIZE = 'h-[14px] w-[14px]';
 
 /**
- * The finished-turn shape. lucide `square-check-big` (icons/square-check-big.svg),
- * paths verbatim from upstream Lucide v1.64.0, ISC License (lucide.dev/license) —
- * the same shipped artwork AskIcon.jsx and ApprovalIcon.jsx borrow, and it stays
- * on lucide's own 24×24 grid at lucide's own stroke 2 rather than being redrawn
- * on the house 16×16: at the 18px row box the ink lands with the same weight as
- * the other lucide glyphs in this strip.
+ * The finished-turn shape. lucide `badge-check` (icons/badge-check.svg),
+ * paths verbatim from upstream Lucide, ISC License (lucide.dev/license) —
+ * same licensing / grid rule as AskIcon.jsx and ApprovalIcon.jsx, kept on
+ * lucide's own 24×24 grid at lucide's own stroke 2 rather than being redrawn
+ * on the house 16×16.
  */
 function TurnDoneIcon({ size = ICON_SIZE, className = '', title = null }) {
   return (
@@ -59,8 +46,8 @@ function TurnDoneIcon({ size = ICON_SIZE, className = '', title = null }) {
       aria-hidden={title ? null : 'true'}
     >
       {title ? <title>{title}</title> : null}
-      <path d="M21 10.656V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h12.344" />
-      <path d="m9 11 3 3L22 4" />
+      <path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z" />
+      <path d="m16 9-5.5 5.5L8 12" />
     </svg>
   );
 }
@@ -87,7 +74,7 @@ function openGate(parts) {
   return approvalOpen ? 'approval' : null;
 }
 
-export function SessionIndicator({ status, parts = null, harness = 'kusa', className = '' }) {
+export function SessionIndicator({ status, parts = null, className = '' }) {
   const color = `${ICON_COLOR[status] || ICON_COLOR.idle}${className ? ` ${className}` : ''}`;
   // A gate the user still has to settle outranks everything: it names what they
   // must do next, whether or not the turn around it has closed.
@@ -99,20 +86,10 @@ export function SessionIndicator({ status, parts = null, harness = 'kusa', class
   }
   // Only a CLOSED turn gets the tick. 'idle' is laneStatus's own word for
   // "active session, no open turn" (features/monitor/lib.mjs): the assistant
-  // finished the prompt it was running and nothing is in flight. 'thinking' is a
-  // prompt still open, 'busy' a tool still running, and 'ended' a session that
-  // stopped — none of them completed a turn, so those three keep the provider
-  // mark tinted by status.
+  // finished the prompt it was running and nothing is in flight.
   if (status === 'idle') {
     const tooltip = `${STATUS_TEXT.idle} · ${TURN_LABEL}`;
     return <TurnDoneIcon size={ICON_SIZE} className={color} title={tooltip} />;
   }
-  return (
-    <HarnessLogo
-      harness={harness}
-      size={ICON_SIZE}
-      className={color}
-      title={STATUS_TEXT[status] || status}
-    />
-  );
+  return null;
 }

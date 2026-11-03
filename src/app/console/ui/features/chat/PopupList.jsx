@@ -10,7 +10,7 @@ import { DrawerCloseIcon, DrawerDockIcon } from './ChatGlyphs.jsx';
  *      so the chip reads "2/5" for a task list and "3" for a queue. It is
  *      disabled while there is nothing to list, so an empty list never takes
  *      space in the composer; the count stays visible on the control, which is
- *      one click away from listing the items. ChatHarness treats the switches
+ *      one click away from listing the items. SessionChat treats the switches
  *      as tabs: opening one closes the others. Below the composer's container
  *      breakpoint the name hides and only the glyph (+ count) remains, so the
  *      row still fits on a phone without losing the toggle.
@@ -18,12 +18,12 @@ import { DrawerCloseIcon, DrawerDockIcon } from './ChatGlyphs.jsx';
  *      icon that toggles bottom (above the message box) vs right (flush left of
  *      the right rail), and a close icon that hides the list (same as flipping
  *      the toolbar switch off). Dock is shared across all three drawers.
- *   3. A scrollable box of rows that fills the sized dock ChatHarness owns —
+ *   3. A scrollable box of rows that fills the sized dock SessionChat owns —
  *      bottom height / right width are drag-resized there (up to half the chat
  *      shell). The list scrolls inside that size so it never pushes the
  *      transcript away.
  *
- * State stays with the owner (ChatHarness), exactly like ComposerDropdown keeps
+ * State stays with the owner (SessionChat), exactly like ComposerDropdown keeps
  * `value` + `onSelect`: these components render and call back, they never own a
  * switch. Each list supplies its own rows and its own glyph, because the rows
  * carry the meaning — a queued prompt, a task, and a staged file are different
@@ -112,14 +112,14 @@ export function PopupToggle({
  * Bottom dock: a panel bounded on every side by a visible border, only its TOP
  * corners rounded — the square bottom edge says "this belongs to the composer
  * below me". Right dock: same gray-800 border language inside the side column
- * ChatHarness sizes (left border of that column separates from the transcript).
+ * SessionChat sizes (left border of that column separates from the transcript).
  * Both fill the sized parent; `maxHeightPx` is only a fallback if no sized
  * parent is wrapping the list.
  */
 export function PopupList({
   expanded = true,
   count = 0,
-  // Kept for call-site compatibility; ChatHarness sizes the dock wrapper so
+  // Kept for call-site compatibility; SessionChat sizes the dock wrapper so
   // the list fills that box instead of applying a fixed pixel cap here.
   maxHeightPx: _maxHeightPx,
   summary = '',

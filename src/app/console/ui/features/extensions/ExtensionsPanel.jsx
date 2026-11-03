@@ -1,8 +1,9 @@
 /**
  * Sidebar › Extensions — built-in (and later workspace) extension catalog.
  *
- * Selecting an installed extension with `nav` opens that placement (App owns
- * the switch). CLI Agent Orchestrator places on right-rail Dev Tools › CAO.
+ * Selecting a row loads that extension’s info & config page in the main pane
+ * (`ExtensionPage` via App `activeExtensionId`). Extensions that declare
+ * `nav.placement: 'devtools'` also stay reachable from Dev Tools (e.g. CAO).
  * The Kusă agent CLI is a standalone feature (not listed here); CAO can
  * optionally use it as provider kusa_cli.
  */
@@ -10,8 +11,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import { BUILTIN_EXTENSIONS } from './registry.js';
 
-async function fetchCaoStatus() {
-  const res = await fetch('/cao', { headers: { Accept: 'application/json' } });
+async function fetchJson(path) {
+  const res = await fetch(path, { headers: { Accept: 'application/json' } });
   const text = await res.text();
   let data = null;
   try {
@@ -32,17 +33,29 @@ function ExtensionIcon() {
   return <LucideIcon name="blocks" className="h-[18px] w-[18px]" />;
 }
 
-function statusLabel(ext, caoStatus) {
-  if (!caoStatus || ext.id !== 'cao') return null;
-  if (!caoStatus.installed) return { text: 'cao CLI missing', ok: false };
-  if (!caoStatus.serverUp) return { text: 'cao-server down', ok: false };
-  const kusa = (caoStatus.providers || []).find(
-    (p) => p.id === 'kusa_cli' || p.name === 'kusa_cli',
-  );
-  if (kusa?.available || kusa?.installed) {
-    return { text: 'server up · Kusa CLI ready', ok: true };
+function statusLabel(ext, statuses) {
+  if (!statuses) return null;
+  if (ext.id === 'cao') {
+    const caoStatus = statuses.cao;
+    if (!caoStatus) return null;
+    if (!caoStatus.installed) return { text: 'cao CLI missing', ok: false };
+    if (!caoStatus.serverUp) return { text: 'cao-server down', ok: false };
+    const kusa = (caoStatus.providers || []).find(
+      (p) => p.id === 'kusa_cli' || p.name === 'kusa_cli',
+    );
+    if (kusa?.available || kusa?.installed) {
+      return { text: 'server up · Kusa CLI ready', ok: true };
+    }
+    return { text: 'server up', ok: true };
   }
-  return { text: 'server up', ok: true };
+  if (ext.id === 'live-chat') {
+    const live = statuses.liveChat;
+    if (!live) return null;
+    if (!live.installed) return { text: 'bot not installed', ok: false };
+    if (!live.serverUp) return { text: 'bot down', ok: false };
+    return { text: `server up · ${live.transport || 'ws'}`, ok: true };
+  }
+  return null;
 }
 
 export function ExtensionsPanel({
@@ -51,18 +64,25 @@ export function ExtensionsPanel({
   onSelect = null,
   collapsed = false,
 }) {
-  const [caoStatus, setCaoStatus] = useState(null);
+  const [statuses, setStatuses] = useState(null);
 
   const refresh = useCallback(async () => {
     if (!canPersist) {
-      setCaoStatus(null);
+      setStatuses(null);
       return;
     }
+    const next = { cao: null, liveChat: null };
     try {
-      setCaoStatus(await fetchCaoStatus());
+      next.cao = await fetchJson('/cao');
     } catch {
-      setCaoStatus(null);
+      next.cao = null;
     }
+    try {
+      next.liveChat = await fetchJson('/live-chat');
+    } catch {
+      next.liveChat = null;
+    }
+    setStatuses(next);
   }, [canPersist]);
 
   useEffect(() => {
@@ -118,7 +138,7 @@ export function ExtensionsPanel({
         <ul className="space-y-1" aria-label="Built-in extensions">
           {BUILTIN_EXTENSIONS.map((ext) => {
             const on = selectedId === ext.id;
-            const badge = statusLabel(ext, caoStatus);
+            const badge = statusLabel(ext, statuses);
             return (
               <li key={ext.id}>
                 <button

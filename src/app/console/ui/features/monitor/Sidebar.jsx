@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  CHAT_PROVIDER_GROUPS,
   HARNESS_NAMES,
-  KUSA_HARNESS,
   SIDEBAR_VIEW_IDS,
   SIDEBAR_VIEW_LABELS,
   SIDEBAR_VIEW_MIGRATED,
   shortId,
   sessionLabel,
+  sessionRankAt,
   sessionTitle,
   STATUS_TEXT,
 } from '#ui/shared/lib/format.js';
@@ -15,11 +16,90 @@ import { KUSA_VERSION } from '#ui/shared/lib/version.js';
 import { PlusIcon } from '#ui/shared/IconButton.jsx';
 import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
 import { KusaLogo } from '#ui/shared/KusaLogo.jsx';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import { ExplorerPanel } from '#ui/features/explorer/ExplorerPanel.jsx';
 import { SearchPanel } from '#ui/features/explorer/SearchPanel.jsx';
 import { ExtensionsPanel } from '#ui/features/extensions/ExtensionsPanel.jsx';
-import { StatusDot } from './StatusDot.jsx';
 import { SessionIndicator } from './SessionIndicator.jsx';
+
+/** Provider / multi-agent mark tinted by session status (left of the row label). */
+const PROVIDER_COLOR = {
+  busy: 'text-emerald-400',
+  thinking: 'text-amber-400',
+  idle: 'text-sky-400',
+  ended: 'text-gray-500',
+};
+
+const PROVIDER_ICON_SIZE = 'h-[18px] w-[18px]';
+
+function isOrchestratedSession(session) {
+  const kind = String(session?.kind || session?.options?.kind || '').toLowerCase();
+  return kind === 'orchestrated' || Boolean(session?.options?.workflowId || session?.workflowId);
+}
+
+/**
+ * IDE-owned sessions (Cursor UI hooks, and any adapter with externalOwned)
+ * that Kusă only observes — not promptable here.
+ * Prefer the server-stamped `external` flag; fall back for monitor-only rows.
+ */
+const EXTERNAL_OWNED_HARNESS_FALLBACK = new Set(['cursor']);
+
+function isExternalSession(session) {
+  if (session?.external === true) return true;
+  if (session?.external === false) return false;
+  const harness = session?.harness
+    || (typeof session?.key === 'string' && session.key.includes(':')
+      ? session.key.slice(0, session.key.indexOf(':'))
+      : '');
+  if (!EXTERNAL_OWNED_HARNESS_FALLBACK.has(harness)) return false;
+  // Monitor-only IDE row (no chat ownership record from createChatSession).
+  if (session?.provider || Array.isArray(session?.messages)) return false;
+  return true;
+}
+
+function SessionProviderIcon({ session, className = '' }) {
+  const color = `${PROVIDER_COLOR[session?.status] || PROVIDER_COLOR.idle}${className ? ` ${className}` : ''}`;
+  const external = isExternalSession(session);
+  const orchestrated = isOrchestratedSession(session);
+  const harness = session?.harness
+    || (typeof session?.key === 'string' && session.key.includes(':')
+      ? session.key.slice(0, session.key.indexOf(':'))
+      : 'kusa');
+  const baseTitle = orchestrated
+    ? 'Orchestrated · multiple agents'
+    : (HARNESS_NAMES[harness] || harness);
+  const title = external ? `${baseTitle} · external (Cursor UI)` : baseTitle;
+  const mark = orchestrated ? (
+    <LucideIcon
+      name="network"
+      className={`${PROVIDER_ICON_SIZE} ${color}`}
+      title={external ? null : title}
+    />
+  ) : (
+    <HarnessLogo
+      harness={harness}
+      size={PROVIDER_ICON_SIZE}
+      className={color}
+      title={external ? null : title}
+    />
+  );
+  if (!external) return mark;
+  // Composite: provider mark + corner external badge (Cursor UI–owned).
+  return (
+    <span
+      className={`relative inline-flex shrink-0 ${PROVIDER_ICON_SIZE}`}
+      title={title}
+    >
+      {mark}
+      <span
+        className="pointer-events-none absolute -bottom-0.5 -right-0.5 flex h-2.5 w-2.5 items-center justify-center rounded-[2px] bg-gray-950 text-amber-400 ring-1 ring-gray-950"
+        aria-hidden="true"
+      >
+        <LucideIcon name="external-link" className="h-2 w-2" />
+      </span>
+    </span>
+  );
+}
 
 const FILTERS = [
   { id: 'all', label: 'All' },
@@ -144,11 +224,9 @@ export function Sidebar({
   selected,
   collapsed,
   onToggleCollapsed,
-  collapsedHarnesses,
-  onToggleHarness,
   onSelectLane,
-  onNewKusaSession,
-  kusaSessions = [],
+  onNewSession,
+  chatSessions = [],
   sessionFilter = 'all',
   onSessionFilterChange,
   selectMode = false,
@@ -163,7 +241,7 @@ export function Sidebar({
   deleteGate = false,
   statusLine = null,
   statusLane = null,
-  statusKusaSession = null,
+  statusChatSession = null,
   canPersistExtensions = false,
   activeExtensionId = null,
   onSelectExtension = null,
@@ -171,7 +249,12 @@ export function Sidebar({
   const harnesses = data?.harnesses || [];
   const [view, setView] = useState(initialSidebarView);
   const [filterOpen, setFilterOpen] = useState(false);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [newSessionSub, setNewSessionSub] = useState(null); // 'standard' | 'orchestrated' | null
+  const [workflows, setWorkflows] = useState([]);
+  const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const filterRef = useRef(null);
+  const newSessionRef = useRef(null);
   const filterActive = sessionFilter !== 'all';
   const filterLabel = FILTERS.find((f) => f.id === sessionFilter)?.label || 'All';
   const sessionsView = view === 'sessions';
@@ -181,6 +264,8 @@ export function Sidebar({
     setView(next);
     writeLocal('monitor.sidebarView', next);
     setFilterOpen(false);
+    setNewSessionOpen(false);
+    setNewSessionSub(null);
     if (next !== 'sessions' && selectMode) {
       onSelectModeChange?.(false);
       onClearChecked?.();
@@ -188,14 +273,22 @@ export function Sidebar({
   }
 
   useEffect(() => {
-    if (!filterOpen) return undefined;
+    if (!filterOpen && !newSessionOpen) return undefined;
     function onPointerDown(event) {
-      if (filterRef.current && !filterRef.current.contains(event.target)) {
+      if (filterOpen && filterRef.current && !filterRef.current.contains(event.target)) {
         setFilterOpen(false);
+      }
+      if (newSessionOpen && newSessionRef.current && !newSessionRef.current.contains(event.target)) {
+        setNewSessionOpen(false);
+        setNewSessionSub(null);
       }
     }
     function onKeyDown(event) {
-      if (event.key === 'Escape') setFilterOpen(false);
+      if (event.key === 'Escape') {
+        setFilterOpen(false);
+        setNewSessionOpen(false);
+        setNewSessionSub(null);
+      }
     }
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
@@ -203,31 +296,68 @@ export function Sidebar({
       document.removeEventListener('mousedown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [filterOpen]);
+  }, [filterOpen, newSessionOpen]);
 
   useEffect(() => {
-    if (collapsed) setFilterOpen(false);
+    if (collapsed) {
+      setFilterOpen(false);
+      setNewSessionOpen(false);
+      setNewSessionSub(null);
+    }
   }, [collapsed]);
 
-  const filteredHarnesses = useMemo(() => {
-    const monitorHarnesses = harnesses.filter((h) => h.harness !== KUSA_HARNESS);
-    const kusaGroup = {
-      harness: KUSA_HARNESS,
-      label: HARNESS_NAMES[KUSA_HARNESS],
-      sessions: kusaSessions,
+  useEffect(() => {
+    if (!newSessionOpen || newSessionSub !== 'orchestrated') return undefined;
+    let cancelled = false;
+    setWorkflowsLoading(true);
+    fetch('/cao/workflows', { headers: { Accept: 'application/json' } })
+      .then(async (res) => {
+        if (!res.ok) return [];
+        const body = await res.json().catch(() => ({}));
+        const list = Array.isArray(body?.workflows) ? body.workflows : Array.isArray(body) ? body : [];
+        return list.map((w) => ({
+          id: String(w?.name || w?.id || '').trim(),
+          label: String(w?.name || w?.id || w?.title || '').trim(),
+          provider: typeof w?.provider === 'string' ? w.provider : null,
+        })).filter((w) => w.id);
+      })
+      .then((list) => {
+        if (!cancelled) setWorkflows(list);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkflows([]);
+      })
+      .finally(() => {
+        if (!cancelled) setWorkflowsLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [newSessionOpen, newSessionSub]);
+
+  // Flat Agents list: every chat + monitor-only session, newest rank first.
+  // Dedup by session id (and key) so a kusa hook shadow of a cursor/copilot
+  // chat cannot appear twice after we stopped grouping by provider.
+  const filteredSessions = useMemo(() => {
+    const byId = new Map();
+    const seenKeys = new Set();
+    const take = (session) => {
+      if (!session?.key || seenKeys.has(session.key)) return;
+      const id = session.id || session.key;
+      if (byId.has(id)) return;
+      seenKeys.add(session.key);
+      byId.set(id, session);
     };
-    return [kusaGroup, ...monitorHarnesses]
-      .map((h) => ({
-        ...h,
-        sessions: (h.sessions || []).filter((s) => matchesFilter(s, sessionFilter)),
-      }))
-      // Kusă stays visible even with zero sessions so New session remains reachable.
-      .filter((h) => h.harness === KUSA_HARNESS || h.sessions.length > 0 || sessionFilter === 'all');
-  }, [harnesses, kusaSessions, sessionFilter]);
+    for (const session of chatSessions || []) take(session);
+    for (const group of harnesses || []) {
+      for (const session of group.sessions || []) take(session);
+    }
+    return [...byId.values()]
+      .filter((s) => matchesFilter(s, sessionFilter))
+      .sort((a, b) => sessionRankAt(b) - sessionRankAt(a));
+  }, [harnesses, chatSessions, sessionFilter]);
 
   const visibleKeys = useMemo(
-    () => filteredHarnesses.flatMap((h) => h.sessions.map((s) => s.key)),
-    [filteredHarnesses],
+    () => filteredSessions.map((s) => s.key),
+    [filteredSessions],
   );
 
   const checkedVisible = useMemo(
@@ -242,8 +372,8 @@ export function Sidebar({
     else onToggleChecked?.(visibleKeys, true);
   }
 
-  const statusAgentBit = statusKusaSession
-    ? `Kusă › ${shortId(statusKusaSession.id)} · ${STATUS_TEXT[statusKusaSession.status] || statusKusaSession.status}`
+  const statusAgentBit = statusChatSession
+    ? `${HARNESS_NAMES[statusChatSession.harness] || statusChatSession.provider || 'Chat'} › ${shortId(statusChatSession.id)} · ${STATUS_TEXT[statusChatSession.status] || statusChatSession.status}`
     : statusLane
       ? `${statusLane.label} › ${shortId(statusLane.session?.id)} · ${STATUS_TEXT[statusLane.status] || statusLane.status}${
           statusLane.key === data?.focus ? '' : ' · pinned'
@@ -317,6 +447,116 @@ export function Sidebar({
             Agents
           </span>
           <div className="ml-auto flex items-center gap-0.5">
+            <div className="relative" ref={newSessionRef}>
+              <ToolIconButton
+                label="New session"
+                active={newSessionOpen}
+                aria-haspopup="menu"
+                aria-expanded={newSessionOpen}
+                onClick={() => {
+                  setFilterOpen(false);
+                  setNewSessionOpen((open) => !open);
+                  setNewSessionSub(null);
+                }}
+              >
+                <PlusIcon className="h-3.5 w-3.5" />
+              </ToolIconButton>
+              {newSessionOpen && (
+                <div
+                  role="menu"
+                  aria-label="New session"
+                  className="absolute right-0 top-full z-30 mt-1 min-w-[12rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
+                >
+                  {!newSessionSub ? (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                        onClick={() => setNewSessionSub('standard')}
+                      >
+                        <span>Standard Session</span>
+                        <span className="text-gray-500">›</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                        onClick={() => setNewSessionSub('orchestrated')}
+                      >
+                        <span>Orchestrated Session</span>
+                        <span className="text-gray-500">›</span>
+                      </button>
+                    </>
+                  ) : null}
+                  {newSessionSub === 'standard' ? (
+                    <>
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
+                        onClick={() => setNewSessionSub(null)}
+                      >
+                        ‹ Standard Session
+                      </button>
+                      {CHAT_PROVIDER_GROUPS.map((group) => (
+                        <button
+                          key={group.id}
+                          type="button"
+                          role="menuitem"
+                          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                          onClick={() => {
+                            setNewSessionOpen(false);
+                            setNewSessionSub(null);
+                            onNewSession?.({ provider: group.id, kind: 'standard' });
+                          }}
+                        >
+                          <HarnessLogo harness={group.harness} size="h-3.5 w-3.5" />
+                          <span>{group.label}</span>
+                        </button>
+                      ))}
+                    </>
+                  ) : null}
+                  {newSessionSub === 'orchestrated' ? (
+                    <>
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
+                        onClick={() => setNewSessionSub(null)}
+                      >
+                        ‹ Orchestrated Session
+                      </button>
+                      {workflowsLoading ? (
+                        <p className="px-3 py-2 text-[11px] text-gray-500">Loading workflows…</p>
+                      ) : workflows.length ? (
+                        workflows.map((wf) => (
+                          <button
+                            key={wf.id}
+                            type="button"
+                            role="menuitem"
+                            className="flex w-full items-center px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
+                            onClick={() => {
+                              setNewSessionOpen(false);
+                              setNewSessionSub(null);
+                              onNewSession?.({
+                                provider: wf.provider || 'kusa',
+                                kind: 'orchestrated',
+                                workflowId: wf.id,
+                              });
+                            }}
+                          >
+                            {wf.label || wf.id}
+                          </button>
+                        ))
+                      ) : (
+                        <p className="px-3 py-2 text-[11px] text-gray-500">
+                          No workflows yet. A manage page will come later.
+                        </p>
+                      )}
+                    </>
+                  ) : null}
+                </div>
+              )}
+            </div>
             <ToolIconButton
               label={selectMode ? 'Done selecting' : 'Select agents'}
               pressed={selectMode}
@@ -337,7 +577,11 @@ export function Sidebar({
                 active={filterActive || filterOpen}
                 aria-haspopup="menu"
                 aria-expanded={filterOpen}
-                onClick={() => setFilterOpen((open) => !open)}
+                onClick={() => {
+                  setNewSessionOpen(false);
+                  setNewSessionSub(null);
+                  setFilterOpen((open) => !open);
+                }}
               >
                 <FilterIcon className="h-3.5 w-3.5" />
               </ToolIconButton>
@@ -410,143 +654,105 @@ export function Sidebar({
           role="tabpanel"
           aria-labelledby="sidebar-view-sessions"
           className="flex-1 overflow-y-auto py-2 text-sm"
-          aria-label="Harnesses and agents"
+          aria-label="Agents"
         >
-          {filteredHarnesses.map((h) => {
-            const isKusa = h.harness === KUSA_HARNESS;
-            const folded = collapsedHarnesses.has(h.harness);
-            const live = h.sessions.filter((s) => s.status === 'busy' || s.status === 'thinking').length;
-            const headStatus = h.sessions.some((s) => s.status === 'busy')
-              ? 'busy'
-              : h.sessions.some((s) => s.status === 'thinking')
-                ? 'thinking'
-                : h.sessions.some((s) => s.status === 'idle')
-                  ? 'idle'
-                  : isKusa
-                    ? 'idle'
-                    : 'ended';
-            const title = `${h.label || HARNESS_NAMES[h.harness] || h.harness} · ${h.sessions.length} session${h.sessions.length === 1 ? '' : 's'}${live ? `, ${live} live` : ''}${h.sessions.length ? ` · ${STATUS_TEXT[headStatus] || headStatus}` : ''}`;
+          {!filteredSessions.length ? (
+            collapsed ? null : (
+              <p className="px-3 py-2 text-[11px] text-gray-600 sidebar-label">
+                No sessions yet. Use + to start one.
+              </p>
+            )
+          ) : (
+            filteredSessions.map((s) => {
+              const isChatRow = Boolean(
+                s.messages
+                || s.provider
+                || s.kind
+                || (typeof s.key === 'string' && chatSessions.some((c) => c.key === s.key)),
+              );
+              const active = s.key === selected;
+              const checked = checkedKeys?.has(s.key);
+              const canRemove = (isChatRow || canDelete) && !deleteGate;
+              const label = sessionLabel(s);
+              const titled = Boolean(sessionTitle(s));
 
-            return (
-              <div key={h.harness}>
+              const external = isExternalSession(s);
+              const rowTitle = external
+                ? (titled ? `${label} · external (Cursor UI)` : 'External session · Cursor UI')
+                : (titled ? `Session ${shortId(s.id)}` : 'unknown');
+
+              if (collapsed) {
+                return (
+                  <button
+                    key={s.key}
+                    type="button"
+                    title={external ? `${label} · external (Cursor UI)` : label}
+                    aria-label={external ? `${label} (external session)` : label}
+                    aria-current={active ? 'true' : undefined}
+                    className={`flex w-full items-center justify-center px-0 py-2 hover:bg-gray-800 ${active ? 'bg-gray-800' : ''}`}
+                    onClick={() => {
+                      onSelectLane(s.key);
+                      onToggleCollapsed?.();
+                    }}
+                  >
+                    <SessionProviderIcon session={s} />
+                  </button>
+                );
+              }
+
+              return (
                 <div
-                  className={`tree-harness group/harness flex w-full items-center gap-1 font-medium text-gray-200 ${collapsed ? 'justify-center px-0 py-2' : 'px-2'}`}
+                  key={s.key}
+                  className={`group tree-session flex w-full items-center gap-1 px-2 py-1 text-left hover:bg-gray-800 ${active ? 'bg-gray-800 text-gray-100' : 'text-gray-400'}`}
                 >
+                  {selectMode ? (
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 shrink-0 rounded border-gray-600 bg-gray-800 accent-emerald-500"
+                      checked={!!checked}
+                      aria-label={`Select ${label}`}
+                      onChange={() => onToggleChecked?.([s.key])}
+                    />
+                  ) : null}
                   <button
                     type="button"
-                    title={title}
-                    className={`flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left hover:bg-gray-800 ${collapsed ? 'justify-center rounded px-0' : 'rounded-md px-1'}`}
-                    onClick={() => onToggleHarness(h.harness)}
+                    title={rowTitle}
+                    className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
+                    onClick={() => onSelectLane(s.key)}
                   >
-                    {collapsed ? (
-                      <span className="relative inline-flex">
-                        <HarnessLogo harness={h.harness} size="h-5 w-5" />
-                        <StatusDot
-                          status={headStatus}
-                          className={`absolute -bottom-0.5 -right-0.5 ring-2 ring-gray-900 ${headStatus === 'ended' ? 'bg-gray-900' : ''}`}
-                        />
+                    <SessionProviderIcon session={s} />
+                    <span className={`min-w-0 flex-1 truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
+                    {!isExternalSession(s) ? (
+                      <span className="shrink-0">
+                        <SessionIndicator status={s.status} parts={s.live?.parts} />
                       </span>
-                    ) : (
-                      <>
-                        <svg
-                          className={`h-3 w-3 shrink-0 text-gray-500 transition-transform ${folded ? '' : 'rotate-90'}`}
-                          viewBox="0 0 16 16"
-                          fill="currentColor"
-                        >
-                          <path d="M6 4l4 4-4 4z" />
-                        </svg>
-                        <HarnessLogo harness={h.harness} />
-                        <StatusDot status={headStatus} />
-                        <span className="truncate">{h.label || HARNESS_NAMES[h.harness] || h.harness}</span>
-                        <span className="ml-auto rounded-full bg-gray-800 px-1.5 text-[10px] text-gray-400">
-                          {h.sessions.length}{live ? ` · ${live} live` : ''}
-                        </span>
-                      </>
-                    )}
+                    ) : null}
                   </button>
-                  {isKusa && !collapsed && (
+                  {!selectMode && (
                     <button
                       type="button"
-                      title="New session"
-                      aria-label="New Kusă session"
-                      className="shrink-0 rounded p-1.5 text-gray-400 hover:bg-gray-800 hover:text-emerald-400"
+                      className="shrink-0 rounded p-1 text-gray-600 opacity-0 hover:bg-gray-700 hover:text-rose-300 group-hover:opacity-100 focus:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
+                      title={
+                        deleteGate
+                          ? 'A delete confirmation is open — answer it first'
+                          : isChatRow || canDelete
+                            ? 'Delete session'
+                            : 'Start the local console server (npm run kusa:serve) to delete sessions'
+                      }
+                      aria-label={`Delete ${label}`}
+                      disabled={!canRemove}
                       onClick={(event) => {
                         event.stopPropagation();
-                        onNewKusaSession?.();
+                        onDeleteKeys?.([s.key]);
                       }}
                     >
-                      <PlusIcon className="h-3.5 w-3.5" />
+                      <TrashIcon />
                     </button>
                   )}
                 </div>
-                {!folded && !collapsed && !h.sessions.length && isKusa ? (
-                  <p className="px-3 pb-2 pl-9 text-[11px] text-gray-600 sidebar-label">
-                    No chats yet. Start a new session.
-                  </p>
-                ) : null}
-                {!folded && !collapsed && h.sessions.map((s) => {
-                  const active = s.key === selected;
-                  const latest = !isKusa && s.key === data?.focus;
-                  const checked = checkedKeys?.has(s.key);
-                  const canRemove = (isKusa || canDelete) && !deleteGate;
-                  const label = sessionLabel(s);
-                  const titled = Boolean(sessionTitle(s));
-                  return (
-                    <div
-                      key={s.key}
-                      className={`group tree-session flex w-full items-center gap-1 py-1 pl-7 pr-2 text-left hover:bg-gray-800 ${active ? 'bg-gray-800 text-gray-100' : 'text-gray-400'}`}
-                    >
-                      {selectMode ? (
-                        <input
-                          type="checkbox"
-                          className="h-3.5 w-3.5 shrink-0 rounded border-gray-600 bg-gray-800 accent-emerald-500"
-                          checked={!!checked}
-                          aria-label={`Select ${label}`}
-                          onChange={() => onToggleChecked?.([s.key])}
-                        />
-                      ) : null}
-                      <button
-                        type="button"
-                        title={titled ? `Session ${shortId(s.id)}` : 'unknown'}
-                        className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
-                        onClick={() => onSelectLane(s.key)}
-                      >
-                        <SessionIndicator status={s.status} parts={s.live?.parts} harness={h.harness} />
-                        <span className={`truncate text-xs ${titled ? 'text-gray-200' : 'font-mono text-gray-400'}`}>{label}</span>
-                        {latest ? <span className="ml-auto text-[10px] uppercase tracking-wide text-emerald-500">latest</span> : null}
-                        {!isKusa ? (
-                          <span className={`${latest ? '' : 'ml-auto '}tabular-nums text-[10px] text-gray-500`}>{s.attempts}</span>
-                        ) : null}
-                      </button>
-                      {!selectMode && (
-                        <button
-                          type="button"
-                          className="shrink-0 rounded p-1 text-gray-600 opacity-0 hover:bg-gray-700 hover:text-rose-300 group-hover:opacity-100 focus:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
-                          title={
-                            deleteGate
-                              ? 'A delete confirmation is open — answer it first'
-                              : isKusa
-                                ? 'Delete session'
-                                : canDelete
-                                  ? 'Delete session'
-                                  : 'Start the local console server (npm run kusa:serve) to delete sessions'
-                          }
-                          aria-label={`Delete ${label}`}
-                          disabled={!canRemove}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            onDeleteKeys?.([s.key]);
-                          }}
-                        >
-                          <TrashIcon />
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </nav>
       ) : (
         <>

@@ -10,7 +10,8 @@ Catalog id: `cao` · Folder: `extensions/cli-agent-orchestrator/` · Dev Tools n
 
 ## Console
 
-**Extensions → CLI Agent Orchestrator** opens Dev Tools › CAO.
+**Extensions → CLI Agent Orchestrator** opens its info & config page in the main
+pane (also reachable from Dev Tools › CAO).
 
 Kusă’s agent shell is the standalone **`kusa agent`** CLI
 (`src/features/kusa-cli/`). Optionally register it as CAO provider `kusa_cli`

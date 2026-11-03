@@ -4,7 +4,7 @@
  * Native 24×24 grid at stroke 2 → 1.5px ink inside an 18×18 box.
  */
 const PATHS = {
-  /** https://lucide.dev/icons/network — supervisor + workers. */
+  /** https://lucide.dev/icons/network — supervisor + workers / multi-agent. */
   network: (
     <>
       <rect x="16" y="16" width="6" height="6" rx="1" />
@@ -12,6 +12,17 @@ const PATHS = {
       <rect x="9" y="2" width="6" height="6" rx="1" />
       <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" />
       <path d="M12 12V8" />
+    </>
+  ),
+  /** https://lucide.dev/icons/audio-lines — Live Chat voice extension. */
+  'audio-lines': (
+    <>
+      <path d="M2 10v3" />
+      <path d="M6 6v11" />
+      <path d="M10 3v18" />
+      <path d="M14 8v7" />
+      <path d="M18 5v13" />
+      <path d="M22 10v3" />
     </>
   ),
   /** https://lucide.dev/icons/blocks — Extensions catalog. */
@@ -104,6 +115,14 @@ const PATHS = {
     <>
       <path d="M5 12h14" />
       <path d="M12 5v14" />
+    </>
+  ),
+  /** https://lucide.dev/icons/external-link — external / IDE-owned session. */
+  'external-link': (
+    <>
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
     </>
   ),
   /** https://lucide.dev/icons/chevron-down — collapsible card / disclosure. */

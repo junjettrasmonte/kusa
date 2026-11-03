@@ -36,6 +36,8 @@ export function RailSubmenu({
   // grow the document). Both literals must stay literal: Tailwind generates a
   // utility only for a class it can see in the source.
   anchor = 'down',
+  /** Optional per-id status: `{ [id]: { tone: 'ok'|'down', title?: string } }`. */
+  itemStatus = null,
 }) {
   if (!ids?.length) return null;
 
@@ -44,10 +46,19 @@ export function RailSubmenu({
       role="tablist"
       aria-label={ariaLabel}
       aria-orientation="vertical"
-      className={`rail-submenu absolute right-[100%] z-30 flex flex-col items-stretch w-40 rounded-md border border-gray-700 bg-gray-900 py-1.5 px-2 shadow-lg ${anchor === 'up' ? 'bottom-0' : 'top-0'}`}
+      className={`rail-submenu absolute right-[100%] z-30 flex flex-col items-stretch w-44 rounded-md border border-gray-700 bg-gray-900 py-1.5 px-2 shadow-lg ${anchor === 'up' ? 'bottom-0' : 'top-0'}`}
     >
       {ids.map((id) => {
         const on = id === value;
+        const status = itemStatus?.[id] || null;
+        const statusTitle = status?.title || '';
+        const label = labels[id];
+        const title = statusTitle ? `${label} — ${statusTitle}` : label;
+        const toneClass = status?.tone === 'ok'
+          ? 'bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.25)]'
+          : status?.tone === 'down'
+            ? 'bg-rose-500 shadow-[0_0_0_2px_rgba(244,63,94,0.25)]'
+            : '';
         return (
           <button
             key={id}
@@ -56,8 +67,8 @@ export function RailSubmenu({
             id={`${idPrefix}-tab-${id}`}
             aria-controls={`${idPrefix}-panel-${id}`}
             aria-selected={on}
-            title={labels[id]}
-            aria-label={labels[id]}
+            title={title}
+            aria-label={title}
             className={`flex w-full h-6 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium text-left transition-colors ${
               on
                 ? 'bg-emerald-500/15 text-emerald-400'
@@ -66,7 +77,14 @@ export function RailSubmenu({
             onClick={() => onChange(id)}
           >
             <SubTabIcon id={id} />
-            {labels[id]}
+            <span className="min-w-0 flex-1 truncate">{label}</span>
+            {status && toneClass ? (
+              <span
+                className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${toneClass}`}
+                title={statusTitle}
+                aria-hidden="true"
+              />
+            ) : null}
           </button>
         );
       })}

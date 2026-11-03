@@ -114,10 +114,32 @@ export const HARNESS_NAMES = {
   'github-copilot': 'GitHub Copilot',
 };
 
+/** Provider groups shown in Agents (standard + orchestrated chat sessions). */
+export const CHAT_PROVIDER_GROUPS = [
+  { id: 'kusa', harness: 'kusa', label: 'Kusă' },
+  { id: 'cursor', harness: 'cursor', label: 'Cursor' },
+  { id: 'copilot', harness: 'github-copilot', label: 'Copilot' },
+];
+
+export const CHAT_HARNESSES = CHAT_PROVIDER_GROUPS.map((g) => g.harness);
+
 export const KUSA_HARNESS = 'kusa';
 
 export function isKusaKey(key) {
   return typeof key === 'string' && key.startsWith(`${KUSA_HARNESS}:`);
+}
+
+/** True when the key belongs to a chat-capable provider harness. */
+export function isChatSessionKey(key) {
+  if (typeof key !== 'string' || !key.includes(':')) return false;
+  const harness = key.slice(0, key.indexOf(':'));
+  return CHAT_HARNESSES.includes(harness);
+}
+
+export function harnessFromKey(key) {
+  if (typeof key !== 'string' || !key.includes(':')) return null;
+  const harness = key.slice(0, key.indexOf(':'));
+  return CHAT_HARNESSES.includes(harness) || HARNESS_NAMES[harness] ? harness : null;
 }
 
 export function kusaLaneKey(sessionId) {
@@ -232,14 +254,12 @@ export const HARNESS_SUBTAB_LABELS = {
 /** Sub-views under the Settings rail tab. Login/auth lives on the Account (user) page. */
 export const SETTINGS_SUBTAB_IDS = [
   'agent',
-  'playback',
   'workspace',
   'sdk',
 ];
 
 export const SETTINGS_SUBTAB_LABELS = {
   agent: 'Agent',
-  playback: 'Playback',
   workspace: 'Workspace',
   sdk: 'SDK listener',
 };

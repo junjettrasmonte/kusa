@@ -28,7 +28,7 @@ describe('chat-store', () => {
       });
       assert.deepEqual(written.options, { mode: 'agent', rules: 'allow' });
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'kusa', 'pick-1', 'pick-1.chat.json'), 'utf8'),
+        readFileSync(join(dir, 'sessions', 'pick-1', 'pick-1.chat.json'), 'utf8'),
       );
       // The transcript stays a transcript: no picks inside it.
       assert.equal(Object.hasOwn(transcript, 'options'), false);
@@ -64,9 +64,9 @@ describe('chat-store', () => {
       // A hand-edited sidecar that looks like a lane record (id + harness) must
       // not hydrate a row: listLaneFiles reads every other .json in the folder,
       // and a settings file carries no prompts.
-      mkdirSync(join(dir, 'kusa', 'ghost'), { recursive: true });
+      mkdirSync(join(dir, 'sessions', 'ghost'), { recursive: true });
       writeFileSync(
-        join(dir, 'kusa', 'ghost', 'session.json'),
+        join(dir, 'sessions', 'ghost', 'session.json'),
         JSON.stringify({ harness: 'kusa', id: 'ghost', rules: 'allow' }),
       );
       const listed = listChatSessions(dir);
@@ -75,24 +75,25 @@ describe('chat-store', () => {
     });
 
     it('flat and stem-prefixed session config migrate into session.json', () => {
-      // Pre-folder leftover beside the harness root.
+      // Pre-folder leftover beside the legacy harness root.
+      mkdirSync(join(dir, 'kusa'), { recursive: true });
       writeFileSync(
         join(dir, 'kusa', 'flat-1.session.json'),
         JSON.stringify({ rules: 'deny', model: 'from-flat' }),
       );
       assert.deepEqual(readSessionConfig(dir, 'flat-1'), { rules: 'deny', model: 'from-flat' });
       assert.equal(existsSync(join(dir, 'kusa', 'flat-1.session.json')), false);
-      assert.equal(existsSync(join(dir, 'kusa', 'flat-1', 'session.json')), true);
+      assert.equal(existsSync(join(dir, 'sessions', 'flat-1', 'session.json')), true);
 
       // Short-lived in-folder `<id>.session.json` name → canonical session.json.
-      mkdirSync(join(dir, 'kusa', 'stem-1'), { recursive: true });
+      mkdirSync(join(dir, 'sessions', 'stem-1'), { recursive: true });
       writeFileSync(
-        join(dir, 'kusa', 'stem-1', 'stem-1.session.json'),
+        join(dir, 'sessions', 'stem-1', 'stem-1.session.json'),
         JSON.stringify({ rules: 'allow' }),
       );
       assert.deepEqual(readSessionConfig(dir, 'stem-1'), { rules: 'allow' });
-      assert.equal(existsSync(join(dir, 'kusa', 'stem-1', 'stem-1.session.json')), false);
-      assert.equal(existsSync(join(dir, 'kusa', 'stem-1', 'session.json')), true);
+      assert.equal(existsSync(join(dir, 'sessions', 'stem-1', 'stem-1.session.json')), false);
+      assert.equal(existsSync(join(dir, 'sessions', 'stem-1', 'session.json')), true);
     });
 
     it('attachment bytes land in the session attachments folder, not chat.json', () => {
@@ -115,7 +116,7 @@ describe('chat-store', () => {
       assert.equal(written.messages[0].attachments[0].dataUrl, dataUrl);
       assert.ok(written.messages[0].attachments[0].file);
       const transcript = JSON.parse(
-        readFileSync(join(dir, 'kusa', 'attach-1', 'attach-1.chat.json'), 'utf8'),
+        readFileSync(join(dir, 'sessions', 'attach-1', 'attach-1.chat.json'), 'utf8'),
       );
       // On disk the transcript keeps only the pointer — no inline payload.
       assert.equal(transcript.messages[0].attachments[0].dataUrl, undefined);

@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -105,7 +105,7 @@ function readPersisted(dir) {
 /** Concatenate persisted text files so tests can assert secrets never landed on disk. */
 function persistedText(dir) {
   const chunks = [];
-  for (const name of ['index.json', 'dashboard.html', 'dashboard.md', 'monitor-data.js']) {
+  for (const name of ['index.json', 'dashboard.html', 'monitor-data.js']) {
     chunks.push(readFileSync(join(dir, name), 'utf8'));
   }
   const { index } = readPersisted(dir);
@@ -251,7 +251,7 @@ describe('Copilot feature parity', () => {
     assert.equal(stored['github-copilot:sess-1']?.todos[0].content, 'Copilot todo');
   });
 
-  it('keeps task lists per session in tasks.json (prompts stay workspace-shared)', () => {
+  it('keeps task lists per session in tasks.json (held prompts are per-session too)', () => {
     const dir = tempDir();
     feed(dir, 'sessionStart', session('alpha'));
     feed(dir, 'preToolUse', tool('TodoWrite', {
@@ -463,16 +463,19 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.equal(copilotLane.summary.attempts, 1);
     assert.equal(copilotLane.tools.Shell, undefined);
 
-    const files = ['dashboard.html', 'dashboard.md', 'monitor-data.js']
+    const files = ['dashboard.html', 'monitor-data.js']
       .map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
     assert.equal(files.includes(`cd client && npm test -- --grep ${secret}`), true);
     assert.equal(files.includes(`blocked ${secret}`), false);
     assert.equal(files.includes('person@example.com'), false);
     assert.equal(files.includes('cursor-transcript'), false);
-    const markdown = readFileSync(join(dir, 'dashboard.md'), 'utf8');
-    assert.match(markdown, /GitHub Copilot › `copilot-sess` · idle · 1 tool calls/);
-    assert.match(markdown, /Cursor › `conv-1` · idle · 3 tool calls ← latest/);
-    assert.match(markdown, /\| Shell \| 2 \|/);
+    const view = bootstrap(dir);
+    const cursorNode = view.harnesses.find((h) => h.harness === 'cursor');
+    const copilotNode = view.harnesses.find((h) => h.harness === 'github-copilot');
+    assert.ok(cursorNode?.sessions.some((s) => s.id === 'conv-1' && s.attempts === 3));
+    assert.ok(copilotNode?.sessions.some((s) => s.id === 'copilot-sess' && s.attempts === 1));
+    assert.equal(view.focus, 'cursor:conv-1');
+    assert.equal(view.rows.find((row) => row.name === 'Shell')?.total, 2);
 
     state = feed(dir, 'sessionStart', {}, { stdinText: JSON.stringify(cursor('sessionStart', { conversation_id: 'conv-2', session_id: 'conv-2', composer_mode: 'agent' })), wall: 1_700_000_002_000, mono: 2000 });
     assert.equal(state.session.id, 'conv-2');
@@ -617,6 +620,9 @@ describe('Cursor and Copilot share one dashboard', () => {
     feed(dir, 'beforeSubmitPrompt', {}, { stdinText: JSON.stringify(cursor('beforeSubmitPrompt', { prompt: 'x' })), wall: 1_700_000_000_400, mono: 400 });
     // thinking: prompt open, nothing in flight
     feed(dir, 'sessionStart', {}, { stdinText: JSON.stringify(cursor('sessionStart', { conversation_id: 'conv-0', session_id: 'conv-0' })), wall: 1_700_000_000_500, mono: 500 });
+    // A prompt gives the lane activity so sessionEnd marks it ended instead of
+    // dropping it as an empty start/end ghost (Cursor delete noise).
+    feed(dir, 'beforeSubmitPrompt', {}, { stdinText: JSON.stringify(cursor('beforeSubmitPrompt', { conversation_id: 'conv-0', session_id: 'conv-0', prompt: 'wrap up' })), wall: 1_700_000_000_550, mono: 550 });
     let state = feed(dir, 'sessionEnd', {}, { stdinText: JSON.stringify(cursor('sessionEnd', { conversation_id: 'conv-0', session_id: 'conv-0', reason: 'user_close', duration_ms: 10 })), wall: 1_700_000_000_600, mono: 600 });
     // ended
 
@@ -629,17 +635,20 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.deepEqual(cursorNode.sessions.map((s) => [s.id, s.status]), [['conv-0', 'ended'], ['conv-1', 'thinking']]);
     const copilotNode = received.harnesses.find((h) => h.harness === 'github-copilot');
     assert.deepEqual(copilotNode.sessions.map((s) => [s.id, s.status, s.running, s.attempts]), [['cp-1', 'busy', 1, 1]]);
-    assert.equal(received.focus, 'cursor:conv-0');
+    // sessionEnd must not steal focus from the live chat you were watching.
+    assert.equal(received.focus, 'cursor:conv-1');
     assert.equal(received.lanes['github-copilot:cp-1'].rows[0].name, 'view');
     assert.equal(received.lanes['github-copilot:cp-1'].open.length, 1);
     assert.equal(received.lanes['cursor:conv-1'].rows.length, 0);
     assert.equal(received.lanes['cursor:conv-1'].session.turnOpen, true);
     assert.equal(received.lanes['cursor:conv-0'].session.endReason, 'user_close');
-    assert.equal(received.session.id, 'conv-0', 'top-level mirrors the focused lane');
+    assert.equal(received.session.id, 'conv-1', 'top-level mirrors the focused lane');
 
     // Closing the Copilot call flips its status; other lanes are unaffected.
+    // Tool completions must not steal dashboard focus from the live Cursor chat.
     state = feed(dir, 'postToolUse', tool('view', { sessionId: 'cp-1', timestamp: 1_700_000_000_700, toolResult: { resultType: 'success' } }), { wall: 1_700_000_000_700, mono: 700 });
-    assert.equal(state.focus, 'github-copilot:cp-1');
+    assert.equal(state.focus, 'cursor:conv-1');
+    assert.equal(state.session.id, 'cp-1', 'state.session still tracks the lane that received the event');
     new Function('window', readFileSync(join(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
     assert.equal(received.harnesses.find((h) => h.harness === 'github-copilot').sessions[0].status, 'thinking');
     assert.equal(received.lanes['cursor:conv-1'].session.turnOpen, true);
@@ -669,10 +678,6 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.ok(bucket, 'the id-less bucket keeps its figures');
     assert.equal(bucket.summary.attempts, 1);
     assert.equal(bucket.rows[0].name, 'view');
-    const md = readFileSync(join(dir, 'dashboard.md'), 'utf8');
-    const sessionsSection = md.split('\n## Sessions\n\n')[1].split('\n## ')[0];
-    assert.match(sessionsSection, /`sess-1`/);
-    assert.doesNotMatch(sessionsSection, /unknown/, 'the markdown list matches the sidebar tree');
   });
 
   it('keeps at most eight sessions per harness and drops the oldest finished ones', () => {
@@ -825,10 +830,10 @@ describe('terminal command children', () => {
     const files = persistedText(dir);
     assert.equal(files.includes(secret), true);
     assert.equal(files.includes('--grep'), true);
-    const markdown = readFileSync(join(dir, 'dashboard.md'), 'utf8');
-    assert.match(markdown, /\| run_in_terminal \| 3 \|/);
-    assert.match(markdown, /↳ `npm` \| 2 \| 0 \| 2 \|/);
-    assert.match(markdown, /↳ `git` \| 1 \| 0 \| 0 \| 0 \| 0 \| 1 \|/);
+    const termView = bootstrap(dir);
+    assert.equal(termView.rows.find((row) => row.name === 'run_in_terminal')?.total, 3);
+    assert.equal(termView.rows.find((row) => row.name === 'npm')?.success, 2);
+    assert.equal(termView.rows.find((row) => row.name === 'git')?.incomplete, 1);
     let received = null;
     new Function('window', readFileSync(join(dir, 'monitor-data.js'), 'utf8'))({ kusaUpdate: (view) => { received = view; } });
     const npmRow = received.rows.find((row) => row.name === 'npm');
@@ -884,8 +889,12 @@ describe('file children', () => {
     const files = persistedText(dir);
     assert.equal(files.includes('SECRET_OLD'), false);
     assert.equal(files.includes('SECRET_NEW'), false);
-    assert.match(readFileSync(join(dir, 'dashboard.md'), 'utf8'), /↳ `src\/a\.ts` \| 2 \| 0 \| 1 \| 1 \|/);
-    assert.match(readFileSync(join(dir, 'dashboard.md'), 'utf8'), /or files \(path relative to the workspace\)/);
+    const fileView = bootstrap(dir);
+    const aRow = fileView.rows.find((row) => row.name === 'src/a.ts');
+    assert.equal(aRow?.total, 2);
+    assert.equal(aRow?.success, 1);
+    assert.equal(aRow?.failed, 1);
+    assert.ok(aRow?.depth > 0, 'file children are indented under the parent tool');
 
     // Child maps are capped; the overflow folds into "(other)".
     for (let index = 0; index < 70; index += 1) {
@@ -936,9 +945,11 @@ describe('correlation and durations', () => {
     }), { wall: 1_700_000_099_999, mono: 3400 });
     assert.equal(state.tools.view.durationMsSum, 2400);
     assert.equal(formatDuration(2400), '2.4 s');
-    const markdown = readFileSync(join(dir, 'dashboard.md'), 'utf8');
-    assert.match(markdown, /\| view \| 1 \| 0 \| 1 \| 0 \| 0 \| 0 \| 2\.4 s \|/);
-    assert.equal(bootstrap(dir).rows[0].avg, 2400);
+    const view = bootstrap(dir);
+    assert.equal(view.rows[0].name, 'view');
+    assert.equal(view.rows[0].total, 1);
+    assert.equal(view.rows[0].success, 1);
+    assert.equal(view.rows[0].avg, 2400);
   });
 
   it('records a completion that has no pre-tool event as unmatched', () => {
@@ -959,7 +970,9 @@ describe('correlation and durations', () => {
     assert.equal(state.tools.view.total, 1);
     assert.equal(state.tools.view.success, 0);
     assert.equal(state.tools.view.running, 1);
-    assert.match(readFileSync(join(dir, 'dashboard.md'), 'utf8'), /missing post-tool event is not counted as success/);
+    assert.ok(
+      bootstrap(dir).notes.some((note) => /missing post-tool event is not counted as success/.test(note)),
+    );
   });
 
   it('marks still-open calls incomplete at session end', () => {
@@ -1090,7 +1103,7 @@ describe('reliability', () => {
     assert.equal(view.prompts[0].role, 'user');
     assert.equal(view.prompts[0].toolAttempts, 3);
     assert.equal(view.prompts[0].open, true);
-    const files = ['dashboard.md', 'monitor-data.js'].map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
+    const files = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
     // Prompt text is intentionally kept for the Prompts tab (gitignored data dir).
     assert.equal(files.includes(prompt), true);
     assert.match(files, /"curl"/);
@@ -1137,8 +1150,7 @@ describe('reliability', () => {
     assert.equal(state.nonCopilotPayloads, 0);
     assert.equal(state.session.prompts[0].text, 'SUPER_SECRET_PROMPT_LOCAL');
     assert.equal(state.session.prompts[0].open, false);
-    const files = ['dashboard.md', 'monitor-data.js']
-      .map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
+    const files = readFileSync(join(dir, 'monitor-data.js'), 'utf8');
     // Tool argument secrets stay out; prompt text is kept for the Prompts tab.
     assert.equal(files.includes('SUPER_SECRET_LOCAL_9f3a'), false);
     assert.equal(files.includes('SUPER_SECRET_PROMPT_LOCAL'), true);
@@ -1401,6 +1413,8 @@ describe('delete sessions', () => {
     const dir = tempDir();
     feed(dir, 'sessionStart', session('keep-me'), { wall: 1_700_000_000_000, mono: 0 });
     feed(dir, 'sessionStart', session('drop-me'), { wall: 1_700_000_000_100, mono: 100 });
+    // Activity so sessionEnd keeps the lane (empty end would auto-drop it).
+    feed(dir, 'userPromptSubmitted', { sessionId: 'drop-me', timestamp: 1_700_000_000_150, cwd: '/work', prompt: 'hi' }, { wall: 1_700_000_000_150, mono: 150 });
     feed(dir, 'sessionEnd', { sessionId: 'drop-me', timestamp: 1_700_000_000_200, cwd: '/work', reason: 'done' }, { wall: 1_700_000_000_200, mono: 200 });
     const dropFiles = laneFiles(dir, { harness: 'github-copilot', id: 'drop-me' });
     assert.equal(existsSync(dropFiles.json), true);
@@ -1479,6 +1493,134 @@ describe('delete sessions', () => {
     assert.equal(after['github-copilot:keep-me'].todos[0].content, 'Keep task');
     assert.equal(existsSync(chatFilePath(dir, 'drop-chat')), false);
     assert.equal(existsSync(sessionConfigPath(dir, 'drop-chat')), false);
+  });
+
+  it('deletes when the chat key harness differs from the monitor lane harness', () => {
+    const dir = tempDir();
+    // Lane minted as kusa:id (New Session), then chat persisted under cursor:id
+    // after the provider pick — Agents lists the chat key, index keeps the lane key.
+    feed(dir, 'sessionStart', {
+      ...session('switched'),
+      sessionId: 'switched',
+      harness: 'kusa',
+    }, { wall: 1_700_000_000_000, mono: 0 });
+    writeChatSession(dir, {
+      key: 'cursor:switched',
+      id: 'switched',
+      harness: 'cursor',
+      provider: 'cursor',
+      status: 'idle',
+      attempts: 0,
+      createdAt: 100,
+      messages: [{ id: 'm1', role: 'user', text: 'hi', at: 100 }],
+      options: { provider: 'cursor', rules: 'ask-deny' },
+    });
+    const files = laneFiles(dir, { harness: 'kusa', id: 'switched' });
+    assert.equal(existsSync(files.json), true);
+    assert.equal(existsSync(chatFilePath(dir, 'switched', 'cursor')), true);
+
+    const result = deleteSessions(dir, ['cursor:switched'], { nowWall: 1_700_000_000_300 });
+    assert.deepEqual(result.deleted, ['cursor:switched']);
+    assert.deepEqual(result.missing, []);
+    assert.equal(existsSync(files.json), false);
+    assert.equal(existsSync(files.dir), false);
+    assert.equal(existsSync(chatFilePath(dir, 'switched', 'cursor')), false);
+  });
+});
+
+describe('sessionEnd does not invent sidebar rows', () => {
+  function cursorPayload(eventName, sessionId, extra = {}) {
+    return {
+      conversation_id: sessionId,
+      session_id: sessionId,
+      hook_event_name: eventName,
+      cursor_version: '1.7.2',
+      workspace_roots: ['/work'],
+      ...extra,
+    };
+  }
+
+  it('ignores Cursor sessionEnd for a conversation the monitor never tracked', () => {
+    const dir = tempDir();
+    feed(dir, 'sessionStart', session('keep-me'), { wall: 1_700_000_000_000, mono: 0 });
+    const state = feed(dir, 'sessionEnd', {}, {
+      stdinText: JSON.stringify(cursorPayload('sessionEnd', 'never-seen', { reason: 'user_close', duration_ms: 10 })),
+      wall: 1_700_000_000_100,
+      mono: 100,
+    });
+    assert.equal(state.sessions['cursor:never-seen'], undefined);
+    assert.ok(state.sessions['github-copilot:keep-me']);
+    const view = bootstrap(dir);
+    assert.equal(view.harnesses.some((h) => h.harness === 'cursor'), false);
+    assert.deepEqual(
+      view.harnesses.find((h) => h.harness === 'github-copilot').sessions.map((s) => s.id),
+      ['keep-me'],
+    );
+  });
+
+  it('hides prompt-less Cursor lanes and drops them on sessionEnd even if tools ran', () => {
+    const dir = tempDir();
+    feed(dir, 'sessionStart', session('real'), { wall: 1_700_000_000_000, mono: 0 });
+    feed(dir, 'userPromptSubmitted', {
+      sessionId: 'real', timestamp: 1_700_000_000_050, cwd: '/work', prompt: 'real chat',
+    }, { wall: 1_700_000_000_050, mono: 50 });
+
+    // Ephemeral Cursor run: sessionStart + Shell, no beforeSubmitPrompt.
+    feed(dir, 'sessionStart', {}, {
+      stdinText: JSON.stringify(cursorPayload('sessionStart', 'ghost')),
+      wall: 1_700_000_000_100,
+      mono: 100,
+    });
+    feed(dir, 'preToolUse', {}, {
+      stdinText: JSON.stringify(cursorPayload('preToolUse', 'ghost', {
+        tool_name: 'Shell', tool_use_id: 'g1', tool_input: { command: 'ls' },
+      })),
+      wall: 1_700_000_000_200,
+      mono: 200,
+    });
+    // Still tracked in memory while tools run, but never written to disk —
+    // and must not steal focus or appear in Agents.
+    assert.ok(feed(dir, 'postToolUse', {}, {
+      stdinText: JSON.stringify(cursorPayload('postToolUse', 'ghost', {
+        tool_name: 'Shell', tool_use_id: 'g1', tool_input: { command: 'ls' },
+        tool_output: '{"exitCode":0}', duration: 10,
+      })),
+      wall: 1_700_000_000_300,
+      mono: 300,
+    }).sessions['cursor:ghost']);
+    assert.equal(
+      existsSync(laneFiles(dir, { harness: 'cursor', id: 'ghost' }).json),
+      false,
+      'prompt-less Cursor blips must not leave session files on disk',
+    );
+    let view = bootstrap(dir);
+    assert.equal(view.focus, 'github-copilot:real');
+    assert.deepEqual(
+      (view.harnesses.find((h) => h.harness === 'cursor')?.sessions || []).map((s) => s.id),
+      [],
+      'tool-only Cursor blips stay out of the sidebar',
+    );
+    assert.deepEqual(
+      view.harnesses.find((h) => h.harness === 'github-copilot').sessions.map((s) => s.id),
+      ['real'],
+    );
+    // Agents chat list must use the same gate — lane hydration must not
+    // resurrect the tool-only Cursor blip as an empty external session.
+    assert.equal(
+      listChatSessions(dir).some((s) => s.id === 'ghost'),
+      false,
+      'tool-only Cursor blips stay out of /kusa/sessions',
+    );
+
+    const state = feed(dir, 'sessionEnd', {}, {
+      stdinText: JSON.stringify(cursorPayload('sessionEnd', 'ghost', { reason: 'error', duration_ms: 10 })),
+      wall: 1_700_000_000_400,
+      mono: 400,
+    });
+    assert.equal(state.sessions['cursor:ghost'], undefined);
+    view = bootstrap(dir);
+    assert.equal(view.harnesses.some((h) => h.harness === 'cursor'), false);
+    assert.equal(existsSync(laneFiles(dir, { harness: 'cursor', id: 'ghost' }).json), false);
   });
 });
 
@@ -1899,7 +2041,9 @@ describe('local http server', () => {
       res = await queue(base1, { queueKey: 'kusa:persist', action: 'send', id: heldId });
       assert.equal(res.status, 200);
       assert.equal(res.body.steering.length, 1);
+      // Parked → shared kusa/queues.json; held/steering → session folder.
       assert.ok(existsSync(queuesFilePath(dir)));
+      assert.ok(existsSync(queuesFilePath(dir, 'kusa:persist')));
     } finally {
       await new Promise((resolve) => server1.close(resolve));
     }
@@ -1940,6 +2084,9 @@ describe('local http server', () => {
     ]);
     const steering = new Map([['kusa:a', [{ id: 's1', text: 'steer', at: 4, options: {} }]]]);
     saveQueues(dir, queued, steering);
+    assert.ok(existsSync(queuesFilePath(dir, 'kusa:a')));
+    assert.ok(existsSync(queuesFilePath(dir)));
+    assert.notEqual(queuesFilePath(dir, 'kusa:a'), queuesFilePath(dir));
     const first = loadQueues(dir);
     assert.equal(first.steering.size, 0);
     assert.ok(first.queued.has('kusa:a'));
@@ -1953,6 +2100,37 @@ describe('local http server', () => {
     const second = loadQueues(dir);
     assert.equal(second.queued.get('kusa:a')?.length, 2);
     assert.equal(second.queued.get(WORKSPACE_QUEUE_KEY)?.length, 2);
+  });
+
+  it('queue-store migrates legacy shared maps into per-session files', () => {
+    const dir = tempDir();
+    const legacyPath = queuesFilePath(dir);
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, `${JSON.stringify({
+      version: 1,
+      queued: {
+        'cursor:sess-1': [{ id: 'h1', text: 'held-legacy', at: 1, options: {} }],
+        [WORKSPACE_QUEUE_KEY]: [{ id: 'p1', text: 'parked-legacy', at: 2, options: {}, paused: true }],
+      },
+      steering: {
+        'cursor:sess-1': [{ id: 's1', text: 'steer-legacy', at: 3, options: {} }],
+      },
+    }, null, 2)}\n`);
+    const loaded = loadQueues(dir);
+    assert.ok(existsSync(queuesFilePath(dir, 'cursor:sess-1')));
+    assert.ok(existsSync(queuesFilePath(dir)));
+    assert.equal(loaded.queued.get('cursor:sess-1')?.length, 2);
+    assert.ok(loaded.queued.get('cursor:sess-1').some((e) => e.id === 'h1'));
+    assert.ok(loaded.queued.get('cursor:sess-1').some((e) => e.id === 's1'));
+    assert.deepEqual(
+      (loaded.queued.get(WORKSPACE_QUEUE_KEY) || []).map((e) => e.id),
+      ['p1'],
+    );
+    // Shared file is parked-only (array), not the old per-session map.
+    const shared = JSON.parse(readFileSync(queuesFilePath(dir), 'utf8'));
+    assert.ok(Array.isArray(shared.queued));
+    assert.equal(shared.queued.length, 1);
+    assert.equal(shared.queued[0].id, 'p1');
   });
 
   it('only parked prompts are visible and claimable from another session', async () => {
@@ -2166,7 +2344,7 @@ describe('local http server', () => {
 });
 
 describe('kusa chat persistence', () => {
-  it('writes chat sidecars under .kusa/kusa and lists them', () => {
+  it('writes chat sidecars under .kusa/sessions and lists them', () => {
     const dir = tempDir();
     const created = createChatSession(dir, { id: 'chat-1', workspaceRoot: dir });
     assert.equal(created.id, 'chat-1');
@@ -2314,7 +2492,7 @@ describe('kusa chat persistence', () => {
 });
 
 describe('dashboard demonstration', () => {
-  it('renders collected events into the html and markdown dashboards', () => {
+  it('renders collected events into the html dashboard', () => {
     const dir = tempDir();
     feed(dir, 'sessionStart', session(), { mono: 0, origin: 'synthetic-demo' });
     feed(dir, 'userPromptSubmitted', { sessionId: 'sess-1', timestamp: 1_700_000_000_020, cwd: '/work', prompt: 'do not store' }, { wall: 1_700_000_000_020, mono: 20, origin: 'synthetic-demo' });
@@ -2323,21 +2501,18 @@ describe('dashboard demonstration', () => {
     assert.equal(state.origin, 'synthetic-demo');
     assert.equal(state.tools.view.durationMsSum, 2400);
     const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
-    const markdown = readFileSync(join(dir, 'dashboard.md'), 'utf8');
     const boot = bootstrap(dir);
     assert.equal(boot.origin, 'synthetic-demo');
     assert.equal(boot.rows[0].name, 'view');
     assert.equal(boot.rows[0].avg, 2400);
     assert.match(html, /"origin":"synthetic-demo"/);
     assert.match(readFileSync(consoleAsset('dashboard.js'), 'utf8'), /synthetic demo data/);
-    assert.match(markdown, /Synthetic demonstration data/);
-    assert.match(markdown, /\| view \| 1 \| 0 \| 1 \|/);
-    assert.match(markdown, /## Git/);
     assert.equal(typeof boot.git?.ok, 'boolean');
     assert.equal(typeof boot.trailStatus?.ok, 'boolean');
     assert.equal(html.includes('file body'), false);
     // Prompt text is inlined in the bootstrap view for the Prompts tab.
     assert.equal(boot.prompts[0].text, 'do not store');
     assert.equal(html.includes('do not store'), true);
+    assert.equal(existsSync(join(dir, 'dashboard.md')), false);
   });
 });

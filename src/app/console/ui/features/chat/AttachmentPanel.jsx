@@ -11,7 +11,7 @@ import { PopupList } from './PopupList.jsx';
 /**
  * Attachments drawer — the same PopupList control as the Prompt Queue and Task
  * List, listing the files staged for THIS draft above the composer. State stays
- * with ChatHarness; this panel renders rows, selection, remove, and the image
+ * with SessionChat; this panel renders rows, selection, remove, and the image
  * viewer. Off or empty renders nothing (PopupList), so an idle slot stays empty.
  *
  * Transcript still uses AttachmentChips under a sent user bubble — that surface

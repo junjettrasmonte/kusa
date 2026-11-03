@@ -179,8 +179,9 @@ export function attachmentLabels(attachments) {
 }
 
 /** Absolute path of a session's attachments/ folder (creates nothing). */
-export function sessionAttachmentsDir(dir, sessionId) {
-  const files = migrateFlatSessionFiles(dir, { harness: 'kusa', id: sessionId });
+export function sessionAttachmentsDir(dir, sessionId, harness = 'kusa') {
+  const name = typeof harness === 'string' && harness.trim() ? harness.trim() : 'kusa';
+  const files = migrateFlatSessionFiles(dir, { harness: name, id: sessionId });
   return files.attachments;
 }
 
@@ -226,10 +227,10 @@ function bufferToDataUrl(buf, mime) {
  * have no new bytes are left alone.
  * @returns {object|null}
  */
-export function persistAttachment(dir, sessionId, attachment) {
+export function persistAttachment(dir, sessionId, attachment, harness = 'kusa') {
   const normalized = normalizeAttachment(attachment);
   if (!normalized || !dir || !sessionId) return normalized;
-  const folder = sessionAttachmentsDir(dir, sessionId);
+  const folder = sessionAttachmentsDir(dir, sessionId, harness);
   mkdirSync(folder, { recursive: true });
 
   let bytes = null;
@@ -263,10 +264,10 @@ export function persistAttachment(dir, sessionId, attachment) {
 }
 
 /** Persist every attachment on a message; returns slim records. */
-export function persistAttachments(dir, sessionId, attachments) {
+export function persistAttachments(dir, sessionId, attachments, harness = 'kusa') {
   const list = normalizeAttachments(attachments);
   if (!list.length) return [];
-  return list.map((attachment) => persistAttachment(dir, sessionId, attachment)).filter(Boolean);
+  return list.map((attachment) => persistAttachment(dir, sessionId, attachment, harness)).filter(Boolean);
 }
 
 /**
@@ -274,13 +275,13 @@ export function persistAttachments(dir, sessionId, attachments) {
  * transcript record only carries a `file` pointer. Missing files keep the
  * record as a named reference (with a note) rather than inventing bytes.
  */
-export function hydrateAttachment(dir, sessionId, attachment) {
+export function hydrateAttachment(dir, sessionId, attachment, harness = 'kusa') {
   const normalized = normalizeAttachment(attachment);
   if (!normalized) return null;
   if (normalized.dataUrl || normalized.text) return normalized;
   const fileName = sanitizeAttachmentFileName(normalized.file);
   if (!fileName || !dir || !sessionId) return normalized;
-  const path = join(sessionAttachmentsDir(dir, sessionId), fileName);
+  const path = join(sessionAttachmentsDir(dir, sessionId, harness), fileName);
   if (!existsSync(path)) {
     if (normalized.kind === 'image' && !normalized.note) {
       return { ...normalized, note: 'image not included' };
@@ -313,8 +314,8 @@ export function hydrateAttachment(dir, sessionId, attachment) {
   }
 }
 
-export function hydrateAttachments(dir, sessionId, attachments) {
+export function hydrateAttachments(dir, sessionId, attachments, harness = 'kusa') {
   const list = normalizeAttachments(attachments);
   if (!list.length) return [];
-  return list.map((attachment) => hydrateAttachment(dir, sessionId, attachment)).filter(Boolean);
+  return list.map((attachment) => hydrateAttachment(dir, sessionId, attachment, harness)).filter(Boolean);
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   buildProfileDocument,
+  caoListenFromBaseUrl,
   emptyCaoStatus,
   parseProfileDocument,
   resolveCaoBaseUrl,
@@ -51,6 +52,17 @@ describe('cao status helpers', () => {
 
   it('labels kusa_cli', () => {
     assert.equal(CAO_PROVIDER_LABELS.kusa_cli, 'Kusa CLI');
+  });
+
+  it('parses listen host/port from CAO base URL', () => {
+    assert.deepEqual(caoListenFromBaseUrl('http://127.0.0.1:9889'), {
+      host: '127.0.0.1',
+      port: 9889,
+    });
+    assert.deepEqual(caoListenFromBaseUrl('http://localhost:9999/'), {
+      host: '127.0.0.1',
+      port: 9999,
+    });
   });
 });
 

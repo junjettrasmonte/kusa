@@ -3,8 +3,6 @@ import { Choice, Field } from '#ui/shared/SettingsControls.jsx';
 
 export function SettingsPanel({
   subTab,
-  follow,
-  onFollowChange,
   settings,
   sdkListener,
   canPersist,
@@ -128,20 +126,6 @@ export function SettingsPanel({
                     agentAllowDenyRevertMinutes: Math.min(240, Math.max(1, Math.floor(n))),
                   });
                 }}
-              />
-            </div>
-          </section>
-        ) : null}
-
-        {subTab === 'playback' ? (
-          <section>
-            <h2 className="mb-2 text-base font-semibold">Playback</h2>
-            <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-3">
-              <SliderToggle
-                checked={follow}
-                onChange={onFollowChange}
-                label="Follow latest activity"
-                hint="When on, the console tracks the newest session automatically. Turn off to keep the session you selected pinned."
               />
             </div>
           </section>

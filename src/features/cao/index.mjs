@@ -7,6 +7,7 @@
  * read-only from GET /agents/providers.
  */
 import { spawnSync } from 'node:child_process';
+import { spawnDetached } from '#shared/lib/spawn-detached.mjs';
 
 export const DEFAULT_CAO_BASE_URL = 'http://127.0.0.1:9889';
 export const CAO_WEB_UI_URL = 'http://localhost:9889';
@@ -75,6 +76,120 @@ export function resolveCaoBaseUrl(env = process.env) {
   const raw = String(env.CAO_BASE_URL || '').trim();
   if (!raw) return DEFAULT_CAO_BASE_URL;
   return raw.replace(/\/+$/, '');
+}
+
+/** Host + port for spawning `cao-server` from a CAO_BASE_URL. */
+export function caoListenFromBaseUrl(baseUrl = resolveCaoBaseUrl()) {
+  try {
+    const u = new URL(baseUrl);
+    const host = u.hostname || '127.0.0.1';
+    const port = u.port
+      ? Number(u.port)
+      : (u.protocol === 'https:' ? 443 : 80);
+    return {
+      host: host === 'localhost' ? '127.0.0.1' : host,
+      port: Number.isFinite(port) && port > 0 ? port : 9889,
+    };
+  } catch {
+    return { host: '127.0.0.1', port: 9889 };
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Coalesce concurrent Start clicks / overlapping serve handlers. */
+let caoStartInFlight = null;
+
+function spawnCaoServerProcess({ host, port }) {
+  return spawnDetached('cao-server', ['--host', host, '--port', String(port)]);
+}
+
+/**
+ * Start local cao-server when it is down. No-ops if /health already succeeds.
+ * Survives `kusa serve --live` restarts (setsid + unref). Concurrent calls share
+ * one in-flight promise so two Starts cannot fight over the port.
+ *
+ * Not `async` — must return the shared promise identity, not a wrapped one.
+ */
+export function startCaoServer(opts = {}) {
+  if (!caoStartInFlight) {
+    caoStartInFlight = startCaoServerUnlocked(opts).finally(() => {
+      caoStartInFlight = null;
+    });
+  }
+  return caoStartInFlight;
+}
+
+async function startCaoServerUnlocked({
+  baseUrl = resolveCaoBaseUrl(),
+  waitMs = 10_000,
+} = {}) {
+  const root = baseUrl.replace(/\/+$/, '');
+  const already = await caoFetch('/health', { baseUrl: root });
+  if (already.ok) {
+    const status = await collectCaoStatus({ force: true, baseUrl: root });
+    return {
+      ok: true,
+      started: false,
+      alreadyUp: true,
+      pid: null,
+      error: null,
+      status,
+    };
+  }
+
+  const cli = probeCaoCli();
+  if (!cli.installed) {
+    return {
+      ok: false,
+      started: false,
+      alreadyUp: false,
+      pid: null,
+      error: 'CAO CLI not found on PATH — install it first',
+      status: await collectCaoStatus({ force: true, baseUrl: root }),
+    };
+  }
+
+  const { host, port } = caoListenFromBaseUrl(root);
+  const spawned = await spawnCaoServerProcess({ host, port });
+  if (!spawned.ok) {
+    return {
+      ok: false,
+      started: false,
+      alreadyUp: false,
+      pid: null,
+      error: spawned.error || 'failed to spawn cao-server',
+      status: await collectCaoStatus({ force: true, baseUrl: root }),
+    };
+  }
+
+  const deadline = Date.now() + Math.max(1000, waitMs);
+  while (Date.now() < deadline) {
+    await sleep(400);
+    const health = await caoFetch('/health', { baseUrl: root });
+    if (health.ok) {
+      const status = await collectCaoStatus({ force: true, baseUrl: root });
+      return {
+        ok: true,
+        started: true,
+        alreadyUp: false,
+        pid: spawned.pid,
+        error: null,
+        status,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    started: true,
+    alreadyUp: false,
+    pid: spawned.pid,
+    error: `cao-server launched (pid ${spawned.pid || '?'}) but ${root}/health did not pass within ${waitMs}ms`,
+    status: await collectCaoStatus({ force: true, baseUrl: root }),
+  };
 }
 
 export function emptyCaoStatus(error = null) {
@@ -506,6 +621,141 @@ export function parseProfileDocument(content) {
     description: fields.description || '',
     body: body.replace(/^\n/, ''),
   };
+}
+
+/**
+ * Create a standalone CAO session (one terminal). Query params match cao-server
+ * POST /sessions — agent_profile + provider select the CLI; working_directory
+ * is the workspace the agent starts in.
+ */
+export async function createCaoSession({
+  agentProfile = 'developer',
+  provider,
+  sessionName = null,
+  workingDirectory = null,
+  model = null,
+  initialMessage = null,
+  baseUrl = resolveCaoBaseUrl(),
+  timeoutMs = 60_000,
+} = {}) {
+  const profile = String(agentProfile || 'developer').trim() || 'developer';
+  const params = new URLSearchParams();
+  params.set('agent_profile', profile);
+  if (provider) params.set('provider', String(provider).trim());
+  if (sessionName) params.set('session_name', String(sessionName).trim());
+  if (workingDirectory) params.set('working_directory', String(workingDirectory).trim());
+  if (model) params.set('model', String(model).trim());
+  const body = {};
+  if (initialMessage) body.initial_message = String(initialMessage);
+  const res = await caoFetch(`/sessions?${params.toString()}`, {
+    baseUrl,
+    method: 'POST',
+    body: Object.keys(body).length ? body : {},
+    timeoutMs,
+  });
+  if (!res.ok) {
+    const err = new Error(res.error || 'Could not create CAO session');
+    err.status = res.status;
+    err.code = res.status === 0 ? 'ECONN' : 'EHTTP';
+    err.data = res.data;
+    throw err;
+  }
+  return res.data;
+}
+
+/** Paste a message into a CAO terminal (starts a turn). */
+export async function sendCaoTerminalInput(terminalId, message, {
+  baseUrl = resolveCaoBaseUrl(),
+  timeoutMs = 30_000,
+} = {}) {
+  const id = String(terminalId || '').trim();
+  const text = String(message || '');
+  if (!id) {
+    const err = new Error('terminalId is required');
+    err.code = 'EINVAL';
+    throw err;
+  }
+  const params = new URLSearchParams();
+  params.set('message', text);
+  const res = await caoFetch(`/terminals/${encodeURIComponent(id)}/input?${params.toString()}`, {
+    baseUrl,
+    method: 'POST',
+    body: {},
+    timeoutMs,
+  });
+  if (!res.ok) {
+    const err = new Error(res.error || 'Could not send CAO input');
+    err.status = res.status;
+    err.code = res.status === 409 ? 'EBUSY' : res.status === 0 ? 'ECONN' : 'EHTTP';
+    err.data = res.data;
+    throw err;
+  }
+  return res.data || { success: true };
+}
+
+export async function getCaoTerminal(terminalId, { baseUrl = resolveCaoBaseUrl() } = {}) {
+  const id = String(terminalId || '').trim();
+  if (!id) {
+    const err = new Error('terminalId is required');
+    err.code = 'EINVAL';
+    throw err;
+  }
+  const res = await caoFetch(`/terminals/${encodeURIComponent(id)}`, { baseUrl });
+  if (!res.ok) {
+    const err = new Error(res.error || 'Could not read CAO terminal');
+    err.status = res.status;
+    err.code = res.status === 0 ? 'ECONN' : 'EHTTP';
+    err.data = res.data;
+    throw err;
+  }
+  return res.data;
+}
+
+export async function getCaoTerminalOutput(terminalId, {
+  mode = 'full',
+  baseUrl = resolveCaoBaseUrl(),
+} = {}) {
+  const id = String(terminalId || '').trim();
+  if (!id) {
+    const err = new Error('terminalId is required');
+    err.code = 'EINVAL';
+    throw err;
+  }
+  const params = new URLSearchParams();
+  if (mode) params.set('mode', mode);
+  const q = params.toString();
+  const res = await caoFetch(
+    `/terminals/${encodeURIComponent(id)}/output${q ? `?${q}` : ''}`,
+    { baseUrl },
+  );
+  if (!res.ok) {
+    const err = new Error(res.error || 'Could not read CAO terminal output');
+    err.status = res.status;
+    err.code = res.status === 0 ? 'ECONN' : 'EHTTP';
+    err.data = res.data;
+    throw err;
+  }
+  return res.data;
+}
+
+export async function listCaoWorkflows({ baseUrl = resolveCaoBaseUrl() } = {}) {
+  const res = await caoFetch('/workflows', { baseUrl });
+  if (!res.ok) {
+    const err = new Error(res.error || 'Could not list CAO workflows');
+    err.status = res.status;
+    err.code = res.status === 0 ? 'ECONN' : 'EHTTP';
+    err.data = res.data;
+    throw err;
+  }
+  const raw = res.data;
+  const list = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw?.workflows)
+      ? raw.workflows
+      : Array.isArray(raw?.items)
+        ? raw.items
+        : [];
+  return { workflows: list };
 }
 
 function yamlScalar(value) {

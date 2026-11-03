@@ -198,6 +198,19 @@ export function publicSettings(settings = {}) {
     authUsername: authPublic.authUsername,
     authOidc: authPublic.oidc,
     authSaml: authPublic.saml,
+    liveChat: publicLiveChat(s.liveChat),
+  };
+}
+
+/** Browser-safe Live Chat prefs (no secrets). */
+function publicLiveChat(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const transport = String(src.transport ?? '').trim().toLowerCase();
+  const tts = String(src.tts ?? '').trim().toLowerCase();
+  return {
+    transport: transport === 'webrtc' ? 'webrtc' : 'websocket',
+    tts: tts === 'kokoro' ? 'kokoro' : 'piper',
+    baseUrl: typeof src.baseUrl === 'string' ? src.baseUrl.trim().replace(/\/+$/, '') : '',
   };
 }
 
