@@ -5,15 +5,18 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildOpencodeConfig,
+  clearStrataDetectCache,
   createFileTools,
   createKusaHookEmitter,
   createTrailAwareTools,
   DEFAULT_ENDPOINT_LABEL,
   DEFAULT_MAX_STEPS,
   listAgentModelGroups,
+  readStrataContext,
   resolveAgentEndpoint,
   resolveAgentMaxSteps,
   resolveTrailPolicy,
+  strataRootFromBaseUrl,
   trailNotReadyMessage,
   trailSystemPromptAddon,
   // Rule → OpenCode permission mapping (the OpenCode backend has no gate of its
@@ -23,7 +26,14 @@ import {
   permissionForRule,
   agentToolFlags,
 } from '#features/agent/index.mjs';
-import { laneKey, loadMonitorSettings, saveMonitorSettings } from '#features/monitor/lib.mjs';
+import {
+  indexJsonPath,
+  laneKey,
+  loadMonitorSettings,
+  refreshMonitorArtifacts,
+  runHook,
+  saveMonitorSettings,
+} from '#features/monitor/lib.mjs';
 import { publicSettings } from '#features/settings/secrets.mjs';
 import { callTool } from '#features/mcp/tools.mjs';
 
@@ -344,6 +354,52 @@ describe('agent settings', () => {
     assert.equal(kept.agentEndpoints[0].apiKey, 'sk-acme');
   });
 
+  it('refreshMonitorArtifacts picks up endpoint edits from settings.json', () => {
+    // Regression: POST /settings wrote settings.json but monitor-data.js kept the
+    // prior snapshot until the next refresh — the console poll then reverted fields.
+    const dir = tempDir();
+    saveMonitorSettings(dir, {
+      agentBaseUrl: 'https://api.openai.com/v1',
+      agentModel: 'gpt-4o-mini',
+      agentEndpoints: [
+        {
+          name: 'Acme',
+          baseUrl: 'https://api.acme.test/v1',
+          authMode: 'none',
+          models: 'acme-one',
+        },
+      ],
+    });
+    const first = refreshMonitorArtifacts(dir, { origin: '' });
+    assert.equal(first.settings.agentBaseUrl, 'https://api.openai.com/v1');
+    assert.equal(first.settings.agentEndpoints.length, 1);
+    assert.equal(first.settings.agentEndpoints[0].baseUrl, 'https://api.acme.test/v1');
+
+    saveMonitorSettings(dir, {
+      agentBaseUrl: 'https://proxy.example/v1',
+      agentEndpoints: [
+        {
+          id: first.settings.agentEndpoints[0].id,
+          name: 'Acme Renamed',
+          baseUrl: 'https://api.acme.test/v2',
+          authMode: 'none',
+          models: 'acme-two',
+        },
+      ],
+    });
+    const second = refreshMonitorArtifacts(dir, { origin: '' });
+    assert.equal(second.settings.agentBaseUrl, 'https://proxy.example/v1');
+    assert.equal(second.settings.agentEndpoints[0].name, 'Acme Renamed');
+    assert.equal(second.settings.agentEndpoints[0].baseUrl, 'https://api.acme.test/v2');
+    assert.deepEqual(second.settings.agentEndpoints[0].models, ['acme-two']);
+
+    // A later hook persist must not re-emit the pre-edit snapshot into the index.
+    saveMonitorSettings(dir, { agentBaseUrl: 'https://after-hook.example/v1' });
+    runHook({ dir, eventName: 'not-a-hook', stdinText: '{}', origin: '' });
+    const index = JSON.parse(readFileSync(indexJsonPath(dir), 'utf8'));
+    assert.equal(index.settings.agentBaseUrl, 'https://after-hook.example/v1');
+  });
+
   it('resolveAgentEndpoint routes a pick to the endpoint that declared it', () => {
     const settings = {
       agentBaseUrl: 'https://api.openai.com/v1',
@@ -484,5 +540,59 @@ describe('agent settings', () => {
     // The composer picker wins over Settings for the run it starts.
     assert.equal(resolveApprovalRule({ agentApprovalMode: 'deny' }, 'allow'), 'allow');
     assert.equal(resolveApprovalRule({ agentApprovalMode: 'deny' }, ''), 'deny');
+  });
+
+  it('strataRootFromBaseUrl strips a trailing /v1 for discovery endpoints', () => {
+    assert.equal(strataRootFromBaseUrl('https://strata.example/v1'), 'https://strata.example');
+    assert.equal(strataRootFromBaseUrl('https://strata.example/v1/'), 'https://strata.example');
+    assert.equal(strataRootFromBaseUrl('http://127.0.0.1:8080'), 'http://127.0.0.1:8080');
+  });
+
+  it('readStrataContext reports live n_prompt_tokens / n_ctx when /health is Strata', async () => {
+    clearStrataDetectCache();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      if (href.endsWith('/health')) {
+        return new Response(JSON.stringify({
+          status: 'ok',
+          service: 'strata',
+          max_context: 131072,
+          model: 'demo',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (href.endsWith('/slots')) {
+        return new Response(JSON.stringify([
+          { id: 0, n_ctx: 131072, is_processing: false, n_prompt_tokens: 42000 },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+    try {
+      const ctx = await readStrataContext('https://strata.example/v1', {});
+      assert.equal(ctx.strata, true);
+      assert.equal(ctx.used, 42000);
+      assert.equal(ctx.limit, 131072);
+      assert.equal(ctx.model, 'demo');
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('readStrataContext returns strata:false for ordinary OpenAI hosts', async () => {
+    clearStrataDetectCache();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'not found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    try {
+      const ctx = await readStrataContext('https://api.openai.com/v1', {});
+      assert.equal(ctx.strata, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
   });
 });

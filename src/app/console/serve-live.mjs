@@ -182,7 +182,15 @@ export function runLiveServe(argv = process.argv.slice(2)) {
         startServer();
         return;
       }
-      if (code !== 0) process.stderr.write(`kusa: serve exited ${code}\n`);
+      // Unexpected death (uncaught throw, OOM): bring the API back so --live
+      // does not leave Vite proxying to a dead :apiPort until the next edit.
+      if (code !== 0) {
+        process.stderr.write(`kusa: serve exited ${code}${signal ? ` (${signal})` : ''} — restarting API\n`);
+        setTimeout(() => {
+          if (!shuttingDown) startServer();
+        }, 250);
+        return;
+      }
     });
   };
 
@@ -192,9 +200,15 @@ export function runLiveServe(argv = process.argv.slice(2)) {
 
   let pendingRestart;
   const restartServer = () => {
-    if (shuttingDown || !serverChild) return;
+    if (shuttingDown) return;
     process.stdout.write(`kusa: server sources changed — restarting API on :${apiPort} (in-flight turns are lost)\n`);
     restartPending = true;
+    // Child may already be dead (crash before a watcher fire). kill() on a
+    // finished process does not emit 'exit' again, so start immediately.
+    if (!serverChild || serverChild.exitCode != null || serverChild.signalCode) {
+      startServer();
+      return;
+    }
     serverChild.kill('SIGTERM');
   };
   const scheduleRestart = () => {

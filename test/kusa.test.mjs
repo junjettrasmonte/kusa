@@ -18,6 +18,8 @@ import {
   deleteSessions,
   isPlanExecutionPrompt,
   extractPlanTodo,
+  syncLanePromptsFromTranscript,
+  transcriptPromptTurns,
   fileLabelOf,
   formatDuration,
   trailSavingsFromTranscript,
@@ -39,6 +41,7 @@ import {
   createChatSession,
   listChatSessions,
   migrateChatSessions,
+  readChatSession,
   sessionConfigPath,
   writeChatSession,
 } from '#features/chat/data/chat-store.mjs';
@@ -47,6 +50,7 @@ import { createKusaHookEmitter, mirrorCliMonitorEvent } from '#features/agent/ho
 import { serverSourceClosure } from '#app/console/serve-live.mjs';
 import { loadQueues, queuesFilePath, saveQueues, WORKSPACE_QUEUE_KEY } from '#features/chat/data/queue-store.mjs';
 import { loadTasks, saveTasks, tasksFilePath } from '#features/chat/data/task-store.mjs';
+import { listPlans } from '#features/chat/data/plan-store.mjs';
 import { consoleAsset, entryPoint } from '#shared/lib/pkg.mjs';
 
 const root = join(import.meta.dirname, '..');
@@ -547,6 +551,14 @@ describe('Cursor and Copilot share one dashboard', () => {
     assert.match(state.session.prompts[0].plan.body, /Capture todos/);
     assert.equal(state.session.prompts[0].todos.length, 2);
     assert.equal(state.session.prompts[0].todos[0].id, 'p1');
+    // External CreatePlan is also upserted into `.kusa/plans/` for the drawer.
+    assert.ok(state.session.plan.workspacePlanId, 'lane.plan.workspacePlanId stamped');
+    const workspacePlans = listPlans(dir);
+    const shipped = workspacePlans.find((plan) => plan.id === state.session.plan.workspacePlanId);
+    assert.ok(shipped, 'workspace plan exists for intercepted CreatePlan');
+    assert.equal(shipped.name, 'Ship tabs');
+    assert.equal(shipped.status, 'ready');
+    assert.match(shipped.body, /Capture todos/);
     const view = bootstrap(dir);
     assert.equal(view.plan.name, 'Ship tabs');
     assert.equal(view.todos.length, 2);
@@ -1720,6 +1732,125 @@ describe('sessionEnd does not invent sidebar rows', () => {
     view = bootstrap(dir);
     assert.equal(view.harnesses.some((h) => h.harness === 'cursor'), false);
     assert.equal(existsSync(laneFiles(dir, { harness: 'cursor', id: 'ghost' }).json), false);
+  });
+});
+
+function promptRow(index, atWall, text, response) {
+  return {
+    index,
+    atWall,
+    endedAtWall: null,
+    durationMs: null,
+    chars: text.length,
+    text,
+    truncated: false,
+    role: 'user',
+    response,
+    responseChars: response.length,
+    responseTruncated: false,
+    plan: null,
+    todos: null,
+    toolAttempts: 0,
+    open: false,
+    generationId: '',
+    model: '',
+    tokens: null,
+    trailSavedTokens: null,
+  };
+}
+
+describe('Cursor observe: prompts backfilled from agent-transcripts', () => {
+  const jsonl = (rows) => rows.map((row) => JSON.stringify(row)).join('\n');
+
+  it('parses agent-transcript rows into prompt turns and reply bodies', () => {
+    const fixture = jsonl([
+      { role: 'user', message: { content: [{ type: 'text', text: '<user_query>first question</user_query>' }] } },
+      { role: 'assistant', message: { content: [
+        { type: 'text', text: 'answer one' },
+        { type: 'tool_use', name: 'Shell', input: { command: 'ls' } },
+      ] } },
+      { role: 'assistant', message: { content: [{ type: 'text', text: ' continues the same reply' }] } },
+      { role: 'user', message: { content: [{ type: 'tool_result', content: 'tool output is not a prompt' }] } },
+      { role: 'user', message: { content: '<user_query>\n[2026-11-02T10:00:00Z] second question\n</user_query>' } },
+      { role: 'assistant', message: { content: [] } },
+    ]);
+    const turns = transcriptPromptTurns(fixture);
+    // A tool-result echo is never a prompt, and `<user_query>` bodies / harness
+    // timestamps unwrap so the Agents chat reads what the user actually typed.
+    assert.equal(turns.length, 2);
+    assert.equal(turns[0].text, 'first question');
+    assert.equal(turns[0].role, 'user');
+    assert.equal(turns[0].response, 'answer one\n continues the same reply');
+    assert.equal(turns[1].text, 'second question');
+    assert.equal(turns[1].response, '');
+  });
+
+  it('backfills turns no hook ever fired for, and never rewrites hook text', () => {
+    const dir = tempDir();
+    const transcriptPath = join(dir, 'ide-3.jsonl');
+    writeFileSync(transcriptPath, jsonl([
+      { role: 'user', timestamp: 1_700_000_000_000, message: { content: [{ type: 'text', text: '<user_query>older question</user_query>' }] } },
+      { role: 'assistant', timestamp: 1_700_000_000_500, message: { content: [{ type: 'text', text: 'older answer' }] } },
+      { role: 'user', timestamp: 1_700_000_000_100, message: { content: [{ type: 'text', text: '<user_query>hook question</user_query>' }] } },
+      { role: 'assistant', timestamp: 1_700_000_000_600, message: { content: [{ type: 'text', text: 'disk reply for the first turn' }] } },
+      { role: 'user', timestamp: 1_700_000_000_200, message: { content: [{ type: 'text', text: '<user_query>hook question two</user_query>' }] } },
+      { role: 'assistant', timestamp: 1_700_000_000_700, message: { content: [{ type: 'text', text: 'disk answer two' }] } },
+    ]));
+    const lane = {
+      id: 'ide-3',
+      key: 'cursor:ide-3',
+      harness: 'cursor',
+      kusaOwned: false,
+      transcriptPath,
+      startedAtWall: 1_700_000_000_000,
+      promptIndex: 2,
+      // Newest first, like every lane. Row 2 lost its reply (no afterAgentResponse
+      // for an observe-only composer); row 1 has text hooks already captured.
+      prompts: [
+        promptRow(2, 1_700_000_000_200, 'hook question two', ''),
+        promptRow(1, 1_700_000_000_100, 'hook question', 'hook reply'),
+      ],
+    };
+    syncLanePromptsFromTranscript(lane);
+    const byText = (text) => lane.prompts.find((row) => row.text === text);
+    assert.equal(lane.prompts.length, 3, 'the pre-hook turn comes from disk');
+    assert.equal(byText('hook question').response, 'hook reply', 'hook text is never replaced');
+    assert.equal(byText('hook question two').response, 'disk answer two', 'the missing reply is filled');
+    const appended = lane.prompts[lane.prompts.length - 1];
+    assert.equal(appended.text, 'older question');
+    assert.equal(appended.response, 'older answer');
+    assert.equal(appended.atWall, 1_700_000_000_000);
+    assert.equal(lane.promptIndex, 3, 'the next hook prompt cannot reuse an index');
+    // Unchanged transcript → no re-parse (mtime gate, like todos/trail sync).
+    syncLanePromptsFromTranscript(lane);
+    assert.equal(lane.prompts.length, 3);
+  });
+
+  it('an empty chat sidecar cannot blank a lane the monitor backfilled', () => {
+    const dir = tempDir();
+    const lanePath = laneFiles(dir, { harness: 'cursor', id: 'ide-4' }).json;
+    mkdirSync(dirname(lanePath), { recursive: true });
+    writeFileSync(lanePath, JSON.stringify({
+      id: 'ide-4',
+      key: 'cursor:ide-4',
+      harness: 'cursor',
+      kusaOwned: false,
+      active: false,
+      startedAtWall: 1_700_000_000_000,
+      endedAtWall: 1_700_000_000_900,
+      promptIndex: 1,
+      prompts: [promptRow(1, 1_700_000_000_000, 'from disk', 'from disk reply')],
+    }));
+    // A turn writer that never saw a prompt still leaves chat.json behind — the
+    // exact artifact that used to render an Agents row with no transcript.
+    writeFileSync(chatFilePath(dir, 'ide-4', 'cursor'), JSON.stringify({ id: 'ide-4', harness: 'cursor', messages: [] }));
+    const row = listChatSessions(dir).find((s) => s.id === 'ide-4');
+    assert.ok(row, 'a lane with prompts is still listed');
+    assert.equal(row.messages.length, 2);
+    assert.equal(row.messages[0].role, 'user');
+    assert.equal(row.messages[0].text, 'from disk');
+    assert.equal(row.messages[1].text, 'from disk reply');
+    assert.equal(readChatSession(dir, 'ide-4')?.messages?.length, 2, 'the open detail reads the same way');
   });
 });
 

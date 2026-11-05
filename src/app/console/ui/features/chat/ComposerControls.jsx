@@ -1,20 +1,36 @@
-import { useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useEffect, useId, useRef, useState } from 'react';
+import { CHAT_PROVIDER_GROUPS } from '#ui/shared/lib/format.js';
+import { CloseIcon, InfoIcon, IconButton } from '#ui/shared/IconButton.jsx';
 import {
   modelFamilyBackLabel,
   modelFamilyOptions,
   modelMenuRows,
 } from '#ui/shared/lib/modelFamily.js';
+import { WorkflowGraphView } from './WorkflowGraphView.jsx';
 
 /**
- * Composer pickers + action icons — Mode / Rules / Model dropdowns sit in the
- * composer footer flush left of the context ring, attach, dictate, and
+ * Composer pickers + action icons — Mode / Agent / Model / Rule dropdowns sit
+ * in the composer footer flush left of the context ring, attach, dictate, and
  * live/send controls (or, on a narrow composer, one ComposerOptionsMenu that
  * drills into each picker). Values live in SessionChat state; these
  * components only render and route a selection back through onSelect.
+ * Disabled triggers render at 50% opacity.
  *
  * Model menus keep provider (endpoint) headings, then nest multi-model
  * families (Claude / GPT / Gemini / …) as selectable submenus.
+ * Mode → Orchestrator is a nested submenu; workflows are the selectable children.
  */
+export const AGENT_PROVIDER_OPTIONS = CHAT_PROVIDER_GROUPS.map((group) => ({
+  id: group.id,
+  label: group.id === 'copilot' ? 'GitHub Copilot' : group.label,
+  blurb: group.id === 'kusa'
+    ? 'Kusă agent (OpenAI-compatible endpoints).'
+    : group.id === 'cursor'
+      ? 'Cursor Agent CLI.'
+      : 'GitHub Copilot CLI.',
+}));
+
 export const AGENT_MODE_OPTIONS = [
   {
     id: 'ask',
@@ -31,7 +47,17 @@ export const AGENT_MODE_OPTIONS = [
     label: 'Agent',
     blurb: 'Read and write files; commands follow the rules.',
   },
+  {
+    id: 'orchestrator',
+    label: 'Orchestrator',
+    blurb: 'Pick a workflow — nested submenu.',
+    /** Opens as a chevron nested menu; workflows are the selectable children. */
+    nested: true,
+  },
 ];
+
+/** Tool-loop modes only — Orchestrator is session kind, not normalizeAgentMode. */
+export const AGENT_TOOL_MODE_IDS = new Set(['ask', 'plan', 'agent']);
 
 /**
  * Composer Rules picker options. The ask timeout comes from Settings so the
@@ -144,29 +170,35 @@ function MenuOptionButton({
   onPick,
   role = undefined,
 }) {
+  const disabled = option?.disabled === true;
   return (
     <button
       type="button"
       role={role}
+      disabled={disabled}
+      aria-disabled={disabled || undefined}
+      title={disabled ? (option.disabledReason || option.blurb || 'Unavailable') : undefined}
       onMouseDown={(e) => {
         // Press, not release: the trigger's blur can close the menu before
         // `click` is dispatched, and a released click would then land on
         // whatever sits behind the removed menu. mousedown always fires
         // while the option is still in the DOM, so the selection cannot
         // be lost. Left button only (right-click is a context menu).
-        if (!isPrimaryMouse(e)) return;
+        if (disabled || !isPrimaryMouse(e)) return;
         e.preventDefault();
         onPick?.(option.id);
       }}
       className={`block w-full px-2.5 py-1.5 text-[11px] leading-snug text-left ${
-        selected
-          ? 'bg-gray-800/70 font-medium text-emerald-300'
-          : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+        disabled
+          ? 'cursor-not-allowed text-gray-600'
+          : selected
+            ? 'bg-gray-800/70 font-medium text-emerald-300'
+            : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
       }`}
     >
       <span className="font-medium break-all">{option.label}</span>
       {option.blurb ? (
-        <span className="ml-1.5 text-gray-500">· {option.blurb}</span>
+        <span className={`ml-1.5 ${disabled ? 'text-gray-600' : 'text-gray-500'}`}>· {option.blurb}</span>
       ) : null}
     </button>
   );
@@ -177,26 +209,41 @@ function MenuFamilyButton({
   selected,
   onOpen,
   role = undefined,
+  disabled = false,
+  blurb = '',
+  title = undefined,
 }) {
   return (
     <button
       type="button"
       role={role}
+      disabled={disabled}
+      aria-disabled={disabled || undefined}
+      title={title}
       onMouseDown={(e) => {
-        if (!isPrimaryMouse(e)) return;
+        if (disabled || !isPrimaryMouse(e)) return;
         // preventDefault keeps the trigger focused so the deferred blur
         // close never fires while opening a family submenu.
         e.preventDefault();
         onOpen?.();
       }}
       className={`flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-left ${
-        selected
-          ? 'bg-gray-800/70 font-medium text-emerald-300'
-          : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+        disabled
+          ? 'cursor-not-allowed text-gray-600'
+          : selected
+            ? 'bg-gray-800/70 font-medium text-emerald-300'
+            : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
       }`}
     >
-      <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-      <Chevron open />
+      <span className="min-w-0 flex-1 truncate font-medium">
+        {label}
+        {blurb ? (
+          <span className={`ml-1.5 font-normal ${disabled ? 'text-gray-600' : 'text-gray-500'}`}>
+            · {blurb}
+          </span>
+        ) : null}
+      </span>
+      {disabled ? null : <Chevron open />}
     </button>
   );
 }
@@ -221,7 +268,240 @@ function MenuBackButton({ label, onBack, stickyClass = 'top-0' }) {
   );
 }
 
-/** Render Mode/Rule flat rows, or Model provider+family rows. */
+/** Compact Orchestrator workflow row: max 2 lines + info affordance. */
+function WorkflowMenuRow({ workflow, onSelect, onInfo }) {
+  const title = String(workflow?.label || workflow?.id || 'Workflow').trim();
+  const description = String(workflow?.description || '').trim();
+  return (
+    <div
+      role="menuitem"
+      className="flex w-full items-start gap-1 px-2 py-1.5 text-left hover:bg-gray-800/50"
+    >
+      <button
+        type="button"
+        title={description ? `${title} — ${description}` : title}
+        onMouseDown={(e) => {
+          if (!isPrimaryMouse(e)) return;
+          e.preventDefault();
+          onSelect?.(workflow);
+        }}
+        className="min-w-0 flex-1 text-left"
+      >
+        <p className="line-clamp-2 text-[11px] leading-snug text-gray-200">
+          <span className="font-medium">{title}</span>
+          {description ? (
+            <span className="font-normal text-gray-500">{` — ${description}`}</span>
+          ) : null}
+        </p>
+      </button>
+      <button
+        type="button"
+        title={`About ${title}`}
+        aria-label={`About ${title}`}
+        onMouseDown={(e) => {
+          if (!isPrimaryMouse(e)) return;
+          // Keep the Mode menu from blur-closing before the details dialog mounts.
+          e.preventDefault();
+          e.stopPropagation();
+          onInfo?.(workflow);
+        }}
+        className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-gray-500 hover:bg-gray-800 hover:text-sky-300"
+      >
+        <InfoIcon className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+/** Full workflow details (desc / roles / LangGraph) opened from the info icon. */
+function WorkflowDetailsModal({ workflow, onClose }) {
+  const titleId = useId();
+  const closeRef = useRef(null);
+  const title = String(workflow?.label || workflow?.id || 'Workflow').trim();
+  const description = String(workflow?.description || '').trim();
+  const workflowId = String(workflow?.id || '').trim();
+  const isLangGraph = String(workflow?.runtime || '').toLowerCase() === 'langgraph';
+  const roleConfigs = workflow?.roleConfigs && typeof workflow.roleConfigs === 'object'
+    ? workflow.roleConfigs
+    : {};
+  const roles = Object.entries(roleConfigs);
+  const [graph, setGraph] = useState(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [graphError, setGraphError] = useState('');
+
+  useEffect(() => {
+    const previous = document.activeElement;
+    closeRef.current?.focus();
+    const onKey = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+      if (previous && typeof previous.focus === 'function') previous.focus();
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!isLangGraph || !workflowId) {
+      setGraph(null);
+      setGraphError('');
+      setGraphLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setGraphLoading(true);
+    setGraphError('');
+    setGraph(null);
+    fetch(`/kusa/workflows/${encodeURIComponent(workflowId)}/graph`, {
+      headers: { Accept: 'application/json' },
+    })
+      .then(async (res) => {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
+        return body?.graph || null;
+      })
+      .then((next) => {
+        if (cancelled) return;
+        setGraph(next);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setGraphError(err?.message || 'Could not load graph');
+      })
+      .finally(() => {
+        if (!cancelled) setGraphLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isLangGraph, workflowId]);
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4"
+      role="presentation"
+      onMouseDown={(e) => {
+        // Don't let the backdrop click fall through to the composer menu.
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="flex max-h-[min(92vh,52rem)] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-900 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-gray-800 px-4 py-3">
+          <div className="min-w-0">
+            <h2 id={titleId} className="truncate text-sm font-semibold text-gray-100">
+              {title}
+            </h2>
+            <p className="mt-0.5 truncate font-mono text-[11px] text-sky-300">
+              {workflowId || '—'}
+              {isLangGraph ? (
+                <span className="ml-2 font-sans text-gray-500">· LangGraph</span>
+              ) : null}
+            </p>
+          </div>
+          <IconButton
+            ref={closeRef}
+            label="Close"
+            icon={CloseIcon}
+            onClick={onClose}
+          />
+        </div>
+        <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">
+          {description ? (
+            <p className="text-sm leading-relaxed text-gray-300">{description}</p>
+          ) : (
+            <p className="text-sm text-gray-500">No description for this workflow.</p>
+          )}
+          {isLangGraph ? (
+            <div>
+              <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+                Graph
+              </h3>
+              <WorkflowGraphView
+                drawable={graph}
+                loading={graphLoading}
+                error={graphError}
+                className="h-[20rem]"
+              />
+            </div>
+          ) : null}
+          {roles.length ? (
+            <div>
+              <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+                Roles
+              </h3>
+              <ul className="space-y-2">
+                {roles.map(([roleName, cfg]) => {
+                  const provider = String(cfg?.provider || 'kusa').trim() || 'kusa';
+                  const mode = String(cfg?.mode || '').trim();
+                  const rules = String(cfg?.rules || '').trim();
+                  const model = String(cfg?.model || '').trim();
+                  const bits = [
+                    `provider ${provider}`,
+                    mode ? `mode ${mode}` : null,
+                    rules ? `rules ${rules}` : null,
+                    model ? `model ${model}` : 'model · endpoint default',
+                  ].filter(Boolean);
+                  return (
+                    <li
+                      key={roleName}
+                      className="rounded-lg border border-gray-800 bg-gray-950/80 px-3 py-2"
+                    >
+                      <p className="text-[12px] font-medium capitalize text-gray-200">{roleName}</p>
+                      <p className="mt-0.5 text-[11px] text-gray-500">{bits.join(' · ')}</p>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function WorkflowMenuList({
+  workflows,
+  loading,
+  onSelect,
+  onInfo,
+}) {
+  if (loading) {
+    return <p className="px-2.5 py-2 text-[11px] text-gray-500">Loading workflows…</p>;
+  }
+  if (!workflows?.length) {
+    return (
+      <p className="px-2.5 py-2 text-[11px] text-gray-500">
+        No workflows yet. Seeded plan-execute appears after serve starts.
+      </p>
+    );
+  }
+  return workflows.map((wf) => (
+    <WorkflowMenuRow
+      key={wf.id}
+      workflow={wf}
+      onSelect={onSelect}
+      onInfo={onInfo}
+    />
+  ));
+}
+
+/** Render Mode/Rule flat rows, or Model provider+family rows.
+ *  Mode options may set `nested: true` (Orchestrator) to open as a submenu. */
 function PickerMenuBody({
   title,
   options,
@@ -229,6 +509,7 @@ function PickerMenuBody({
   familyKey,
   onFamilyOpen,
   onSelect,
+  onNestedOpen = null,
   headingStickyClass = 'top-0',
   role = undefined,
 }) {
@@ -269,6 +550,22 @@ function PickerMenuBody({
         />
       );
     }
+    if (row.option?.nested) {
+      return (
+        <MenuFamilyButton
+          key={row.option.id}
+          label={row.option.label}
+          blurb={row.option.blurb || ''}
+          selected={row.option.id === value}
+          disabled={row.option.disabled === true}
+          title={row.option.disabled
+            ? (row.option.disabledReason || row.option.blurb || 'Unavailable')
+            : undefined}
+          onOpen={() => onNestedOpen?.(row.option.id)}
+          role={role}
+        />
+      );
+    }
     return (
       <MenuOptionButton
         key={row.option.id}
@@ -281,44 +578,100 @@ function PickerMenuBody({
   });
 }
 
-export function ComposerDropdown({ title, options, value, onSelect }) {
+/**
+ * @param {string} title
+ * @param {Array<{ id: string, label: string, blurb?: string, group?: string }>} options
+ * @param {string} value
+ * @param {(id: string) => void} [onSelect]
+ * @param {boolean} [disabled]
+ * @param {Array<{ id: string, label: string, blurb?: string, roleConfigs?: object, provider?: string }>} [workflowOptions]
+ *   Mode → Orchestrator drills into these before converting.
+ * @param {boolean} [workflowsLoading]
+ * @param {(workflow: object) => void} [onWorkflowSelect]
+ */
+export function ComposerDropdown({
+  title,
+  options,
+  value,
+  onSelect,
+  disabled = false,
+  workflowOptions = null,
+  workflowsLoading = false,
+  onWorkflowSelect = null,
+  onWorkflowMenuOpen = null,
+}) {
   // Focus-driven, not a toggle: blur is the only way the menu closes itself.
   const [open, setOpen] = useState(false);
   // Model-only: null at provider/family list; family key while drilled in.
   const [familyKey, setFamilyKey] = useState(null);
+  // Mode-only: 'orchestrator' while picking a workflow under Orchestrator.
+  const [modeDrill, setModeDrill] = useState(null);
+  // Info icon → workflow details dialog (independent of the menu).
+  const [detailsWorkflow, setDetailsWorkflow] = useState(null);
+  const rootRef = useRef(null);
   const label = optionLabel(options, value);
   const isModel = title === 'Model';
+  const isMode = title === 'Mode';
+  const showWorkflowDrill = isMode && modeDrill === 'orchestrator';
+  // Nested Orchestrator menu must open even while the list is still loading —
+  // an empty array is fine; null means "not available for this session".
+  const canDrillOrchestrator = isMode
+    && workflowOptions != null
+    && typeof onWorkflowSelect === 'function';
 
   function close() {
     setOpen(false);
     setFamilyKey(null);
+    setModeDrill(null);
+  }
+
+  function handleSelect(id) {
+    const option = options.find((entry) => entry.id === id);
+    if (option?.disabled || option?.nested) return;
+    close();
+    onSelect?.(id);
+  }
+
+  function openOrchestratorNest() {
+    if (!canDrillOrchestrator) return;
+    const option = options.find((entry) => entry.id === 'orchestrator');
+    if (option?.disabled) return;
+    setModeDrill('orchestrator');
+    onWorkflowMenuOpen?.();
   }
 
   return (
-    <div className="relative inline-flex items-center">
+    <div className="relative inline-flex items-center" ref={rootRef}>
       <button
         type="button"
+        disabled={disabled}
         onClick={(e) => {
+          if (disabled) return;
           setOpen(true);
           setFamilyKey(null);
+          setModeDrill(null);
           // Focus it explicitly: browsers are inconsistent about moving focus on a
           // mouse click, and without focus there is no blur event to close the menu.
           e.currentTarget.focus();
         }}
         onBlur={() => {
-          // Deferred, never synchronous: selecting an option moves focus to that
-          // option, which blurs THIS trigger first. Closing here would take the
-          // menu out of the DOM before the option's own handler runs, and the
-          // selection would be silently dropped. A queued task still runs before
-          // the next input event is dispatched, so the menu stays reachable for
-          // the rest of the click, and it still self-closes when the user types
-          // in the composer or tabs away.
-          if (open) setTimeout(close, 0);
+          // Deferred: ignore blur when focus stays inside this picker (nested
+          // Orchestrator / Model family clicks). A bare close-on-blur was wiping
+          // modeDrill before the workflow list could paint.
+          if (!open) return;
+          setTimeout(() => {
+            if (!rootRef.current?.contains(document.activeElement)) close();
+          }, 0);
         }}
-        title={`${title}: ${label}`}
+        title={disabled ? `${title}: ${label} (locked by workflow)` : `${title}: ${label}`}
         aria-label={title}
         aria-expanded={open}
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-gray-500 hover:text-gray-200 hover:bg-gray-800/70"
+        aria-disabled={disabled || undefined}
+        className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium ${
+          disabled
+            ? 'cursor-not-allowed text-gray-500 opacity-50'
+            : 'text-gray-500 hover:text-gray-200 hover:bg-gray-800/70'
+        }`}
       >
         <span className="text-gray-600">{title}</span>
         <span className="max-w-[12rem] truncate text-gray-200">{label}</span>
@@ -326,9 +679,15 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
       </button>
       {open ? (
         <div
-          className={`absolute left-0 bottom-[100%] z-50 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg ${
+          className={`absolute left-0 bottom-[100%] z-50 max-h-[min(20rem,50vh)] w-[18rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg ${
             isModel ? 'divide-y divide-gray-800' : ''
           }`}
+          onMouseDown={(e) => {
+            // Keep the trigger focused for the whole drill (Orchestrator /
+            // Model family). Without this, a nested click can blur→close
+            // before modeDrill paints the workflow list.
+            e.preventDefault();
+          }}
         >
           {isModel && familyKey ? (
             <MenuBackButton
@@ -336,19 +695,43 @@ export function ComposerDropdown({ title, options, value, onSelect }) {
               onBack={() => setFamilyKey(null)}
             />
           ) : null}
-          <PickerMenuBody
-            title={title}
-            options={options}
-            value={value}
-            familyKey={isModel ? familyKey : null}
-            onFamilyOpen={setFamilyKey}
-            onSelect={(id) => {
-              close();
-              onSelect?.(id);
-            }}
-            headingStickyClass={isModel && familyKey ? 'top-8' : 'top-0'}
-          />
+          {showWorkflowDrill ? (
+            <>
+              <MenuBackButton
+                label="Orchestrator"
+                onBack={() => setModeDrill(null)}
+              />
+              <WorkflowMenuList
+                workflows={workflowOptions}
+                loading={workflowsLoading}
+                onSelect={(wf) => {
+                  close();
+                  onWorkflowSelect?.(wf);
+                }}
+                onInfo={setDetailsWorkflow}
+              />
+            </>
+          ) : (
+            <PickerMenuBody
+              title={title}
+              options={options}
+              value={value}
+              familyKey={isModel ? familyKey : null}
+              onFamilyOpen={setFamilyKey}
+              onNestedOpen={(id) => {
+                if (id === 'orchestrator') openOrchestratorNest();
+              }}
+              onSelect={handleSelect}
+              headingStickyClass={isModel && familyKey ? 'top-8' : 'top-0'}
+            />
+          )}
         </div>
+      ) : null}
+      {detailsWorkflow ? (
+        <WorkflowDetailsModal
+          workflow={detailsWorkflow}
+          onClose={() => setDetailsWorkflow(null)}
+        />
       ) : null}
     </div>
   );
@@ -381,32 +764,48 @@ function ComposerOptionsIcon() {
 }
 
 /**
- * Narrow-composer Mode / Rule / Model control. One icon opens a menu whose
- * first level is the three pickers; each picker's options are a drill-in
- * submenu (tap Mode → Ask/Plan/Agent). Wide composers keep the three
- * ComposerDropdowns in the footer instead — SessionChat swaps on a container
- * query so a narrow chat column collapses even when the window itself is wide.
+ * Narrow-composer Mode / Agent / Model / Rule control. One icon opens a menu
+ * whose first level is the pickers; each picker's options are a drill-in
+ * submenu. Mode → Orchestrator opens a nested workflow submenu. Wide composers
+ * keep ComposerDropdowns in the footer instead — SessionChat swaps on a
+ * container query so a narrow chat column collapses even when the window
+ * itself is wide.
  *
  * Focus-driven like ComposerDropdown: the trigger holds focus, menu presses
  * use mousedown + preventDefault so drilling in never blurs the trigger shut,
  * and blur (typing in the composer, tabbing away) still closes everything.
  */
 export function ComposerOptionsMenu({
+  agent = '',
+  agentOptions = AGENT_PROVIDER_OPTIONS,
+  onAgentSelect = null,
+  agentDisabled = false,
   mode,
   modeOptions,
   onModeSelect,
+  modeDisabled = false,
   rule,
   ruleOptions: ruleOpts,
   onRuleSelect,
+  ruleDisabled = false,
   model,
   modelOptions,
   onModelSelect,
+  modelDisabled = false,
+  workflowOptions = null,
+  workflowsLoading = false,
+  onWorkflowSelect = null,
+  onWorkflowMenuOpen = null,
 }) {
   const [open, setOpen] = useState(false);
-  // null = top level (Mode / Rule / Model); otherwise which picker's options.
+  // null = top level; otherwise which picker's options.
   const [panel, setPanel] = useState(null);
   // Model-only: family drill-in under the Model panel.
   const [familyKey, setFamilyKey] = useState(null);
+  // Mode-only: workflow list under Orchestrator.
+  const [modeDrill, setModeDrill] = useState(null);
+  const [detailsWorkflow, setDetailsWorkflow] = useState(null);
+  const rootRef = useRef(null);
 
   const pickers = [
     {
@@ -415,6 +814,25 @@ export function ComposerOptionsMenu({
       value: mode,
       options: modeOptions,
       onSelect: onModeSelect,
+      disabled: modeDisabled,
+    },
+    ...(onAgentSelect
+      ? [{
+        id: 'agent',
+        title: 'Agent',
+        value: agent,
+        options: agentOptions,
+        onSelect: onAgentSelect,
+        disabled: agentDisabled,
+      }]
+      : []),
+    {
+      id: 'model',
+      title: 'Model',
+      value: model,
+      options: modelOptions,
+      onSelect: onModelSelect,
+      disabled: modelDisabled,
     },
     {
       id: 'rule',
@@ -422,52 +840,66 @@ export function ComposerOptionsMenu({
       value: rule,
       options: ruleOpts,
       onSelect: onRuleSelect,
-    },
-    {
-      id: 'model',
-      title: 'Model',
-      value: model,
-      options: modelOptions,
-      onSelect: onModelSelect,
+      disabled: ruleDisabled,
     },
   ];
   const active = pickers.find((picker) => picker.id === panel) || null;
-  const tip = `Mode: ${optionLabel(modeOptions, mode)} · Rule: ${optionLabel(ruleOpts, rule)} · Model: ${optionLabel(modelOptions, model)}`;
+  const tip = [
+    `Mode: ${optionLabel(modeOptions, mode)}`,
+    onAgentSelect ? `Agent: ${optionLabel(agentOptions, agent)}` : null,
+    `Model: ${optionLabel(modelOptions, model)}`,
+    `Rule: ${optionLabel(ruleOpts, rule)}`,
+  ].filter(Boolean).join(' · ');
+  const canDrillOrchestrator = workflowOptions != null
+    && typeof onWorkflowSelect === 'function';
+  const showWorkflowDrill = active?.id === 'mode' && modeDrill === 'orchestrator';
 
   function close() {
     setOpen(false);
     setPanel(null);
     setFamilyKey(null);
+    setModeDrill(null);
   }
 
   function backFromActive() {
+    if (showWorkflowDrill) {
+      setModeDrill(null);
+      return;
+    }
     if (active?.id === 'model' && familyKey) {
       setFamilyKey(null);
       return;
     }
     setPanel(null);
     setFamilyKey(null);
+    setModeDrill(null);
   }
 
-  const backLabel = active?.id === 'model' && familyKey
-    ? modelFamilyBackLabel(familyKey)
-    : (active?.title || '');
+  const backLabel = showWorkflowDrill
+    ? 'Orchestrator'
+    : active?.id === 'model' && familyKey
+      ? modelFamilyBackLabel(familyKey)
+      : (active?.title || '');
 
   return (
-    <div className="relative inline-flex items-center">
+    <div className="relative inline-flex items-center" ref={rootRef}>
       <button
         type="button"
         onClick={(e) => {
           setOpen(true);
           setPanel(null);
           setFamilyKey(null);
+          setModeDrill(null);
           e.currentTarget.focus();
         }}
         onBlur={() => {
-          if (open) setTimeout(close, 0);
+          if (!open) return;
+          setTimeout(() => {
+            if (!rootRef.current?.contains(document.activeElement)) close();
+          }, 0);
         }}
         title={tip}
-        aria-label="Mode, Rule, and Model"
+        aria-label="Mode, Agent, Model, and Rule"
         aria-expanded={open}
         aria-haspopup="menu"
         className={`inline-flex h-6 w-6 items-center justify-center rounded-md transition-colors ${
@@ -481,25 +913,51 @@ export function ComposerOptionsMenu({
       {open ? (
         <div
           role="menu"
-          aria-label="Mode, Rule, and Model"
+          aria-label="Mode, Agent, Model, and Rule"
           className="absolute left-0 bottom-[100%] z-50 max-h-[min(20rem,50vh)] w-[16rem] overflow-y-auto overscroll-contain rounded-lg border border-gray-700 bg-gray-950 shadow-lg"
+          onMouseDown={(e) => {
+            // Same as ComposerDropdown: nested Orchestrator / Mode clicks must
+            // not blur the trigger or the menu closes before the list paints.
+            e.preventDefault();
+          }}
         >
           {active ? (
             <>
               <MenuBackButton label={backLabel} onBack={backFromActive} />
-              <PickerMenuBody
-                title={active.title}
-                options={active.options}
-                value={active.value}
-                familyKey={active.id === 'model' ? familyKey : null}
-                onFamilyOpen={setFamilyKey}
-                onSelect={(id) => {
-                  close();
-                  active.onSelect?.(id);
-                }}
-                headingStickyClass="top-8"
-                role="menuitem"
-              />
+              {showWorkflowDrill ? (
+                <WorkflowMenuList
+                  workflows={workflowOptions}
+                  loading={workflowsLoading}
+                  onSelect={(wf) => {
+                    close();
+                    onWorkflowSelect?.(wf);
+                  }}
+                  onInfo={setDetailsWorkflow}
+                />
+              ) : (
+                <PickerMenuBody
+                  title={active.title}
+                  options={active.options}
+                  value={active.value}
+                  familyKey={active.id === 'model' ? familyKey : null}
+                  onFamilyOpen={setFamilyKey}
+                  onNestedOpen={(id) => {
+                    if (active.id !== 'mode' || id !== 'orchestrator') return;
+                    const option = active.options?.find((entry) => entry.id === id);
+                    if (option?.disabled || !canDrillOrchestrator) return;
+                    setModeDrill('orchestrator');
+                    onWorkflowMenuOpen?.();
+                  }}
+                  onSelect={(id) => {
+                    const option = active.options?.find((entry) => entry.id === id);
+                    if (option?.disabled || option?.nested) return;
+                    close();
+                    active.onSelect?.(id);
+                  }}
+                  headingStickyClass="top-8"
+                  role="menuitem"
+                />
+              )}
             </>
           ) : (
             pickers.map((picker) => (
@@ -507,25 +965,38 @@ export function ComposerOptionsMenu({
                 key={picker.id}
                 type="button"
                 role="menuitem"
+                disabled={picker.disabled}
                 onMouseDown={(e) => {
-                  if (!isPrimaryMouse(e)) return;
+                  if (picker.disabled || !isPrimaryMouse(e)) return;
                   // preventDefault keeps the trigger focused so the deferred blur
                   // close never fires while opening a submenu.
                   e.preventDefault();
                   setFamilyKey(null);
+                  setModeDrill(null);
                   setPanel(picker.id);
                 }}
-                className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-left text-gray-400 hover:bg-gray-800/50 hover:text-gray-200"
+                className={`flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-left ${
+                  picker.disabled
+                    ? 'cursor-not-allowed text-gray-500 opacity-50'
+                    : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'
+                }`}
+                title={picker.disabled ? 'Locked by workflow' : undefined}
               >
                 <span className="w-10 shrink-0 text-gray-600">{picker.title}</span>
-                <span className="min-w-0 flex-1 truncate font-medium text-gray-200">
+                <span className={`min-w-0 flex-1 truncate font-medium ${picker.disabled ? 'text-gray-500' : 'text-gray-200'}`}>
                   {optionLabel(picker.options, picker.value)}
                 </span>
-                <Chevron open />
+                {picker.disabled ? null : <Chevron open />}
               </button>
             ))
           )}
         </div>
+      ) : null}
+      {detailsWorkflow ? (
+        <WorkflowDetailsModal
+          workflow={detailsWorkflow}
+          onClose={() => setDetailsWorkflow(null)}
+        />
       ) : null}
     </div>
   );
@@ -539,23 +1010,27 @@ function formatTokens(value) {
 }
 
 /**
- * Estimated context window usage as a ring; counts live in the tooltip.
+ * Context window usage as a ring; counts live in the tooltip.
  * Deliberately neutral: the meter is a readout, not an alert, so it uses the
  * gray ramp (track = the same gray at low opacity, arc = the full gray) instead
  * of the kusa-blue brand accent. Only real pressure escalates.
+ * When `source` is "strata", the tip names the live server meter.
  */
-export function ContextRing({ used, limit = DEFAULT_CONTEXT_LIMIT }) {
+export function ContextRing({ used, limit = DEFAULT_CONTEXT_LIMIT, source = '' }) {
   const max = Number(limit) > 0 ? Number(limit) : DEFAULT_CONTEXT_LIMIT;
   const usedN = Math.max(0, Math.round(Number(used) || 0));
   const ratio = Math.min(1, Math.max(0, usedN / max));
   const pct = Math.round(ratio * 100);
   const circumference = 2 * Math.PI * 6.5;
   const arc = ratio * circumference;
-  // Neutral by default — gray-400 arc over a 22%-opacity gray-400 track reads as
-  // light gray on dark gray, and the gray ramp is remapped by
-  // html[data-theme="light"] so this follows the theme with no extra classes.
-  const tone = ratio >= 0.9 ? 'text-rose-400' : ratio >= 0.7 ? 'text-amber-400' : 'text-gray-400';
-  const tip = `Context ${formatTokens(usedN)} / ${formatTokens(max)} (${pct}%)`;
+  // Neutral gray by default. Strata uses Tailwind `green-*` (not emerald): this
+  // console remaps every emerald-* token to the brand blue ramp in index.css,
+  // so emerald would read as blue and look "not green" even when live.
+  // Pressure still escalates to amber/rose either way.
+  const idle = source === 'strata' ? 'text-green-400' : 'text-gray-400';
+  const tone = ratio >= 0.9 ? 'text-rose-400' : ratio >= 0.7 ? 'text-amber-400' : idle;
+  const label = source === 'strata' ? 'Strata context' : 'Context';
+  const tip = `${label} ${formatTokens(usedN)} / ${formatTokens(max)} (${pct}%)`;
   return (
     <span
       className={`inline-flex h-8 w-8 items-center justify-center ${tone}`}

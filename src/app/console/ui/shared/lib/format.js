@@ -167,29 +167,29 @@ export const TAB_LABELS = {
 
 /** Left-sidebar views switched from the sidebar topbar icons. Each id is one
  * pane: `sidebar-view-<id>` is its tab button, `sidebar-panel-<id>` its panel.
- * Search is one id — names only. A content search asks a different question of
- * the workspace and would need its own pane and backend, so it is not a mode
- * switch on this one; that pane is not in the sidebar today (the agent answers
- * it with kusa_grep), and must come back as a NEW id if it is ever built —
- * never by reusing `search-names`. */
+ * `search` is workspace *content* search (GET /grep) with replace — a different
+ * question from file-name lookup. Older browsers stored `search-names` for the
+ * magnifying-glass icon; that id migrates here. */
 export const SIDEBAR_VIEW_IDS = [
-  'explorer',
   'agents',
-  'search-names',
+  'explorer',
+  'search',
+  'terminal',
   'extensions',
 ];
 
 export const SIDEBAR_VIEW_LABELS = {
   agents: 'Agents',
   explorer: 'Explorer',
-  'search-names': 'File names',
+  search: 'Search',
+  terminal: 'Terminal',
   extensions: 'Extensions',
 };
 
 /** Views whose id changed shape, mapped from the value an older browser stored.
  * Read back through initialSidebarView so a saved pane survives the rename. */
 export const SIDEBAR_VIEW_MIGRATED = {
-  search: 'search-names',
+  'search-names': 'search',
   sessions: 'agents',
 };
 

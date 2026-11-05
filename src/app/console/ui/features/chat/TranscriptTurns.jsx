@@ -11,6 +11,7 @@ import {
 } from '#ui/shared/lib/chatText.js';
 import { HARNESS_NAMES } from '#ui/shared/lib/format.js';
 import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import {
   AgentIcon,
   ArrowUpIcon,
@@ -26,6 +27,7 @@ import {
   AskCard,
   gateCarryBack,
 } from './GateBlocks.jsx';
+import { roleDisplayName, roleVisual } from './roleVisuals.js';
 
 /** Compact model id for the AgentSegment header (drop org/path noise). */
 function shortModelLabel(model) {
@@ -49,6 +51,73 @@ function speakerRoleLabel(speaker) {
   const role = String(speaker?.role || '').trim();
   if (!role) return '';
   return role.replace(/[_-]+/g, ' ');
+}
+
+/** Fine-print stub under an orchestrator turn for each Delegated handoff. */
+function DelegateFinePrint({ stub }) {
+  if (!stub) return null;
+  const role = speakerRoleLabel(stub.speaker) || stub.roleLabel || 'agent';
+  const brief = typeof stub.text === 'string' ? stub.text.trim() : '';
+  return (
+    <p className="mt-1.5 text-[10px] leading-relaxed text-gray-600">
+      <span className="text-gray-500">Delegated · {role}</span>
+      {brief ? (
+        <>
+          {' '}
+          <span className="text-gray-700">·</span>
+          {' '}
+          {truncate(brief, 120)}
+        </>
+      ) : null}
+    </p>
+  );
+}
+
+function DelegateFinePrintList({ delegates }) {
+  const list = Array.isArray(delegates) ? delegates.filter(Boolean) : [];
+  if (!list.length) return null;
+  return (
+    <div className="mt-1">
+      {list.map((stub, index) => (
+        <DelegateFinePrint key={stub.id || `delegate-${index}`} stub={stub} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Role-mark avatar to the left of an assistant bubble — Lucide glyph tinted to
+ * the Subagent/role palette so orchestrated transcripts stay scannable.
+ */
+export function RoleAvatar({ role = '', className = '' }) {
+  const visual = roleVisual(role);
+  const title = roleDisplayName(role);
+  return (
+    <span
+      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full ring-1 ${visual.avatar}${className ? ` ${className}` : ''}`}
+      title={title}
+      aria-label={title}
+    >
+      <LucideIcon name={visual.icon} className="h-4 w-4" title={title} />
+    </span>
+  );
+}
+
+/**
+ * Left-avatar + tinted bubble shell for one assistant participant turn.
+ * Gates (ask / approval) stay outside — they are the human's turn.
+ */
+export function AssistantBubble({ speaker = null, children, className = '' }) {
+  const role = speaker?.role || '';
+  const visual = roleVisual(role);
+  return (
+    <div className={`flex items-start gap-2.5${className ? ` ${className}` : ''}`}>
+      <RoleAvatar role={role} className="mt-0.5" />
+      <div className={`min-w-0 flex-1 rounded-lg px-3.5 py-2.5 ${visual.bubble}`}>
+        {children}
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -201,21 +270,10 @@ export function ChatTurn({
   trustBusy = false,
   trustNote = '',
 }) {
+  // Unhosted leftover (parent still streaming when assign fired). Same fine
+  // print as stubs folded onto an orchestrator turn — never a section header.
   if (msg.role === 'meta' || msg.role === 'delegate') {
-    const role = speakerRoleLabel(msg.speaker) || msg.roleLabel || 'agent';
-    const brief = typeof msg.text === 'string' ? msg.text.trim() : '';
-    return (
-      <div className="text-xs text-gray-500">
-        <span className="font-medium text-gray-400">Delegated · {role}</span>
-        {brief ? (
-          <span className="text-gray-600">
-            {' '}
-            <span className="text-gray-700">·</span>{' '}
-            {truncate(brief, 120)}
-          </span>
-        ) : null}
-      </div>
-    );
+    return <DelegateFinePrint stub={msg} />;
   }
   if (msg.role === 'user') {
     return (
@@ -471,6 +529,7 @@ export function AssistantTurn({
         isLast={isLast}
         gate={gateOf(gateRow)}
         speaker={msg?.speaker || null}
+        delegates={isLast ? (msg?.delegates || null) : null}
         agentMaxHeight={agentMaxHeight}
         onApproval={onApproval}
         onTrustWorkspace={onTrustWorkspace}
@@ -482,13 +541,16 @@ export function AssistantTurn({
   // Pure failure with no thinking/tools: just the error card under the user turn.
   if (errored && !parts.length) {
     return (
-      <AgentErrorCard
-        text={replyText}
-        code={msg?.code || ''}
-        onTrustWorkspace={onTrustWorkspace}
-        trustBusy={trustBusy}
-        trustNote={trustNote}
-      />
+      <AssistantBubble speaker={msg?.speaker || null}>
+        <AgentErrorCard
+          text={replyText}
+          code={msg?.code || ''}
+          onTrustWorkspace={onTrustWorkspace}
+          trustBusy={trustBusy}
+          trustNote={trustNote}
+        />
+        <DelegateFinePrintList delegates={msg?.delegates} />
+      </AssistantBubble>
     );
   }
   // Unsplit turns keep their original DOM: no wrapper around a single container.
@@ -527,6 +589,7 @@ export function AgentSegment({
   isLast = true,
   gate = null,
   speaker = null,
+  delegates = null,
   agentMaxHeight = null,
   onApproval = null,
   onTrustWorkspace = null,
@@ -628,174 +691,180 @@ export function AgentSegment({
   // below is the whole row. Mid-turn failures keep the rail so prior work stays.
   if (error && !hasProgress) {
     return (
-      <div className="text-sm">
-        <AgentErrorCard
-          text={replyText}
-          code={errorCode}
-          onTrustWorkspace={onTrustWorkspace}
-          trustBusy={trustBusy}
-          trustNote={trustNote}
-        />
-      </div>
+      <AssistantBubble speaker={speaker}>
+        <div className="text-sm">
+          <AgentErrorCard
+            text={replyText}
+            code={errorCode}
+            onTrustWorkspace={onTrustWorkspace}
+            trustBusy={trustBusy}
+            trustNote={trustNote}
+          />
+        </div>
+      </AssistantBubble>
     );
   }
 
   return (
-    <div className="text-sm">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="group sticky top-0 z-[1] flex w-full max-w-full items-start gap-1.5 rounded bg-gray-950/90 px-0.5 py-0.5 text-left backdrop-blur hover:bg-gray-900/60"
-        aria-expanded={open}
-      >
-        <Chevron open={open} className="mt-0.5 shrink-0 text-gray-600 group-hover:text-gray-400" />
-        {harness ? (
-          <HarnessLogo
-            harness={harness}
-            size="h-4 w-4"
-            className={markClass}
-            title={providerTitle || null}
-          />
-        ) : (
-          <AgentIcon className={markClass} />
-        )}
-        {streaming ? (
-          <StatusGlyph
-            // Only an OPEN gate is hoisted out of this rail; the container
-            // that paused at one still names which kind of wait it is.
-            status={
-              awaitingApproval
-                ? 'awaiting_approval'
-                : awaitingAsk
-                  ? 'awaiting_answer'
-                  : 'running'
-            }
-            className="mt-0.5"
-          />
-        ) : error ? (
-          <StatusGlyph status="error" className="mt-0.5" />
-        ) : null}
-        <span className={`min-w-0 flex-1 truncate ${streaming ? 'chat-shimmer text-gray-300' : error ? 'text-rose-300' : 'text-gray-300'}`}>
-          <span className="font-medium">{label}</span>
-          {!streaming && stepSummary ? (
-            <span className="text-gray-600">
-              {' '}
-              <span className="text-gray-700">·</span> {stepSummary}
-            </span>
-          ) : null}
-          {!streaming && stopped ? (
-            <span className="ml-1.5 shrink-0 text-rose-400">stopped by you</span>
-          ) : null}
-          {carryBack ? (
-            <span className={`ml-1.5 shrink-0 ${carryBack.className}`}>
-              {' '}
-              <span className="text-gray-700">·</span> {carryBack.text}
-            </span>
-          ) : null}
-        </span>
-        {modelLabel ? (
-          <span
-            className="mt-0.5 max-w-[40%] shrink-0 truncate font-mono text-[10px] text-gray-600"
-            title={String(speaker?.model || modelLabel)}
-          >
-            {modelLabel}
-          </span>
-        ) : null}
-      </button>
-
-      {open ? (
-        <ClippedGrow
-          maxHeightPx={agentMaxHeight}
-          follow={streaming}
-          followKey={followKey}
-          className="mt-1.5 ml-1 border-l border-gray-800 pl-3"
+    <AssistantBubble speaker={speaker}>
+      <div className="text-sm">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="group flex w-full max-w-full items-start gap-1.5 rounded px-0.5 py-0.5 text-left hover:bg-black/20"
+          aria-expanded={open}
         >
-          <div className="flex flex-col gap-2.5">
-            {hasProgress ? (
-              <div className="flex flex-col gap-1">
-                {groups.map((group, index) => {
-                  if (group.type === 'thinking') {
-                    const isLastThinking = thinkingStream && group.lastInParts;
-                    return (
-                      <ThinkingBlock
-                        key={`thinking-${index}`}
-                        text={group.text || ''}
-                        streaming={isLastThinking}
-                      />
-                    );
-                  }
-                  if (group.type === 'tool_group') {
-                    const tools = group.tools;
-                    if (tools.length === 1) {
+          <Chevron open={open} className="mt-0.5 shrink-0 text-gray-600 group-hover:text-gray-400" />
+          {harness ? (
+            <HarnessLogo
+              harness={harness}
+              size="h-4 w-4"
+              className={markClass}
+              title={providerTitle || null}
+            />
+          ) : (
+            <AgentIcon className={markClass} />
+          )}
+          {streaming ? (
+            <StatusGlyph
+              // Only an OPEN gate is hoisted out of this rail; the container
+              // that paused at one still names which kind of wait it is.
+              status={
+                awaitingApproval
+                  ? 'awaiting_approval'
+                  : awaitingAsk
+                    ? 'awaiting_answer'
+                    : 'running'
+              }
+              className="mt-0.5"
+            />
+          ) : error ? (
+            <StatusGlyph status="error" className="mt-0.5" />
+          ) : null}
+          <span className={`min-w-0 flex-1 truncate ${streaming ? 'chat-shimmer text-gray-300' : error ? 'text-rose-300' : 'text-gray-300'}`}>
+            <span className="font-medium">{label}</span>
+            {!streaming && stepSummary ? (
+              <span className="text-gray-600">
+                {' '}
+                <span className="text-gray-700">·</span> {stepSummary}
+              </span>
+            ) : null}
+            {!streaming && stopped ? (
+              <span className="ml-1.5 shrink-0 text-rose-400">stopped by you</span>
+            ) : null}
+            {carryBack ? (
+              <span className={`ml-1.5 shrink-0 ${carryBack.className}`}>
+                {' '}
+                <span className="text-gray-700">·</span> {carryBack.text}
+              </span>
+            ) : null}
+          </span>
+          {modelLabel ? (
+            <span
+              className="mt-0.5 max-w-[40%] shrink-0 truncate font-mono text-[10px] text-gray-600"
+              title={String(speaker?.model || modelLabel)}
+            >
+              {modelLabel}
+            </span>
+          ) : null}
+        </button>
+
+        {open ? (
+          <ClippedGrow
+            maxHeightPx={agentMaxHeight}
+            follow={streaming}
+            followKey={followKey}
+            className="mt-1.5 ml-1 border-l border-gray-800/80 pl-3"
+          >
+            <div className="flex flex-col gap-2.5">
+              {hasProgress ? (
+                <div className="flex flex-col gap-1">
+                  {groups.map((group, index) => {
+                    if (group.type === 'thinking') {
+                      const isLastThinking = thinkingStream && group.lastInParts;
                       return (
-                        <ToolCallRow
-                          key={tools[0].id || `tool-${index}`}
-                          tool={tools[0]}
+                        <ThinkingBlock
+                          key={`thinking-${index}`}
+                          text={group.text || ''}
+                          streaming={isLastThinking}
                         />
                       );
                     }
-                    return (
-                      <ToolGroupBlock
-                        key={`tools-${tools[0]?.id || index}`}
-                        tools={tools}
-                      />
-                    );
-                  }
-                  // An ask keeps its own hoisted row: it is the user's turn,
-                  // and an answered one is followed by their reply bubble.
-                  // A settled approval is part of this run, so it renders
-                  // here — the same one-line verdict row, nested like a tool
-                  // row, so the thread still names every gated call this run
-                  // made and how the rule settled it.
-                  if (group.type === 'approval') {
-                    return (
-                      <ApprovalBlock key={`approval-${index}`} approval={group.approval} />
-                    );
-                  }
-                  return null;
-                })}
-                {thinkingStream && lastPart?.type !== 'thinking' && lastPart?.type !== 'approval' && lastPart?.type !== 'ask' ? (
-                  <ThinkingBlock text="" streaming />
-                ) : null}
-              </div>
-            ) : null}
+                    if (group.type === 'tool_group') {
+                      const tools = group.tools;
+                      if (tools.length === 1) {
+                        return (
+                          <ToolCallRow
+                            key={tools[0].id || `tool-${index}`}
+                            tool={tools[0]}
+                          />
+                        );
+                      }
+                      return (
+                        <ToolGroupBlock
+                          key={`tools-${tools[0]?.id || index}`}
+                          tools={tools}
+                        />
+                      );
+                    }
+                    // An ask keeps its own hoisted row: it is the user's turn,
+                    // and an answered one is followed by their reply bubble.
+                    // A settled approval is part of this run, so it renders
+                    // here — the same one-line verdict row, nested like a tool
+                    // row, so the thread still names every gated call this run
+                    // made and how the rule settled it.
+                    if (group.type === 'approval') {
+                      return (
+                        <ApprovalBlock key={`approval-${index}`} approval={group.approval} />
+                      );
+                    }
+                    return null;
+                  })}
+                  {thinkingStream && lastPart?.type !== 'thinking' && lastPart?.type !== 'approval' && lastPart?.type !== 'ask' ? (
+                    <ThinkingBlock text="" streaming />
+                  ) : null}
+                </div>
+              ) : null}
 
-          </div>
-        </ClippedGrow>
-      ) : null}
-
-      {/* The reply sits OUTSIDE the clipped thinking rail: thinking, tools and
-          settled approval verdicts collapse/fade/scroll inside it, while an
-          open gate, a question and an answer never do — splitAtVisibleRows
-          hoists those into separate visible rows, so the buttons of a gate the
-          user still has to answer are always reachable. A container closed by
-          such an interruption owns no reply at all: that exchange ended with
-          the user, so it gets no footer. */}
-      {error ? (
-        <AgentErrorCard
-          text={replyText}
-          code={errorCode}
-          onTrustWorkspace={onTrustWorkspace}
-          trustBusy={trustBusy}
-          trustNote={trustNote}
-        />
-      ) : hasReply ? (
-        <div className="mt-2">
-          {looksLikeMarkdown(displayReply) || streaming ? (
-            <MarkdownBody text={displayReply} variant="chat" />
-          ) : (
-            <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-200">
-              {displayReply}
             </div>
-          )}
-        </div>
-      ) : !isLast ? null : streaming ? null : hasProgress ? (
-        <p className="mt-2 text-sm text-gray-500">
-          No visible reply — expand thinking or tool rows above.
-        </p>
-      ) : (
-        <p className="mt-2 text-sm text-gray-500">(empty response)</p>
-      )}
-    </div>
+          </ClippedGrow>
+        ) : null}
+
+        {/* The reply sits OUTSIDE the clipped thinking rail: thinking, tools and
+            settled approval verdicts collapse/fade/scroll inside it, while an
+            open gate, a question and an answer never do — splitAtVisibleRows
+            hoists those into separate visible rows, so the buttons of a gate the
+            user still has to answer are always reachable. A container closed by
+            such an interruption owns no reply at all: that exchange ended with
+            the user, so it gets no footer. */}
+        {error ? (
+          <AgentErrorCard
+            text={replyText}
+            code={errorCode}
+            onTrustWorkspace={onTrustWorkspace}
+            trustBusy={trustBusy}
+            trustNote={trustNote}
+          />
+        ) : hasReply ? (
+          <div className="mt-2">
+            {looksLikeMarkdown(displayReply) || streaming ? (
+              <MarkdownBody text={displayReply} variant="chat" />
+            ) : (
+              <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-200">
+                {displayReply}
+              </div>
+            )}
+          </div>
+        ) : !isLast ? null : streaming ? null : hasProgress ? (
+          <p className="mt-2 text-sm text-gray-500">
+            No visible reply — expand thinking or tool rows above.
+          </p>
+        ) : (
+          <p className="mt-2 text-sm text-gray-500">(empty response)</p>
+        )}
+        {/* Handoff brief — fine print on the orchestrator turn, not its own section. */}
+        {isLast ? <DelegateFinePrintList delegates={delegates} /> : null}
+      </div>
+    </AssistantBubble>
   );
 }

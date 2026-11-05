@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
+import { bumpWorkspaceTreeRev } from '#features/explorer/tree-rev.mjs';
 import { applyEdits, diffLineCounts } from './patch.mjs';
 
 const MAX_READ_BYTES = 512 * 1024;
@@ -268,9 +269,11 @@ export function createFileTools(workspaceRoot) {
       return { ok: false, error: `contents too large (max ${MAX_WRITE_BYTES} bytes)` };
     }
     const { abs, rel } = resolveWorkspacePath(root, args.path);
+    const created = !existsSync(abs);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, contents, 'utf8');
-    return { ok: true, path: rel, bytes: Buffer.byteLength(contents, 'utf8') };
+    if (created) bumpWorkspaceTreeRev('agent-create');
+    return { ok: true, path: rel, bytes: Buffer.byteLength(contents, 'utf8'), created };
   }
 
   function patchFile(args = {}) {
@@ -388,12 +391,14 @@ export function createFileTools(workspaceRoot) {
         };
       }
       rmSync(abs, { recursive: true, force: false });
+      bumpWorkspaceTreeRev('agent-delete');
       return { ok: true, path: rel, kind: 'directory', recursive: true };
     }
     if (!st.isFile() && !st.isSymbolicLink()) {
       return { ok: false, error: `not a file or directory: ${rel}` };
     }
     unlinkSync(abs);
+    bumpWorkspaceTreeRev('agent-delete');
     return { ok: true, path: rel, kind: 'file' };
   }
 

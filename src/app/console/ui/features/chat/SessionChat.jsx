@@ -9,6 +9,8 @@ import { CHAT_PROVIDER_GROUPS, HARNESS_NAMES, shortId } from '#ui/shared/lib/for
 import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import {
   AGENT_MODE_OPTIONS,
+  AGENT_PROVIDER_OPTIONS,
+  AGENT_TOOL_MODE_IDS,
   AttachmentPicker,
   ComposerDropdown,
   ComposerOptionsMenu,
@@ -52,14 +54,17 @@ import { AttachmentStack } from './AttachmentPanel.jsx';
 import { ClippedGrow, lastPendingGate } from './ClippedGrow.jsx';
 import { QueueStack } from './QueuePanel.jsx';
 import { TaskStack } from './TaskPanel.jsx';
-import { PlanStack, useWorkspacePlans } from './PlanPanel.jsx';
-import { ChatTurn } from './TranscriptTurns.jsx';
+import { PlanStack, countSessionPlans, useWorkspacePlans } from './PlanPanel.jsx';
+import { AssistantBubble, ChatTurn } from './TranscriptTurns.jsx';
+import { ChatMinimap, buildChatMinimapTurns } from './ChatMinimap.jsx';
 import {
   isOrchestratedChatSession,
   isTranscriptHandoff,
   mergeOrchestratedLiveTurns,
   mergeOrchestratedMessages,
+  peelTrailingDelegates,
   speakerFromSession,
+  transcriptLaneKey,
 } from './mergeOrchestratedTranscript.js';
 import { LiveChatStack } from '#ui/features/live-chat/LiveChatDrawer.jsx';
 import { startLiveVoiceSession } from '#ui/features/live-chat/voiceClient.js';
@@ -94,8 +99,69 @@ function readDrawerSize(key, fallback) {
 // session until the picker is used again, so nothing reverts them on a timer.
 function initialComposerMode(options, defaults) {
   const saved = options?.mode;
-  if (AGENT_MODE_OPTIONS.some((option) => option.id === saved)) return saved;
+  // Orchestrator is session kind (Mode UI), not a tool-loop mode id.
+  if (AGENT_TOOL_MODE_IDS.has(saved)) return saved;
   return defaults?.mode || 'agent';
+}
+
+function normalizeComposerProvider(session, options = null) {
+  const raw = String(
+    session?.provider
+    || options?.provider
+    || session?.options?.provider
+    || 'kusa',
+  ).trim().toLowerCase();
+  if (raw === 'github-copilot' || raw === 'copilot') return 'copilot';
+  if (raw === 'cursor') return 'cursor';
+  if (AGENT_PROVIDER_OPTIONS.some((option) => option.id === raw)) return raw;
+  return 'kusa';
+}
+
+/** Local + CAO workflow lists for Mode → Orchestrator drill-in. */
+async function fetchMergedWorkflows() {
+  const [local, cao] = await Promise.all([
+    fetch('/kusa/workflows', { headers: { Accept: 'application/json' } })
+      .then(async (res) => {
+        if (!res.ok) return [];
+        const body = await res.json().catch(() => ({}));
+        const list = Array.isArray(body?.workflows) ? body.workflows : [];
+        return list.map((w) => ({
+          id: String(w?.id || w?.name || '').trim(),
+          label: String(w?.label || w?.name || w?.id || '').trim(),
+          description: String(w?.description || '').trim(),
+          provider: typeof w?.provider === 'string' ? w.provider : 'kusa',
+          ...(String(w?.runtime || '').trim()
+            ? { runtime: String(w.runtime).trim().toLowerCase() }
+            : {}),
+          roleConfigs: w?.roleConfigs && typeof w.roleConfigs === 'object' ? w.roleConfigs : {},
+        })).filter((w) => w.id);
+      })
+      .catch(() => []),
+    fetch('/cao/workflows', { headers: { Accept: 'application/json' } })
+      .then(async (res) => {
+        if (!res.ok) return [];
+        const body = await res.json().catch(() => ({}));
+        const list = Array.isArray(body?.workflows) ? body.workflows : Array.isArray(body) ? body : [];
+        return list.map((w) => ({
+          id: String(w?.name || w?.id || '').trim(),
+          label: String(w?.name || w?.id || w?.title || '').trim(),
+          description: String(w?.description || w?.title || '').trim(),
+          provider: typeof w?.provider === 'string' ? w.provider : null,
+          roleConfigs: w?.roleConfigs && typeof w.roleConfigs === 'object'
+            ? w.roleConfigs
+            : (w?.roles && typeof w.roles === 'object' && !Array.isArray(w.roles) ? w.roles : {}),
+        })).filter((w) => w.id);
+      })
+      .catch(() => []),
+  ]);
+  const seen = new Set();
+  const merged = [];
+  for (const w of [...local, ...cao]) {
+    if (seen.has(w.id)) continue;
+    seen.add(w.id);
+    merged.push(w);
+  }
+  return merged;
 }
 
 function initialComposerRule(options, defaults) {
@@ -186,6 +252,7 @@ export function SessionChat({
   onTurnOptions = null,
   onSessionOptions = null,
   agentDefaults = null,
+  onOpenAgent = null,
 }) {
   const [draft, setDraft] = useState('');
   const [editingId, setEditingId] = useState(null);
@@ -232,6 +299,23 @@ export function SessionChat({
   // human message box stays locked so prompts only come from orchestration.
   const isSubagent = Boolean(session?.parentId || session?.options?.parentId);
   const composerLocked = externalOwned || isSubagent;
+  // Orchestrator dials Agent + Model immediately; Mode stays editable until the
+  // first prompt so the user can change their mind. After the session starts,
+  // Mode / Agent / Model are locked (no take-backs). Rule still follows the
+  // workflow's allowRuleOverride when orchestrated.
+  const isOrchestrated = Boolean(
+    session?.kind === 'orchestrated'
+    || sessionOptions?.workflowId
+    || session?.workflowId,
+  );
+  const sessionHasPrompts = Array.isArray(session?.messages) && session.messages.length > 0;
+  const allowModeOverride = !composerLocked && !(isOrchestrated && sessionHasPrompts);
+  const allowAgentOverride = !composerLocked && !isOrchestrated;
+  const allowModelOverride = !composerLocked && !isOrchestrated;
+  const allowRuleOverride = !composerLocked
+    && (!isOrchestrated || sessionOptions?.allowRuleOverride === true);
+  // Nested Orchestrator → workflow convert only before the first prompt.
+  const canConvertOrchestrator = !composerLocked && !sessionHasPrompts;
   // Some CLIs block until the workspace is trusted once.
   const [trustNeeded, setTrustNeeded] = useState(false);
   const [trustBusy, setTrustBusy] = useState(false);
@@ -239,6 +323,7 @@ export function SessionChat({
   // After a successful Trust click, hide the banner even if older error rows
   // in the transcript still mention trust — those rows stay for history.
   const [trustGranted, setTrustGranted] = useState(false);
+  const [agentProvider, setAgentProvider] = useState(() => normalizeComposerProvider(session, sessionOptions));
   const [agentMode, setAgentMode] = useState(() => initialComposerMode(sessionOptions, agentDefaults));
   const [approvalRules, setApprovalRules] = useState(() => initialComposerRule(sessionOptions, agentDefaults));
   const [modelChoice, setModelChoice] = useState(() => initialComposerModel(
@@ -254,6 +339,10 @@ export function SessionChat({
     session?.ownsModels ? '' : initialComposerEndpointId(sessionOptions)
   ));
   const [models, setModels] = useState([]);
+  const [workflows, setWorkflows] = useState([]);
+  const [workflowsLoading, setWorkflowsLoading] = useState(false);
+  // Live Strata /slots meter for the ContextRing (null = use local estimate).
+  const [strataContext, setStrataContext] = useState(/** @type {{ used: number|null, limit: number|null }|null} */ (null));
   // Which backend the configured endpoint runs ('opencode' | 'native' | '').
   // OpenCode takes a prompt string, so it never receives an image part — the
   // composer says so on the chip rather than letting the picture vanish.
@@ -272,7 +361,90 @@ export function SessionChat({
   const [plansExpanded, setPlansExpanded] = useState(false);
   const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
   const [liveChatExpanded, setLiveChatExpanded] = useState(false);
-  const workspacePlans = useWorkspacePlans({ enabled: !externalOwned });
+  // Plans stay enabled for external (Cursor IDE) sessions too — CreatePlan /
+  // *.plan.md hooks are intercepted into `.kusa/plans/` for the Plan drawer.
+  const workspacePlans = useWorkspacePlans({ enabled: true });
+  const planAgentIds = useMemo(() => {
+    const ids = new Set();
+    const sid = String(session?.id || '').trim();
+    if (sid) ids.add(sid);
+    const parent = String(session?.parentId || session?.options?.parentId || '').trim();
+    if (parent) ids.add(parent);
+    for (const kid of Array.isArray(session?.subagents) ? session.subagents : []) {
+      const id = String(kid?.id || '').trim();
+      if (id) ids.add(id);
+    }
+    // Peer Subagents under the same parent count as "this session's" tree.
+    for (const peer of Array.isArray(peerSessions) ? peerSessions : []) {
+      const peerParent = String(peer?.parentId || peer?.options?.parentId || '').trim();
+      if (sid && (peerParent === sid || peer?.id === sid)) {
+        const id = String(peer?.id || '').trim();
+        if (id) ids.add(id);
+      }
+      if (parent && (peerParent === parent || peer?.id === parent)) {
+        const id = String(peer?.id || '').trim();
+        if (id) ids.add(id);
+      }
+    }
+    return [...ids];
+  }, [session, peerSessions]);
+  const planAgents = useMemo(() => {
+    const byId = new Map();
+    for (const row of [session, ...(Array.isArray(peerSessions) ? peerSessions : [])]) {
+      if (!row?.id || byId.has(row.id)) continue;
+      byId.set(row.id, row);
+    }
+    return [...byId.values()];
+  }, [session, peerSessions]);
+  const sessionPlanCount = useMemo(
+    () => countSessionPlans(workspacePlans.plans, planAgentIds),
+    [workspacePlans.plans, planAgentIds],
+  );
+  // When an agent finishes kusa_plan_create / ingest / update / complete, pull the list
+  // immediately so the Plans badge and open drawer don't wait for the 2s poll.
+  const planToolEpoch = useMemo(() => {
+    const sessions = [session, ...(Array.isArray(peerSessions) ? peerSessions : [])].filter(Boolean);
+    const bits = [];
+    for (const s of sessions) {
+      for (const tool of s?.live?.tools || []) {
+        const name = String(tool?.name || '');
+        if (!/(?:^|_)plan_(?:create|ingest|update|complete)$/.test(name)) continue;
+        if (tool.status !== 'done' || tool.ok === false) continue;
+        bits.push(String(tool.id || name));
+      }
+    }
+    return bits.join('|');
+  }, [session, peerSessions]);
+  useEffect(() => {
+    if (!planToolEpoch) return;
+    void workspacePlans.refresh();
+  }, [planToolEpoch, workspacePlans.refresh]);
+
+  // Prefetch workflows whenever Orchestrator convert is still allowed (including
+  // an already-orchestrated empty session so the nested list can switch workflows).
+  useEffect(() => {
+    if (!canConvertOrchestrator) return undefined;
+    let cancelled = false;
+    setWorkflowsLoading(true);
+    fetchMergedWorkflows()
+      .then((list) => {
+        if (!cancelled) setWorkflows(list);
+      })
+      .finally(() => {
+        if (!cancelled) setWorkflowsLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [canConvertOrchestrator, session?.key]);
+
+  function ensureWorkflowsLoaded() {
+    if (!canConvertOrchestrator || workflowsLoading) return;
+    if (workflows.length) return;
+    setWorkflowsLoading(true);
+    fetchMergedWorkflows()
+      .then((list) => setWorkflows(list))
+      .finally(() => setWorkflowsLoading(false));
+  }
+
   // Live voice (browser-native): phase tracks mic/session lifecycle. handle holds stop().
   const [voicePhase, setVoicePhase] = useState('idle');
   const [voiceError, setVoiceError] = useState('');
@@ -401,6 +573,8 @@ export function SessionChat({
     const extra = voiceMessages.filter((m) => !seen.has(`${m.role}:${m.text.trim()}`));
     return extra.length ? [...baseMessages, ...extra] : baseMessages;
   }, [baseMessages, voiceMessages]);
+  // ChatGPT-style right rail: one jump target per user prompt in this transcript.
+  const minimapTurns = useMemo(() => buildChatMinimapTurns(messages), [messages]);
   const peerBusy = peers.some((p) => p?.status === 'busy' || p?.status === 'thinking' || p?.live);
   const busy = session?.status === 'busy' || session?.status === 'thinking' || (orchestrated && peerBusy);
   // Composer Stop / voice only track THIS session's own turn — peer busy must
@@ -412,6 +586,26 @@ export function SessionChat({
     if (!orchestrated) return null;
     return mergeOrchestratedLiveTurns(session, peers);
   }, [orchestrated, session, peers]);
+  // While the orchestrator is still streaming, assign briefs have no completed
+  // host turn yet — peel them off the timeline and park on the live parent row.
+  const { transcriptMessages, liveParentDelegates } = useMemo(() => {
+    const parentKey = String(session?.key || '').trim();
+    const parentLive = orchestrated
+      ? (liveTurns || []).some((turn) => (
+        turn?.id === 'live-parent'
+        || turn?.id === 'live-parent-relay'
+        || (parentKey && transcriptLaneKey(turn) === parentKey)
+      ))
+      : Boolean(selfBusy && live);
+    if (!parentLive) {
+      return { transcriptMessages: messages, liveParentDelegates: [] };
+    }
+    const peeled = peelTrailingDelegates(messages);
+    return {
+      transcriptMessages: peeled.messages,
+      liveParentDelegates: peeled.delegates,
+    };
+  }, [messages, orchestrated, liveTurns, session?.key, selfBusy, live]);
   const trustFromMessages = useMemo(
     () => messages.some((m) => isCursorTrustError(m)),
     [messages],
@@ -744,17 +938,42 @@ export function SessionChat({
   // when it matches the Settings default. Writing only on difference would
   // leave such a pick unrecorded, so a later Settings change (or a refresh)
   // could move a chat the user had deliberately set.
+  function selectComposerProvider(next) {
+    if (!allowAgentOverride) return;
+    const id = normalizeComposerProvider({ provider: next });
+    setAgentProvider(id);
+    commitPick({ provider: id });
+  }
+
   function selectComposerMode(next) {
+    if (!allowModeOverride) return;
+    // Orchestrator is converted via workflow pick — never stamp mode=orchestrator.
+    if (next === 'orchestrator' || !AGENT_TOOL_MODE_IDS.has(next)) return;
     setAgentMode(next);
+    // Pre-start take-back: leaving Orchestrator restores a standard session.
+    if (isOrchestrated && !sessionHasPrompts) {
+      commitPick({
+        mode: next,
+        kind: 'standard',
+        workflowId: '',
+        role: '',
+        allowModeOverride: false,
+        allowRuleOverride: false,
+        allowModelOverride: false,
+      });
+      return;
+    }
     commitPick({ mode: next });
   }
 
   function selectApprovalRule(next) {
+    if (!allowRuleOverride) return;
     setApprovalRules(next);
     commitPick({ rules: next });
   }
 
   function selectComposerModel(next) {
+    if (!allowModelOverride) return;
     // Look up the live listing so the heading's endpointId rides with the pick —
     // probed-only ids never appear in that endpoint's declared Models list.
     const record = models.find((entry) => entry.id === next);
@@ -762,6 +981,45 @@ export function SessionChat({
     setModelChoice(next);
     setEndpointChoice(endpointId);
     commitPick({ model: next, endpointId });
+  }
+
+  /** Mode → Orchestrator → workflow: convert this standard session in place. */
+  function selectOrchestratorWorkflow(wf) {
+    if (!canConvertOrchestrator || !wf?.id) return;
+    const orch = wf.roleConfigs?.orchestrator && typeof wf.roleConfigs.orchestrator === 'object'
+      ? wf.roleConfigs.orchestrator
+      : {};
+    // Always Kusă unless the workflow orchestrator role overrides the provider.
+    const provider = normalizeComposerProvider({
+      provider: orch.provider || 'kusa',
+    });
+    const modeRaw = String(orch.mode || '').trim().toLowerCase();
+    const mode = AGENT_TOOL_MODE_IDS.has(modeRaw) ? modeRaw : 'agent';
+    const rulesRaw = String(orch.rules || '').trim().toLowerCase();
+    const rules = RULE_OPTIONS.some((option) => option.id === rulesRaw) ? rulesRaw : approvalRules;
+    // Workflow model wins; otherwise the Settings / endpoint default model.
+    const modelRaw = String(orch.model || '').trim();
+    const model = !modelRaw || modelRaw.toLowerCase() === 'auto'
+      ? String(agentDefaults?.model || '').trim()
+      : modelRaw;
+    setAgentProvider(provider);
+    setAgentMode(mode);
+    setApprovalRules(rules);
+    setModelChoice(model);
+    setEndpointChoice('');
+    commitPick({
+      provider,
+      kind: 'orchestrated',
+      workflowId: wf.id,
+      role: 'orchestrator',
+      mode,
+      rules,
+      model,
+      endpointId: '',
+      allowModeOverride: orch.allowModeOverride === true,
+      allowRuleOverride: orch.allowRuleOverride === true,
+      allowModelOverride: orch.allowModelOverride === true,
+    });
   }
 
   // Reload whenever Settings changes an endpoint / declared model list — the
@@ -862,6 +1120,58 @@ export function SessionChat({
   const activeEndpointId = matchedModel
     ? (matchedModel.endpointId || '')
     : (endpointChoice || modelOptions[0]?.endpointId || '');
+  // Strata (and llama.cpp meter hosts) expose real n_prompt_tokens / n_ctx on
+  // GET /slots. When the active BYOK endpoint is Strata, poll that through the
+  // server so the ContextRing uses the server's conversation cache instead of
+  // the local char/4 estimate. Transient proxy blips (--live API restarts)
+  // keep the last good reading so the ring does not flash gray.
+  useEffect(() => {
+    if (ownsModels || cliBacked) {
+      setStrataContext(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const qs = new URLSearchParams();
+        if (activeEndpointId) qs.set('endpointId', activeEndpointId);
+        if (activeModel) qs.set('model', activeModel);
+        const res = await fetch(`/kusa/context?${qs}`, {
+          headers: { Accept: 'application/json' },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        if (cancelled) return;
+        if (body?.strata) {
+          const used = Number.isFinite(Number(body.used)) ? Math.round(Number(body.used)) : null;
+          const limit = Number.isFinite(Number(body.limit)) && Number(body.limit) > 0
+            ? Math.round(Number(body.limit))
+            : null;
+          setStrataContext({ used, limit });
+        } else {
+          setStrataContext(null);
+        }
+      } catch {
+        // Keep the previous Strata reading; only clear when the endpoint is
+        // confirmed non-Strata (handled above) or the session cannot use BYOK.
+      }
+    };
+    poll();
+    const ms = selfBusy ? 1_500 : 5_000;
+    const timer = setInterval(poll, ms);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [ownsModels, cliBacked, activeEndpointId, activeModel, selfBusy]);
+  const estimatedContextUsed = estimateContextTokens(messages, live);
+  const contextUsed = strataContext && strataContext.used != null
+    ? strataContext.used
+    : estimatedContextUsed;
+  const contextLimit = (strataContext && strataContext.limit != null)
+    ? strataContext.limit
+    : activeContextLimit;
+  const contextSource = strataContext ? 'strata' : '';
   const composerOptions = {
     mode: agentMode,
     approvalMode: approvalRules,
@@ -947,6 +1257,7 @@ export function SessionChat({
   if (session?.key && session.key !== seededKeyRef.current) {
     seededKeyRef.current = session.key;
     const sessionOwnsModels = Boolean(session?.ownsModels && session?.modelsPath);
+    setAgentProvider(normalizeComposerProvider(session, sessionOptions));
     setAgentMode(initialComposerMode(sessionOptions, agentDefaults));
     setApprovalRules(initialComposerRule(sessionOptions, agentDefaults));
     setModelChoice(initialComposerModel(sessionOptions, agentDefaults, { ownsModels: sessionOwnsModels }));
@@ -957,16 +1268,54 @@ export function SessionChat({
   onSessionOptionsRef.current = onSessionOptions;
   // Full current pick with the one field the user just chose: fields absent
   // from `over` keep the live picker state, so the other pickers are untouched
-  // and a partial change can never drop them from the record.
+  // and a partial change can never drop them from the record. Convert-to-
+  // orchestrator patches (kind / workflowId / role / allow*) ride the same path.
   const commitPick = (over = {}) => {
     if (!session?.key || !onSessionOptionsRef.current) return;
     void onSessionOptionsRef.current(session.key, {
+      provider: over.provider !== undefined ? over.provider : agentProvider,
       mode: over.mode !== undefined ? over.mode : agentMode,
       rules: over.rules !== undefined ? over.rules : approvalRules,
       model: over.model !== undefined ? over.model : modelChoice,
       endpointId: over.endpointId !== undefined ? over.endpointId : endpointChoice,
+      ...(over.kind != null ? { kind: over.kind } : {}),
+      // Empty string clears orchestrator stamps on a pre-start Mode take-back.
+      ...(over.workflowId !== undefined ? { workflowId: over.workflowId } : {}),
+      ...(over.role !== undefined ? { role: over.role } : {}),
+      ...(over.allowModeOverride != null ? { allowModeOverride: over.allowModeOverride } : {}),
+      ...(over.allowRuleOverride != null ? { allowRuleOverride: over.allowRuleOverride } : {}),
+      ...(over.allowModelOverride != null ? { allowModelOverride: over.allowModelOverride } : {}),
     });
   };
+
+  // Mode picker shows Orchestrator once converted (tool mode stays ask/plan/agent).
+  const modePickerValue = isOrchestrated ? 'orchestrator' : agentMode;
+  // Orchestrator nested menu only before the first prompt; after start it stays
+  // visible but disabled (or the whole Mode picker locks once dialed in).
+  const modePickerOptions = useMemo(
+    () => AGENT_MODE_OPTIONS.map((option) => {
+      if (option.id !== 'orchestrator') return option;
+      if (canConvertOrchestrator) {
+        return {
+          ...option,
+          nested: true,
+          blurb: 'Choose a workflow.',
+        };
+      }
+      return {
+        ...option,
+        nested: true,
+        disabled: true,
+        blurb: isOrchestrated
+          ? 'Locked after the session started.'
+          : 'Only available on a new empty session.',
+        disabledReason: isOrchestrated
+          ? 'Orchestrator is dialed in — no take-backs after the first prompt.'
+          : 'Orchestrator is only available before the first prompt.',
+      };
+    }),
+    [canConvertOrchestrator, isOrchestrated],
+  );
   // No blanket write-back. Every pick reaches the record through commitPick, and
   // nothing else moves a rule: with Allow / Deny sticky there is no timer to
   // persist, so a pick can never be stamped over by an automatic revert and a
@@ -1239,14 +1588,29 @@ export function SessionChat({
         busy={workspacePlans.busy}
         note={workspacePlans.note}
         dock={drawerDock}
+        sessionId={session?.id || ''}
+        sessionAgentIds={planAgentIds}
+        agents={planAgents}
         onDockToggle={toggleDrawerDock}
         onClose={() => setPlansExpanded(false)}
         onSelect={(id) => { void workspacePlans.select(id); }}
         onBack={workspacePlans.back}
-        onApprove={(id) => { void workspacePlans.approve(id); }}
-        onContinue={(id) => { void workspacePlans.continueWorkflow(id); }}
-        onRemove={(id) => { void workspacePlans.remove(id); }}
+        onContinue={(id, opts) => { void workspacePlans.continueWorkflow(id, opts); }}
+        onRemove={(id, opts) => { void workspacePlans.remove(id, opts); }}
         onRefresh={() => { void workspacePlans.refresh(); }}
+        onCreate={() => workspacePlans.create({
+          createdByAgentId: session?.id || '',
+          orchestratorAgentId: session?.parentId || session?.options?.parentId || (
+            session?.kind === 'orchestrated' || session?.options?.workflowId ? session?.id : ''
+          ) || '',
+        })}
+        onSave={(id, patch) => workspacePlans.save(id, patch)}
+        onSetStatus={(id, status) => workspacePlans.setStatus(id, status)}
+        onAssignToSession={(id, opts) => workspacePlans.assignToSession(id, {
+          sessionId: session?.id || '',
+          ...opts,
+        })}
+        onOpenAgent={onOpenAgent}
       />
       <AttachmentStack
         attachments={attachments}
@@ -1288,13 +1652,14 @@ export function SessionChat({
     </>
   );
 
-  const drawerOpen = !externalOwned && (
+  // External sessions still open the Plans drawer (intercepted CreatePlan);
+  // other drawers stay composer-only.
+  const drawerOpen = plansExpanded || (!externalOwned && (
     (queueExpanded && queueTotal > 0)
     || (tasksExpanded && taskTotal > 0)
-    || plansExpanded
     || (attachmentsExpanded && attachments.length > 0)
     || liveChatExpanded
-  );
+  ));
   const bottomDockOpen = drawerDock === 'bottom' && drawerOpen;
   const rightDockOpen = drawerDock === 'right' && drawerOpen;
 
@@ -1304,9 +1669,15 @@ export function SessionChat({
       className={`flex h-full min-h-0 ${drawerDock === 'right' ? 'flex-row' : 'flex-col'}`}
     >
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {/*
+       * Transcript scrollport + ChatGPT-style turn minimap. The rail is a
+       * fixed overlay on this non-scrolling shell (mid-right, left of the
+       * native scrollbar) so it does not move with the transcript.
+       */}
+      <div className="relative z-0 min-h-0 flex-1">
       <div
         ref={panelRef}
-        className="relative z-0 min-h-0 flex-1 overflow-y-auto px-6 py-6"
+        className={`h-full min-h-0 overflow-y-auto px-6 py-6 ${minimapTurns.length >= 3 ? 'pr-10' : ''}`}
       >
         {showWorkspaceTrust ? (
           <div className="w-full pb-4">
@@ -1349,67 +1720,72 @@ export function SessionChat({
           </div>
         ) : (
           <div className="w-full flex flex-col gap-6">
-            {messages.map((msg, index) => {
+            {transcriptMessages.map((msg, index) => {
               const gateKey = msg._queueKey || msg.speaker?.queueKey || session.key;
-              const handoff = isTranscriptHandoff(messages[index - 1], msg);
+              const handoff = isTranscriptHandoff(transcriptMessages[index - 1], msg);
               return (
                 <Fragment key={msg.id}>
                   {handoff ? (
                     <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
                   ) : null}
-                  <ChatTurn
-                    msg={msg}
-                    busy={selfBusy}
-                    editing={!composerLocked && editingId === msg.id}
-                    onStartEdit={
-                      composerLocked
-                        ? undefined
-                        : () => setEditingId(msg.id)
-                    }
-                    onCancelEdit={
-                      composerLocked
-                        ? undefined
-                        : () => setEditingId(null)
-                    }
-                    onResendEdit={
-                      composerLocked
-                        ? undefined
-                        : (text) => {
-                          if (!session || selfBusy) return;
-                          setEditingId(null);
-                          // The files staged now belong to the message being resent,
-                          // not to the one being edited — same rule as pressing Send.
-                          onSend?.(
-                            session.key,
-                            text,
-                            { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
-                          );
-                          setAttachments([]);
-                          setAttachNote('');
-                          setAttachmentsExpanded(false);
-                        }
-                    }
-                    agentMaxHeight={agentMaxHeight}
-                    onApproval={
-                      // Pending gate cards (incl. Subagent relays on the parent) must
-                      // stay answerable after they land in history — not only while live.
-                      externalOwned || !onApproval
-                        ? null
-                        : async (decision) => { await onApproval(gateKey, decision); }
-                    }
-                    onAsk={
-                      externalOwned || !onAsk
-                        ? null
-                        : (decision) => onAsk(gateKey, decision)
-                    }
-                    onTrustWorkspace={
-                      hasWorkspaceTrust && !trustGranted
-                        ? () => { void grantWorkspaceTrust(); }
-                        : null
-                    }
-                    trustBusy={trustBusy}
-                    trustNote={trustNote}
-                  />
+                  <div
+                    data-kusa-turn={msg.role === 'user' ? msg.id : undefined}
+                    className="scroll-mt-3"
+                  >
+                    <ChatTurn
+                      msg={msg}
+                      busy={selfBusy}
+                      editing={!composerLocked && editingId === msg.id}
+                      onStartEdit={
+                        composerLocked
+                          ? undefined
+                          : () => setEditingId(msg.id)
+                      }
+                      onCancelEdit={
+                        composerLocked
+                          ? undefined
+                          : () => setEditingId(null)
+                      }
+                      onResendEdit={
+                        composerLocked
+                          ? undefined
+                          : (text) => {
+                            if (!session || selfBusy) return;
+                            setEditingId(null);
+                            // The files staged now belong to the message being resent,
+                            // not to the one being edited — same rule as pressing Send.
+                            onSend?.(
+                              session.key,
+                              text,
+                              { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
+                            );
+                            setAttachments([]);
+                            setAttachNote('');
+                            setAttachmentsExpanded(false);
+                          }
+                      }
+                      agentMaxHeight={agentMaxHeight}
+                      onApproval={
+                        // Pending gate cards (incl. Subagent relays on the parent) must
+                        // stay answerable after they land in history — not only while live.
+                        externalOwned || !onApproval
+                          ? null
+                          : async (decision) => { await onApproval(gateKey, decision); }
+                      }
+                      onAsk={
+                        externalOwned || !onAsk
+                          ? null
+                          : (decision) => onAsk(gateKey, decision)
+                      }
+                      onTrustWorkspace={
+                        hasWorkspaceTrust && !trustGranted
+                          ? () => { void grantWorkspaceTrust(); }
+                          : null
+                      }
+                      trustBusy={trustBusy}
+                      trustNote={trustNote}
+                    />
+                  </div>
                 </Fragment>
               );
             })}
@@ -1418,22 +1794,28 @@ export function SessionChat({
                 const gateKey = turn._queueKey || turn.speaker?.queueKey || session.key;
                 const prev = index > 0
                   ? liveTurns[index - 1]
-                  : messages[messages.length - 1];
+                  : transcriptMessages[transcriptMessages.length - 1];
                 const handoff = isTranscriptHandoff(prev, turn);
                 const rule = handoff ? (
                   <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
                 ) : null;
+                const isParentLive = turn.id === 'live-parent' || turn.id === 'live-parent-relay';
+                const liveMsg = isParentLive && liveParentDelegates.length
+                  ? { ...turn, delegates: [...(turn.delegates || []), ...liveParentDelegates] }
+                  : turn;
                 if (turn._placeholder) {
                   return (
                     <Fragment key={turn.id}>
                       {rule}
-                      <div className="text-sm">
-                        <span className="chat-shimmer font-medium text-gray-300">
-                          {turn.speaker?.role
-                            ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
-                            : 'Thinking…'}
-                        </span>
-                      </div>
+                      <AssistantBubble speaker={turn.speaker || null}>
+                        <div className="text-sm">
+                          <span className="chat-shimmer font-medium text-gray-300">
+                            {turn.speaker?.role
+                              ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
+                              : 'Thinking…'}
+                          </span>
+                        </div>
+                      </AssistantBubble>
                     </Fragment>
                   );
                 }
@@ -1441,7 +1823,7 @@ export function SessionChat({
                   <Fragment key={turn.id}>
                     {rule}
                     <ChatTurn
-                      msg={turn}
+                      msg={liveMsg}
                       agentMaxHeight={agentMaxHeight}
                       onApproval={
                         externalOwned || !onApproval
@@ -1475,6 +1857,7 @@ export function SessionChat({
                   parts: live.parts || [],
                   streaming: true,
                   speaker: speakerFromSession(session),
+                  ...(liveParentDelegates.length ? { delegates: liveParentDelegates } : {}),
                 }}
                 agentMaxHeight={agentMaxHeight}
                 onApproval={
@@ -1539,6 +1922,18 @@ export function SessionChat({
           </div>
         ) : null}
       </div>
+      <ChatMinimap
+        panelRef={panelRef}
+        turns={minimapTurns}
+        sessionKey={session?.key || ''}
+        onJump={(id) => {
+          const last = minimapTurns[minimapTurns.length - 1]?.id;
+          // Jumping away from the newest prompt is back-reading: keep auto-scroll
+          // off until the user returns to the bottom (wheel or jump-to-bottom).
+          setBackReading(Boolean(last && id !== last));
+        }}
+      />
+      </div>
 
       {/*
        * Bottom dock: drawers sit above the composer. Height is drag-resized
@@ -1568,24 +1963,48 @@ export function SessionChat({
         onSubmit={composerLocked ? (event) => event.preventDefault() : submit}
       >
         {externalOwned ? (
-          <div
-            className="flex items-start gap-3 rounded-2xl border border-amber-700/40 bg-amber-950/25 px-3.5 py-3"
-            role="status"
-          >
-            <LucideIcon
-              name="external-link"
-              className="mt-0.5 h-[18px] w-[18px] shrink-0 text-amber-400"
-              title="External session"
-            />
-            <div className="min-w-0 space-y-1">
-              <p className="text-sm font-medium text-amber-100">
-                Owned by Cursor UI
-              </p>
-              <p className="text-xs leading-relaxed text-amber-200/80">
-                This session is mirrored from Cursor. Prompting is disabled here so Kusă
-                does not mix a separate Cursor CLI chat into the same transcript — continue
-                in Cursor.
-              </p>
+          <div className="space-y-2">
+            <div className="flex items-center justify-end gap-1.5">
+              <PopupToggle
+                icon={PlanIcon}
+                label="Plans"
+                count={sessionPlanCount}
+                noun="plans"
+                available
+                countClassName="text-violet-300/90"
+                activeClassName="bg-violet-500/15 text-violet-300"
+                expanded={plansExpanded}
+                onToggle={() => {
+                  setPlansExpanded((open) => {
+                    const next = !open;
+                    if (next) {
+                      closeOtherDrawers('plans');
+                      void workspacePlans.refresh();
+                    }
+                    return next;
+                  });
+                }}
+              />
+            </div>
+            <div
+              className="flex items-start gap-3 rounded-2xl border border-amber-700/40 bg-amber-950/25 px-3.5 py-3"
+              role="status"
+            >
+              <LucideIcon
+                name="external-link"
+                className="mt-0.5 h-[18px] w-[18px] shrink-0 text-amber-400"
+                title="External session"
+              />
+              <div className="min-w-0 space-y-1">
+                <p className="text-sm font-medium text-amber-100">
+                  Owned by Cursor UI
+                </p>
+                <p className="text-xs leading-relaxed text-amber-200/80">
+                  This session is mirrored from Cursor. Prompting is disabled here so Kusă
+                  does not mix a separate Cursor CLI chat into the same transcript — continue
+                  in Cursor. Plans created there still appear in the Plans drawer.
+                </p>
+              </div>
             </div>
           </div>
         ) : isSubagent ? (
@@ -1669,7 +2088,7 @@ export function SessionChat({
           <PopupToggle
             icon={PlanIcon}
             label="Plans"
-            count={workspacePlans.plans.length}
+            count={sessionPlanCount}
             noun="plans"
             available
             countClassName="text-violet-300/90"
@@ -1752,15 +2171,21 @@ export function SessionChat({
               <div className="hidden min-w-0 flex-wrap items-center gap-0.5 @[36rem]:flex">
                 <ComposerDropdown
                   title="Mode"
-                  options={AGENT_MODE_OPTIONS}
-                  value={agentMode}
+                  options={modePickerOptions}
+                  value={modePickerValue}
                   onSelect={selectComposerMode}
+                  disabled={!allowModeOverride}
+                  workflowOptions={canConvertOrchestrator ? workflows : null}
+                  workflowsLoading={workflowsLoading}
+                  onWorkflowSelect={canConvertOrchestrator ? selectOrchestratorWorkflow : null}
+                  onWorkflowMenuOpen={ensureWorkflowsLoaded}
                 />
                 <ComposerDropdown
-                  title="Rule"
-                  options={rulePickerOptions}
-                  value={approvalRules}
-                  onSelect={selectApprovalRule}
+                  title="Agent"
+                  options={AGENT_PROVIDER_OPTIONS}
+                  value={agentProvider}
+                  onSelect={selectComposerProvider}
+                  disabled={!allowAgentOverride}
                 />
                 {showModelPicker ? (
                   <ComposerDropdown
@@ -1768,39 +2193,57 @@ export function SessionChat({
                     options={modelOptions}
                     value={activeModel}
                     onSelect={selectComposerModel}
+                    disabled={!allowModelOverride}
                   />
                 ) : (
-                  <span className="rounded-md px-1.5 py-0.5 text-[11px] text-gray-500">
+                  <span className="rounded-md px-1.5 py-0.5 text-[11px] text-gray-500 opacity-50">
                     via provider CLI
                   </span>
                 )}
+                <ComposerDropdown
+                  title="Rule"
+                  options={rulePickerOptions}
+                  value={approvalRules}
+                  onSelect={selectApprovalRule}
+                  disabled={!allowRuleOverride}
+                />
               </div>
               <div className="@[36rem]:hidden">
                 <ComposerOptionsMenu
-                  mode={agentMode}
-                  modeOptions={AGENT_MODE_OPTIONS}
+                  mode={modePickerValue}
+                  modeOptions={modePickerOptions}
                   onModeSelect={selectComposerMode}
-                  rule={approvalRules}
-                  ruleOptions={rulePickerOptions}
-                  onRuleSelect={selectApprovalRule}
+                  modeDisabled={!allowModeOverride}
+                  agent={agentProvider}
+                  agentOptions={AGENT_PROVIDER_OPTIONS}
+                  onAgentSelect={selectComposerProvider}
+                  agentDisabled={!allowAgentOverride}
                   model={showModelPicker ? activeModel : ''}
                   modelOptions={showModelPicker ? modelOptions : []}
                   onModelSelect={selectComposerModel}
+                  modelDisabled={!allowModelOverride}
+                  rule={approvalRules}
+                  ruleOptions={rulePickerOptions}
+                  onRuleSelect={selectApprovalRule}
+                  ruleDisabled={!allowRuleOverride}
+                  workflowOptions={canConvertOrchestrator ? workflows : null}
+                  workflowsLoading={workflowsLoading}
+                  onWorkflowSelect={canConvertOrchestrator ? selectOrchestratorWorkflow : null}
+                  onWorkflowMenuOpen={ensureWorkflowsLoaded}
                 />
               </div>
               <p className={`min-w-0 flex-1 truncate px-1 text-[11px] ${attachNote ? 'text-rose-400' : 'text-gray-600'}`}>
                 {attachNote
                   ? attachNote
-                  : selfBusy
-                    ? 'Generating… · Send queues · Stop ends this run'
-                    : editingId
-                      ? 'Editing — resend replaces everything after it'
-                      : null}
+                  : editingId
+                    ? 'Editing — resend replaces everything after it'
+                    : null}
               </p>
               <div className="flex shrink-0 items-center gap-0.5">
                 <ContextRing
-                  used={estimateContextTokens(messages, live)}
-                  limit={activeContextLimit}
+                  used={contextUsed}
+                  limit={contextLimit}
+                  source={contextSource}
                 />
                 <AttachmentPicker
                   onAction={(action) => {

@@ -64,6 +64,7 @@ self.addEventListener('fetch', (event) => {
     || url.pathname.startsWith('/trail')
     || url.pathname.startsWith('/files')
     || url.pathname.startsWith('/search')
+    || url.pathname.startsWith('/grep')
     || url.pathname.startsWith('/learnings')
     || url.pathname.startsWith('/monitor-data')
     || url.pathname === '/index.json'

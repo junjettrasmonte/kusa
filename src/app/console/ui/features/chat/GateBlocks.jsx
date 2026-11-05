@@ -121,8 +121,14 @@ export function ApprovalBlock({ approval, onApproval = null }) {
           ? 'Denied by Rule'
           : autoSettled ? 'Auto-denied' : 'Denied'
         : 'Approval';
+  // Pending only: Allow / Deny rules auto-settle and never "ask" in the orchestrator.
+  const relayAgent = approval?.sourceRole
+    ? `${String(approval.sourceRole).replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())} agent`
+    : 'Subagent';
   const relayLabel = approval?.relayed
-    ? (approval.sourceRole ? `Subagent · ${approval.sourceRole}` : 'Subagent')
+    ? (pending
+      ? (approval.gatePrompt || `${relayAgent} is asking for an approval`)
+      : relayAgent)
     : '';
 
   return (
@@ -366,8 +372,13 @@ export function AskCard({ ask, onAsk = null }) {
     : answered
       ? 'Answered'
       : 'No answer';
+  const relayAgent = ask?.sourceRole
+    ? `${String(ask.sourceRole).replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())} agent`
+    : 'Subagent';
   const relayLabel = ask?.relayed
-    ? (ask.sourceRole ? `Subagent · ${ask.sourceRole}` : 'Subagent')
+    ? (pending
+      ? (ask.gatePrompt || `${relayAgent} is asking a question`)
+      : relayAgent)
     : '';
 
   return (

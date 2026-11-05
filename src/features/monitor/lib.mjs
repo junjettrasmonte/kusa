@@ -51,8 +51,12 @@ import {
   normalizeAuth,
 } from '#features/auth/normalize.mjs';
 import { loadTasks, saveTasks } from '#features/chat/data/task-store.mjs';
+import { upsertPlanFromLaneCapture } from '#features/chat/data/plan-store.mjs';
 import { applyCursorComposerTitles } from '#extensions/cursor-adapter/composer-titles.mjs';
 import { consoleAsset, consoleHtmlPath } from '#shared/lib/pkg.mjs';
+import { isMistakenAgentProfileLane } from '#features/monitor/agent-profile-lane.mjs';
+
+export { isMistakenAgentProfileLane } from '#features/monitor/agent-profile-lane.mjs';
 
 export { publicSettings } from '#features/settings/secrets.mjs';
 
@@ -751,6 +755,7 @@ function emptyLane(harness, sessionId) {
     todos: [],
     todosUpdatedAtWall: null,
     todosTranscriptMtime: null,
+    promptsTranscriptMtime: null,
     trail: emptyTrail(),
     trailTranscriptMtime: null,
     transcriptPath: null,
@@ -1466,6 +1471,95 @@ export function trailSavingsFromTranscript(text) {
   return turns;
 }
 
+/**
+ * Human-visible text of a transcript row: `text` parts only. `tool_use` and
+ * `tool_result` blocks are skipped — the Prompts panel already gets tool
+ * activity from hooks, and a tool result echoed back as a `user` row would
+ * read as a phantom prompt.
+ */
+function transcriptTextParts(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (!part || typeof part !== 'object') return '';
+    if (part.type === 'tool_use' || part.type === 'tool_result') return '';
+    return typeof part.text === 'string' ? part.text : '';
+  }).filter(Boolean).join('\n');
+}
+
+/**
+ * Cursor wraps human submissions in `<user_query>` and prefixes rows with
+ * timestamps. Keep the body the user actually typed; role classification runs
+ * on the raw blob before this so nothing is mislabelled by the unwrap.
+ */
+function unwrapTranscriptPrompt(text) {
+  if (typeof text !== 'string' || !text) return '';
+  let out = text;
+  const wrapped = [...out.matchAll(/<user_query>([\s\S]*?)<\/user_query>/g)]
+    .map((match) => (match[1] || '').trim())
+    .filter(Boolean);
+  if (wrapped.length) out = wrapped.join('\n\n');
+  return out.replace(/^[ \t]*\[[^\]\n]{8,64}\][ \t]*/gm, '').trim();
+}
+
+/**
+ * Parse a Cursor `agent-transcripts/<id>.jsonl` into prompt turns, oldest
+ * first. A `user` row with text starts a turn; the following `assistant` text
+ * parts become its reply body. Rows with no text (tool-result echoes, empty
+ * heartbeats) never start or extend a turn.
+ */
+export function transcriptPromptTurns(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const turns = [];
+  let current = null;
+  const flush = () => {
+    if (!current) return;
+    const promptText = unwrapTranscriptPrompt(current.promptRaw).slice(0, MAX_PROMPT_TEXT);
+    const response = current.responses.filter(Boolean).join('\n').trim().slice(0, MAX_RESPONSE_TEXT);
+    if (promptText) {
+      turns.push({
+        text: promptText,
+        role: current.role,
+        response,
+        atWall: current.atWall,
+        model: current.model,
+      });
+    }
+    current = null;
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (!row || typeof row !== 'object') continue;
+    const body = transcriptTextParts(row?.message?.content);
+    if (row.role === 'user') {
+      // A user row with no text is a tool result being fed back, not a prompt.
+      if (!body) continue;
+      flush();
+      current = {
+        promptRaw: body,
+        role: classifyPromptRole(body, row.prompt_role || row.promptRole),
+        responses: [],
+        atWall: parseWall(row.timestamp ?? row.wall, null),
+        model: typeof row.model === 'string' ? row.model : '',
+      };
+      continue;
+    }
+    if (!current || row.role !== 'assistant' || !body) continue;
+    current.responses.push(body);
+    if (!current.model && typeof row.model === 'string') current.model = row.model;
+  }
+  flush();
+  return turns;
+}
+
+/** Same user submission twice in one transcript? Compare normalized bodies. */
+function promptTextKey(text) {
+  if (typeof text !== 'string') return '';
+  return text.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 4_000);
+}
+
 function loadTrailSessionCache(lane) {
   if (!lane?.id) return;
   const path = join(repoRoot, '.trail', 'cache', '.cache', 'session', `${lane.id}.json`);
@@ -1843,6 +1937,75 @@ function findAgentTranscript(lane) {
     if (existsSync(path)) return path;
   }
   return '';
+}
+
+/**
+ * Backfill `lane.prompts` from the harness transcript. Cursor IDE composers
+ * are observe-only — no `beforeSubmitPrompt` / `afterAgentResponse` ever fires
+ * for them, so their prompts exist nowhere but on disk. Hooks stay
+ * authoritative: a missing turn is appended, an empty `response` is filled,
+ * and text a hook already captured is never replaced with disk text.
+ * Kusa-owned CLI chats are skipped — `runCursorStreamTurn` writes the real
+ * transcript into the lane itself.
+ */
+export function syncLanePromptsFromTranscript(lane) {
+  if (!lane) return;
+  if (lane.kusaOwned || lane.harness !== 'cursor') return;
+  const transcript = findAgentTranscript(lane);
+  if (!transcript) return;
+  try {
+    const st = statSync(transcript);
+    if (lane.promptsTranscriptMtime === st.mtimeMs) return;
+    lane.promptsTranscriptMtime = st.mtimeMs;
+    const turns = transcriptPromptTurns(readFileSync(transcript, 'utf8'));
+    if (!turns.length) return;
+    const prompts = Array.isArray(lane.prompts) ? lane.prompts : [];
+    const keys = new Set(prompts.map((p) => promptTextKey(p?.text)));
+    // 1) Fill reply bodies the hooks never carried. A row that already has a
+    // response keeps it — the live hook text is what the user actually saw.
+    for (const turn of turns) {
+      if (!turn.response) continue;
+      const row = prompts.find((p) => p && !p.response && promptTextKey(p.text) === promptTextKey(turn.text));
+      if (!row) continue;
+      row.response = turn.response;
+      row.responseChars = turn.response.length;
+      row.responseTruncated = false;
+    }
+    // 2) Append turns no hook ever saw. Disk history predates anything hooks
+    // captured, so new rows go to the tail of the newest-first prompt list.
+    let nextIndex = prompts.reduce((max, p) => Math.max(max, Number(p?.index) || 0), 0);
+    let appended = 0;
+    for (const turn of turns) {
+      if (keys.has(promptTextKey(turn.text))) continue;
+      keys.add(promptTextKey(turn.text));
+      nextIndex += 1;
+      appended += 1;
+      prompts.push({
+        index: nextIndex,
+        atWall: turn.atWall ?? lane.startedAtWall ?? Date.now(),
+        endedAtWall: null,
+        durationMs: null,
+        chars: turn.text.length,
+        text: turn.text,
+        truncated: false,
+        role: turn.role,
+        response: turn.response,
+        responseChars: turn.response.length,
+        responseTruncated: false,
+        plan: null,
+        todos: null,
+        toolAttempts: 0,
+        open: false,
+        generationId: '',
+        model: turn.model || '',
+        tokens: null,
+        trailSavedTokens: null,
+      });
+    }
+    if (prompts.length > MAX_PROMPTS) prompts.length = MAX_PROMPTS;
+    if (appended && Number(lane.promptIndex || 0) < nextIndex) lane.promptIndex = nextIndex;
+    if (prompts !== lane.prompts) lane.prompts = prompts;
+  } catch { /* transcript unreadable */ }
 }
 
 function deriveTrailSavedFromPrompts(lane) {
@@ -3361,6 +3524,8 @@ const RESERVED_DATA_DIRS = new Set([
   'skills',
   'plans',
   'workflows',
+  // Central agent profiles (workflow role source of truth) — not a harness.
+  'agent-profiles',
 ]);
 /** Composer picks for a Kusă Agent — lives inside the Agent folder. */
 export const AGENT_CONFIG_FILE = 'agent.json';
@@ -3662,6 +3827,45 @@ function mergeSessionFolderInto(fromDir, toFiles) {
 }
 
 /**
+ * Drop Agents folders whose lane.json is a migrated agent-profile document.
+ * Profiles belong under `.kusa/agent-profiles/`, not the sidebar Agents list.
+ */
+export function reclaimMistakenAgentProfileLanes(dir) {
+  if (!dir) return { removed: [] };
+  const root = agentsRoot(dir);
+  if (!existsSync(root)) return { removed: [] };
+  let entries = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return { removed: [] };
+  }
+  const removed = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const folder = join(root, entry.name);
+    const lanePath = join(folder, LANE_FILE);
+    if (!existsSync(lanePath)) continue;
+    // Never touch a real chat session.
+    if (existsSync(join(folder, CHAT_FILE))) continue;
+    let raw = null;
+    try {
+      raw = JSON.parse(readFileSync(lanePath, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!isMistakenAgentProfileLane(raw)) continue;
+    try {
+      rmSync(folder, { recursive: true, force: true });
+      removed.push(entry.name);
+    } catch {
+      /* best-effort */
+    }
+  }
+  return { removed };
+}
+
+/**
  * Keep Subagents under `agents/<parent>/subagents/<id>/`:
  * - Relocate a top-level folder whose agent.json declares `parentId`
  * - Remove top-level twins when the nested copy already exists
@@ -3831,6 +4035,8 @@ export function migrateHarnessSessionsToShared(dir) {
   }
   // Fold any detached Subagent twins back under their parent's subagents/.
   try { reclaimDetachedSubagents(dir); } catch { /* ignore */ }
+  // Drop agent-profile docs that were once migrated into agents/<id>/.
+  try { reclaimMistakenAgentProfileLanes(dir); } catch { /* ignore */ }
 }
 
 /** Best-effort remove of an entire session folder (and any leftover flat files). */
@@ -4198,6 +4404,13 @@ function retagKusaChatLanes(dir, state) {
 }
 
 function persist(dir, state) {
+  // settings.json is authoritative for agent endpoints / keys. Hook and SDK
+  // paths used to rewrite monitor-data.js from the in-memory snapshot, which
+  // could re-emit a pre-POST /settings endpoints view and make the console
+  // poll revert every field edit a second later.
+  try {
+    state.settings = loadMonitorSettings(dir);
+  } catch { /* keep whatever was already on state */ }
   // Shared index: everything except the lanes and the aliases that mirror the focused lane.
   const index = { ...state, generatedAtWall: state.generatedAtWall };
   delete index.sessions;
@@ -4212,8 +4425,16 @@ function persist(dir, state) {
   for (const lane of Object.values(state.sessions)) {
     syncPlanTodos(lane);
     syncTrailSavings(lane);
+    // Cursor IDE composers fire no hooks: their prompts/replies only ever exist
+    // on disk. Backfill them here so both the Agents chat and the Prompts
+    // panel see the history hooks never carried. Roles are classified after,
+    // so appended rows land in the same shape as hook-captured ones.
+    syncLanePromptsFromTranscript(lane);
     syncPromptRoles(lane);
     syncPlansOntoPrompts(lane);
+    // Intercept CreatePlan / *.plan.md from any harness (incl. external Cursor
+    // IDE sessions) into `.kusa/plans/` so the Plan drawer can show them.
+    try { upsertPlanFromLaneCapture(dir, lane); } catch { /* best-effort */ }
   }
   // Per-session Task List sidecar (held prompts sit beside it in queues.json).
   persistTasksSidecar(dir, state);
@@ -4913,6 +5134,10 @@ export function refreshMonitorArtifacts(dir, { config, origin = 'hooks', nowWall
   return withLock(dir, () => {
     const loaded = loadThresholds(dir, config);
     const { state } = readState(dir, loaded.config, origin);
+    // settings.json is authoritative for Kusă agent endpoints / keys. Without
+    // this reload, POST /settings wrote the file but monitor-data.js kept the
+    // prior snapshot — the console's 1s poll then reverted every field edit.
+    state.settings = loadMonitorSettings(dir);
     prunePromptlessEndedCursorLanes(state);
     state.generatedAtWall = nowWall;
     recompute(state);
@@ -5281,6 +5506,10 @@ export function buildView(state) {
     // prompt stay out of the tree — Cursor otherwise lists every CLI probe /
     // tool-only blip as a new session.
     if (!laneListedInSidebar(lane)) continue;
+    // Subagents surface under the parent transcript, not as their own sidebar
+    // rows. Omitting them here (and stamping parentId when present) keeps the
+    // Agents list from flashing every nested child before /kusa/agents hydrates.
+    if (String(lane.parentId || '').trim()) continue;
     if (!byHarness.has(lane.harness)) byHarness.set(lane.harness, []);
     byHarness.get(lane.harness).push({
       key: lane.key,
@@ -5298,6 +5527,8 @@ export function buildView(state) {
       lastEventName: lane.lastEventName,
       endedAtWall: lane.endedAtWall,
       rankAt: sessionRankAt(lane),
+      ...(lane.kind ? { kind: lane.kind } : {}),
+      ...(lane.workflowId ? { workflowId: lane.workflowId } : {}),
     });
   }
   const harnesses = [...byHarness.entries()].map(([harness, sessions]) => ({

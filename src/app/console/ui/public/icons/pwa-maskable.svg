@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="Kusa">
+  <!-- PWA maskable mark: full-bleed square so OS masks (circle/squircle) clip cleanly.
+       Logo stays inside the central 80% safe zone. -->
+  <rect width="320" height="320" fill="#000"/>
+  <g
+    fill="none"
+    stroke="#fff"
+    stroke-width="20"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    transform="translate(160 160) scale(0.85) translate(-160 -150)"
+  >
+    <circle cx="160" cy="150" r="65"/>
+    <circle cx="254" cy="150" r="29"/>
+    <circle cx="113" cy="68.6" r="29"/>
+    <circle cx="113" cy="231.4" r="29"/>
+    <path d="M145 123 V177"/>
+    <path d="M145 150 L177 123"/>
+    <path d="M145 150 L177 177"/>
+  </g>
+</svg>

@@ -4,8 +4,10 @@ import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  APPROVAL_GATED_TOOLS,
   ESCALATE_TOOL_DEFS,
   agentToolGroups,
+  createApprovalGate,
   createEscalateTools,
   createTrailAwareTools,
   escalateSystemPromptAddon,
@@ -191,6 +193,8 @@ describe('kusa_escalate', () => {
     const orchTools = createTrailAwareTools(dir, {
       dataDir: dir,
       sessionKey: 'kusa:orch',
+      // Pre-approve so this test covers wiring, not the approval gate.
+      approvalMode: 'allow',
       onEscalateTurn: async () => ({
         ok: true,
         type: 'done',
@@ -205,6 +209,63 @@ describe('kusa_escalate', () => {
     });
     assert.equal(orchCall.ok, true);
     assert.equal(orchCall.text, 'unblocked');
+  });
+
+  it('is approval-gated: Deny refuses before starting a provider turn', async () => {
+    assert.equal(APPROVAL_GATED_TOOLS.has('kusa_escalate'), true);
+    const dir = tempDir();
+    createChatSession(dir, {
+      id: 'orch-gate',
+      workspaceRoot: dir,
+      kind: SESSION_KIND_ORCHESTRATED,
+      workflowId: 'plan-execute',
+    });
+    let ran = 0;
+    const tools = createEscalateTools({
+      dataDir: dir,
+      sessionKey: 'kusa:orch-gate',
+      workspaceRoot: dir,
+      approval: createApprovalGate({ mode: 'deny' }),
+      runTurn: async () => {
+        ran += 1;
+        return { ok: true, text: 'should not run' };
+      },
+    });
+    const denied = await tools.call('kusa_escalate', {
+      provider: 'kusa',
+      action: 'handoff a blocked write',
+      reason: 'need cursor',
+    });
+    assert.equal(denied.ok, false);
+    assert.equal(denied.denied, true);
+    assert.match(denied.error, /DENIED before escalating/i);
+    assert.equal(ran, 0);
+
+    const addon = escalateSystemPromptAddon({ dataDir: dir, sessionKey: 'kusa:orch-gate' });
+    assert.match(addon, /approval-gated/i);
+  });
+
+  it('is approval-gated: Allow runs the escalated turn', async () => {
+    const dir = tempDir();
+    createChatSession(dir, {
+      id: 'orch-allow',
+      workspaceRoot: dir,
+      kind: SESSION_KIND_ORCHESTRATED,
+      workflowId: 'plan-execute',
+    });
+    const tools = createEscalateTools({
+      dataDir: dir,
+      sessionKey: 'kusa:orch-allow',
+      workspaceRoot: dir,
+      approval: createApprovalGate({ mode: 'allow' }),
+      runTurn: async () => ({ ok: true, type: 'done', text: 'allowed handoff', turnId: 't-allow' }),
+    });
+    const allowed = await tools.call('kusa_escalate', {
+      provider: 'kusa',
+      action: 'finish the blocked step',
+    });
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.text, 'allowed handoff');
   });
 
   it('nests under the escalating Subagent folder like assign delegation', async () => {

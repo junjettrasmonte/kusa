@@ -59,10 +59,12 @@ const KUSA_PROVIDER = Object.freeze({
   id: 'kusa',
   label: 'Kusă',
   harness: 'kusa',
-  caoProvider: null,
+  // Optional CAO mirror id (Dev Tools › Agent Profiles sync / cao launch).
+  caoProvider: 'kusa_cli',
   turnBackend: 'byok',
   standard: true,
   externalOwned: false,
+  aliases: ['kusa_cli'],
 });
 
 indexProvider(KUSA_PROVIDER);

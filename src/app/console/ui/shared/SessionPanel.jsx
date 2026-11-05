@@ -14,6 +14,7 @@ export function SessionPanel({
   onToggleTool,
   chatSession = null,
   peerSessions = null,
+  lanes = null,
   chatQueue = null,
   onSendMessage,
   onQueueMessage,
@@ -23,6 +24,7 @@ export function SessionPanel({
   onTurnOptions = null,
   onSessionOptions = null,
   agentDefaults = null,
+  onOpenAgent = null,
 }) {
   // Chat transcript for provider chat sessions (Kusă BYOK or CAO-backed).
   const fillHeight = Boolean(chatSession);
@@ -56,6 +58,7 @@ export function SessionPanel({
             onTurnOptions={onTurnOptions}
             onSessionOptions={onSessionOptions}
             agentDefaults={agentDefaults}
+            onOpenAgent={onOpenAgent}
           />
         )}
         {subTab === 'prompts' && (
@@ -72,6 +75,9 @@ export function SessionPanel({
             now={now}
             expandedTools={expandedTools}
             onToggleTool={onToggleTool}
+            chatSession={chatSession}
+            peerSessions={peerSessions}
+            lanes={lanes}
           />
         )}
       </div>

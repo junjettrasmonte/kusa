@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import {
   parseContextTokenLimit,
   parseListModelsOutput,
+  pickCursorCliModel,
 } from '../extensions/cursor-adapter/models.mjs';
 
 describe('cursor adapter models', () => {
@@ -33,5 +34,37 @@ muse-wonder-1.0-high - Muse Wonder  High
     assert.equal(models.find((m) => m.id === 'claude-opus-5-5-high')?.contextTokens, 1_000_000);
     assert.equal(models.find((m) => m.id === 'gpt-5.5-medium')?.contextTokens, 1_000_000);
     assert.ok(models.some((m) => m.id === 'muse-wonder-1.0-high'));
+  });
+
+  it('falls back to provider auto when the requested model is not in Cursor catalog', () => {
+    const catalog = {
+      ok: true,
+      default: 'auto',
+      models: [
+        { id: 'auto' },
+        { id: 'composer-2.5' },
+      ],
+    };
+    assert.deepEqual(pickCursorCliModel('composer-2.5', catalog), {
+      model: 'composer-2.5',
+      fallback: false,
+      default: 'auto',
+    });
+    // Kusă BYOK id must not be passed to Cursor Agent.
+    assert.deepEqual(pickCursorCliModel('qwen3.8-flash-next-iq3_xxs', catalog), {
+      model: '',
+      fallback: true,
+      default: 'auto',
+    });
+    assert.deepEqual(pickCursorCliModel('auto', catalog), {
+      model: '',
+      fallback: false,
+      default: 'auto',
+    });
+    assert.deepEqual(pickCursorCliModel('', catalog), {
+      model: '',
+      fallback: false,
+      default: 'auto',
+    });
   });
 });

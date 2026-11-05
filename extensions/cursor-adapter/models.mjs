@@ -162,3 +162,34 @@ export function listCursorModels(opts = {}) {
 export function resetCursorModelsCache() {
   cache = null;
 }
+
+/**
+ * Pure catalog check for `agent --model`. Unknown / foreign ids (e.g. a Kusă
+ * BYOK model stamped after a mid-session workflow edit) fall back so the CLI
+ * omits `--model` and uses its own default.
+ *
+ * @param {string} requested
+ * @param {{ ok?: boolean, default?: string, models?: Array<{ id: string }> }} catalog
+ * @returns {{ model: string, fallback: boolean, default: string }}
+ */
+export function pickCursorCliModel(requested, catalog = {}) {
+  const raw = String(requested || '').trim();
+  const providerDefault = String(catalog?.default || 'auto').trim() || 'auto';
+  if (!raw || raw.toLowerCase() === 'auto') {
+    return { model: '', fallback: false, default: providerDefault };
+  }
+  const known = Array.isArray(catalog?.models) ? catalog.models : [];
+  if (catalog?.ok && known.some((entry) => entry?.id === raw)) {
+    return { model: raw, fallback: false, default: providerDefault };
+  }
+  return { model: '', fallback: true, default: providerDefault };
+}
+
+/**
+ * Resolve a model id for `agent --model` against the live Cursor catalog.
+ * @param {string} requested
+ * @param {{ force?: boolean }} [opts]
+ */
+export function resolveCursorCliModel(requested, opts = {}) {
+  return pickCursorCliModel(requested, listCursorModels(opts));
+}

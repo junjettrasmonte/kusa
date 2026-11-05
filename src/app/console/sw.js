@@ -64,6 +64,7 @@ self.addEventListener('fetch', (event) => {
     || url.pathname.startsWith('/trail')
     || url.pathname.startsWith('/files')
     || url.pathname.startsWith('/search')
+    || url.pathname.startsWith('/grep')
     || url.pathname.startsWith('/learnings')
     || url.pathname.startsWith('/monitor-data')
     || url.pathname === '/index.json'
@@ -72,6 +73,22 @@ self.addEventListener('fetch', (event) => {
     || url.hostname.endsWith('.huggingface.co')
     || url.hostname === 'cdn.jsdelivr.net'
   ) {
+    return;
+  }
+
+  // Bundled voice weights: cache-first after first fetch (offline Live Chat).
+  if (url.origin === self.location.origin && url.pathname.startsWith('/voice-models/')) {
+    event.respondWith(
+      caches.open('kusa-voice-models-v1').then(async (cache) => {
+        const hit = await cache.match(request);
+        if (hit) return hit;
+        const response = await fetch(request);
+        if (response && response.ok) {
+          cache.put(request, response.clone());
+        }
+        return response;
+      }).catch(() => fetch(request)),
+    );
     return;
   }
 

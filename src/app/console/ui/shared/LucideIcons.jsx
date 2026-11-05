@@ -134,10 +134,249 @@ const PATHS = {
   ),
   /** https://lucide.dev/icons/chevron-down — collapsible card / disclosure. */
   'chevron-down': <path d="m6 9 6 6 6-6" />,
+  /** https://lucide.dev/icons/chevron-left — back / up-a-level. */
+  'chevron-left': <path d="m15 18-6-6 6-6" />,
   /** https://lucide.dev/icons/chevron-right — collapsed tree / disclosure. */
   'chevron-right': <path d="m9 18 6-6-6-6" />,
   /** https://lucide.dev/icons/loader-circle — busy / in-progress spinner. */
   'loader-circle': <path d="M21 12a9 9 0 1 1-6.219-8.56" />,
+  /** https://lucide.dev/icons/refresh-cw — reload / refresh list. */
+  'refresh-cw': (
+    <>
+      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+      <path d="M8 16H3v5" />
+    </>
+  ),
+  /** https://lucide.dev/icons/pencil — edit row. */
+  pencil: (
+    <>
+      <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
+      <path d="m15 5 4 4" />
+    </>
+  ),
+  /** https://lucide.dev/icons/trash-2 — delete row. */
+  'trash-2': (
+    <>
+      <path d="M3 6h18" />
+      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+      <line x1="10" x2="10" y1="11" y2="17" />
+      <line x1="14" x2="14" y1="11" y2="17" />
+    </>
+  ),
+  /** https://lucide.dev/icons/filter — status / facet filter. */
+  filter: (
+    <>
+      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+    </>
+  ),
+  /** https://lucide.dev/icons/folders — session vs all-plans scope. */
+  folders: (
+    <>
+      <path d="M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2Z" />
+      <path d="M2 8v11a2 2 0 0 0 2 2h14" />
+    </>
+  ),
+  /** https://lucide.dev/icons/panel-right — dock drawer to the right. */
+  'panel-right': (
+    <>
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M15 3v18" />
+    </>
+  ),
+  /** https://lucide.dev/icons/panel-bottom — dock drawer to the bottom. */
+  'panel-bottom': (
+    <>
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M3 15h18" />
+    </>
+  ),
+  /** https://lucide.dev/icons/x — close drawer / dismiss. */
+  x: (
+    <>
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </>
+  ),
+  /** https://lucide.dev/icons/save — persist draft / profile / workflow. */
+  save: (
+    <>
+      <path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
+      <path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7" />
+      <path d="M7 3v4a1 1 0 0 0 1 1h7" />
+    </>
+  ),
+  /** https://lucide.dev/icons/search — workspace content search. */
+  search: (
+    <>
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.3-4.3" />
+    </>
+  ),
+  /** https://lucide.dev/icons/replace — toggle find → replace. */
+  replace: (
+    <>
+      <path d="M14 4a2 2 0 0 1 2-2" />
+      <path d="M16 10a2 2 0 0 1-2-2" />
+      <path d="M20 2a2 2 0 0 1 2 2" />
+      <path d="M22 8a2 2 0 0 1-2 2" />
+      <path d="m3 7 3 3 3-3" />
+      <path d="M6 10V5a3 3 0 0 1 3-3h1" />
+      <rect x="2" y="14" width="8" height="8" rx="2" />
+    </>
+  ),
+  /** https://lucide.dev/icons/replace-all — replace every match. */
+  'replace-all': (
+    <>
+      <path d="M14 14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2" />
+      <path d="M14 4a2 2 0 0 1 2-2" />
+      <path d="M16 10a2 2 0 0 1-2-2" />
+      <path d="M20 14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2" />
+      <path d="M20 2a2 2 0 0 1 2 2" />
+      <path d="M22 8a2 2 0 0 1-2 2" />
+      <path d="m3 7 3 3 3-3" />
+      <path d="M6 10V5a3 3 0 0 1 3-3h1" />
+      <rect x="2" y="14" width="8" height="8" rx="2" />
+    </>
+  ),
+  /** https://lucide.dev/icons/case-sensitive — match case. */
+  'case-sensitive': (
+    <>
+      <path d="m3 15 4-8 4 8" />
+      <path d="M4 13h6" />
+      <circle cx="18" cy="12" r="3" />
+      <path d="M21 9v6" />
+    </>
+  ),
+  /** https://lucide.dev/icons/whole-word — match whole word. */
+  'whole-word': (
+    <>
+      <circle cx="7" cy="12" r="3" />
+      <path d="M10 9v6" />
+      <circle cx="17" cy="12" r="3" />
+      <path d="M14 7v8" />
+      <path d="M22 17v1c0 .5-.5 1-1 1H3c-.5 0-1-.5-1-1v-1" />
+    </>
+  ),
+  /** https://lucide.dev/icons/regex — use regular expression. */
+  regex: (
+    <>
+      <path d="M17 3v10" />
+      <path d="m12.67 5.5 8.66 5" />
+      <path d="m12.67 10.5 8.66-5" />
+      <path d="M9 17a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2v-2z" />
+    </>
+  ),
+  /** https://lucide.dev/icons/folder — closed directory. */
+  folder: (
+    <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+  ),
+  /** https://lucide.dev/icons/folder-open — expanded directory. */
+  'folder-open': (
+    <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
+  ),
+  /** https://lucide.dev/icons/folders — Explorer view / multi-folder. */
+  folders: (
+    <>
+      <path d="M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2Z" />
+      <path d="M2 8v11a2 2 0 0 0 2 2h14" />
+    </>
+  ),
+  /** https://lucide.dev/icons/file — generic file. */
+  file: (
+    <>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+    </>
+  ),
+  /** https://lucide.dev/icons/file-code — source. */
+  'file-code': (
+    <>
+      <path d="M10 12.5 8 15l2 2.5" />
+      <path d="m14 12.5 2 2.5-2 2.5" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z" />
+    </>
+  ),
+  /** https://lucide.dev/icons/file-text — docs / markdown. */
+  'file-text': (
+    <>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M10 9H8" />
+      <path d="M16 13H8" />
+      <path d="M16 17H8" />
+    </>
+  ),
+  /** https://lucide.dev/icons/file-json — data / manifests. */
+  'file-json': (
+    <>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M10 12a1 1 0 0 0-1 1v1a1 1 0 0 1-1 1 1 1 0 0 1 1 1v1a1 1 0 0 0 1 1" />
+      <path d="M14 18a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1 1 1 0 0 1-1-1v-1a1 1 0 0 0-1-1" />
+    </>
+  ),
+  /** https://lucide.dev/icons/image — images. */
+  image: (
+    <>
+      <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+      <circle cx="9" cy="9" r="2" />
+      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+    </>
+  ),
+  /** https://lucide.dev/icons/terminal — shell scripts. */
+  terminal: (
+    <>
+      <polyline points="4 17 10 11 4 5" />
+      <line x1="12" x2="20" y1="19" y2="19" />
+    </>
+  ),
+  /** https://lucide.dev/icons/package — binaries / archives. */
+  package: (
+    <>
+      <path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z" />
+      <path d="M12 22V12" />
+      <path d="m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7" />
+      <path d="m7.5 4.27 9 5.15" />
+    </>
+  ),
+  /** https://lucide.dev/icons/clipboard-list — Planner role avatar. */
+  'clipboard-list': (
+    <>
+      <rect width="8" height="4" x="8" y="2" rx="1" ry="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      <path d="M12 11h4" />
+      <path d="M12 16h4" />
+      <path d="M8 11h.01" />
+      <path d="M8 16h.01" />
+    </>
+  ),
+  /** https://lucide.dev/icons/hammer — Executor role avatar. */
+  hammer: (
+    <>
+      <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9" />
+      <path d="m18 15 4-4" />
+      <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5" />
+    </>
+  ),
+  /** https://lucide.dev/icons/flask-conical — Tester role avatar. */
+  'flask-conical': (
+    <>
+      <path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2" />
+      <path d="M6.453 15h11.094" />
+      <path d="M8.5 2h7" />
+    </>
+  ),
+  /** https://lucide.dev/icons/eye — Reviewer role avatar. */
+  eye: (
+    <>
+      <path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
 };
 
 export function LucideIcon({
@@ -150,7 +389,7 @@ export function LucideIcon({
   if (!paths) return null;
   return (
     <svg
-      className={`shrink-0 ${className}`}
+      className={`block shrink-0 ${className}`}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"

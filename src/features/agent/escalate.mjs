@@ -2,7 +2,9 @@
  * Orchestrator escalate tool — hand one blocked action to another chat
  * provider for a single turn, then resume with that provider's result.
  * Only available on orchestrated sessions (kind=orchestrated / workflowId).
+ * Approval-gated like terminal/browse: the session Rule must allow the handoff.
  */
+import { createApprovalGate } from '#features/agent/approval.mjs';
 import {
   createSubagent,
   readChatSession,
@@ -21,6 +23,7 @@ export const ESCALATE_TOOL_DEFS = [
     description:
       'When stuck on a blocker in an orchestrated session, hand one concrete action to another '
       + 'chat provider for a single turn, then resume with that provider\'s result. '
+      + 'Approval-gated: the call either runs or is refused outright under the session Rule. '
       + 'Prefer a different provider than the one currently running (e.g. cursor, copilot, kusa). '
       + 'Control returns after that turn completes — do not escalate work that belongs to a '
       + 'workflow role Subagent (use kusa_assign for that).',
@@ -93,6 +96,7 @@ export function createEscalateTools({
   /** Await a single provider turn and return its result. */
   runTurn = null,
   signal = null,
+  approval = createApprovalGate(),
 } = {}) {
   async function escalate(args = {}) {
     if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
@@ -221,17 +225,51 @@ export function createEscalateTools({
     };
   }
 
-  async function call(name, args = {}) {
-    if (name === 'kusa_escalate' || name === 'escalate') {
-      return escalate(args);
+  async function call(name, args = {}, callId = null) {
+    if (name !== 'kusa_escalate' && name !== 'escalate') {
+      return { ok: false, error: `unknown escalate tool: ${name}`, code: 'ENOENT' };
     }
-    return { ok: false, error: `unknown escalate tool: ${name}`, code: 'ENOENT' };
+    // Refuse unavailable contexts before asking — an approval row for a tool
+    // that cannot run would mislead the user into Allowing a no-op.
+    if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
+    if (!isOrchestratedSessionKey(dataDir, sessionKey)) {
+      return {
+        ok: false,
+        error: 'kusa_escalate is only available on orchestrated sessions',
+        code: 'EORCH',
+      };
+    }
+    const verdict = await approval.request({
+      name,
+      args,
+      callId,
+    });
+    if (!verdict.allowed) {
+      const reason = verdict?.reason || `${name} was not approved`;
+      const decision = String(verdict?.decision || '');
+      const byRule = decision.endsWith('-default');
+      const ruleIsDeny = decision === 'mode-deny';
+      return {
+        ok: false,
+        denied: true,
+        approval: verdict,
+        error: verdict?.unattended === true
+          ? `DENIED before escalating: no approver is wired for this run, so the rule default applied — ${reason}. Retrying will be denied again; ask the user to switch the approval rule to Allow if this must run.`
+          : ruleIsDeny
+            ? `DENIED before escalating: the approval Rule is Deny, so nothing was asked and the escalation was NOT started. Retrying will be denied again — ask the user to switch the Rule to Allow if this must run.`
+            : byRule
+            ? `DENIED before escalating: nobody answered in time, so the rule default applied — ${reason}. The escalation was NOT started. Describe the provider and action, then retry once the user allows it.`
+            : `DENIED by the user before escalating: ${reason} — the escalation was not started.`,
+      };
+    }
+    return escalate(args);
   }
 
   return {
     defs: ESCALATE_TOOL_DEFS,
     call,
     escalate,
+    approval,
   };
 }
 
@@ -242,6 +280,7 @@ export function escalateSystemPromptAddon({ dataDir = '', sessionKey = '' } = {}
     'If you are stuck on a blocker you cannot break through yourself, use kusa_escalate',
     'to hand that one action to another chat provider for a single turn, then continue',
     'with the returned result. Prefer a different provider than the one currently running.',
+    'kusa_escalate is approval-gated like kusa_terminal — the call either runs or is refused outright.',
     providers.length ? `Registered providers: ${providers.join(', ')}.` : '',
     'Do not use kusa_escalate for normal role work — that is kusa_assign.',
   ].filter(Boolean).join(' ');

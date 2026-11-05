@@ -28,6 +28,13 @@ export {
   resolveAgentMaxSteps,
   runOpenAiAgentLoop,
 } from './openai-loop.mjs';
+export {
+  clearStrataDetectCache,
+  detectStrata,
+  readStrataContext,
+  readStrataSlots,
+  strataRootFromBaseUrl,
+} from './strata.mjs';
 export { supportsVision, visionLabel } from './model-capabilities.mjs';
 export {
   AGENT_MODES,

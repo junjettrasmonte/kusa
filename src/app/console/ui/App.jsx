@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DevToolsPanel } from './shared/DevToolsPanel.jsx';
 import { HarnessPanel } from './shared/HarnessPanel.jsx';
 import { MonitorsPanel } from './shared/MonitorsPanel.jsx';
@@ -15,8 +15,45 @@ import {
 } from './features/extensions/registry.js';
 import { RightRail } from './shared/RightRail.jsx';
 import { Sidebar, normalizeSessionFilter } from './features/monitor/Sidebar.jsx';
+import { basenameOfPath } from './features/explorer/language.js';
 import { ConfirmDialog } from './shared/ConfirmDialog.jsx';
 import { TrashIcon } from './shared/IconButton.jsx';
+
+/** Monaco is heavy — load only when a workspace file is opened. */
+const EditorWorkbench = lazy(() =>
+  import('./features/explorer/EditorWorkbench.jsx').then((mod) => ({ default: mod.EditorWorkbench })),
+);
+
+/** Keep the main pane usable if the Monaco chunk fails to load. */
+class EditorPaneBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+          <p className="text-sm text-rose-400">Could not start the code editor.</p>
+          <p className="max-w-md text-xs text-gray-500">{this.state.error.message || String(this.state.error)}</p>
+          <button
+            type="button"
+            className="mt-2 rounded-md border border-gray-700 px-3 py-1 text-xs text-gray-300 hover:bg-gray-800"
+            onClick={() => this.setState({ error: null })}
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 import {
   HARNESS_NAMES,
   HARNESS_SUBTAB_IDS,
@@ -34,6 +71,16 @@ import {
   TAB_IDS,
 } from './shared/lib/format.js';
 import { readJsonSet, readLocal, writeJsonSet, writeLocal } from './shared/lib/storage.js';
+
+/** Left editor drawer width (Explorer / Search open files beside the main pane). */
+const EDITOR_DRAWER_WIDTH_KEY = 'kusa.editor.drawerWidth';
+const EDITOR_DRAWER_DEFAULT_WIDTH = 440;
+const EDITOR_DRAWER_MIN_WIDTH = 280;
+
+function readEditorDrawerWidth() {
+  const raw = Number(readLocal(EDITOR_DRAWER_WIDTH_KEY, String(EDITOR_DRAWER_DEFAULT_WIDTH)));
+  return Number.isFinite(raw) && raw >= EDITOR_DRAWER_MIN_WIDTH ? raw : EDITOR_DRAWER_DEFAULT_WIDTH;
+}
 
 /** Core Dev Tools ids plus installed extension nav placements (e.g. CAO). */
 const { ids: DEVTOOLS_SUBTAB_IDS, labels: DEVTOOLS_SUBTAB_LABELS } = resolveDevtoolsSubTabs();
@@ -545,6 +592,13 @@ export default function App() {
   const [devtoolsSubTab, setDevtoolsSubTab] = useState(initialDevtoolsSubTab);
   const [settingsSubTab, setSettingsSubTab] = useState(initialSettingsSubTab);
   const [activeExtensionId, setActiveExtensionId] = useState(initialActiveExtensionId);
+  /** Open workspace files in a left drawer beside the main pane (Explorer / Search). */
+  const [editorTabs, setEditorTabs] = useState([]);
+  const [editorActivePath, setEditorActivePath] = useState(null);
+  /** Reveal target after opening from Search: { path, line, column }. */
+  const [editorReveal, setEditorReveal] = useState(null);
+  const [editorDrawerWidth, setEditorDrawerWidth] = useState(readEditorDrawerWidth);
+  const mainPaneRef = useRef(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => readLocal('monitor.sidebar', 'open') === 'collapsed',
   );
@@ -565,6 +619,13 @@ export default function App() {
    */
   const [pendingDelete, setPendingDelete] = useState(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
+  // Poll must not clobber Settings while a POST /settings is in flight — the
+  // 1s monitor-data snapshot can still be pre-save and would revert endpoint edits.
+  const settingsBusyRef = useRef(false);
+  settingsBusyRef.current = settingsBusy;
+  // Bumped per save so a delayed unlock from an older save cannot clear busy
+  // while a newer POST is still holding the guard.
+  const settingsSaveGenRef = useRef(0);
   const [chatSessions, setChatSessions] = useState([]);
   /**
    * Composer queue mirror, keyed by session key: { queued, steering }.
@@ -578,6 +639,13 @@ export default function App() {
   const [devtoolsExtReady, setDevtoolsExtReady] = useState({ cao: null, liveChat: null });
   const canDelete = typeof location !== 'undefined' && location.protocol !== 'file:';
   const canPersistSettings = canDelete;
+  /**
+   * False until the first GET /kusa/agents finishes (or file://, where there
+   * is no agents API). The sidebar stays on a loading indicator until then so
+   * harness bootstrap rows — which lack parentId / kind — never flash as a
+   * flat ungrouped list before chat metadata arrives.
+   */
+  const [chatSessionsReady, setChatSessionsReady] = useState(() => !canPersistSettings);
 
   // Load Kusă chats from `.kusa/kusa/*.chat.json` (and migrate legacy localStorage once).
   // Also rehydrate composer queues from the server — they live in memory there and
@@ -608,6 +676,8 @@ export default function App() {
         }
       } catch {
         // Keep empty list; user can still create once the server is reachable.
+      } finally {
+        if (!cancelled) setChatSessionsReady(true);
       }
     })();
     return () => { cancelled = true; };
@@ -654,6 +724,13 @@ export default function App() {
   }, [canPersistSettings, chatSessions]);
 
   useEffect(() => {
+    // Legacy: files used to take over the main pane via tab === 'editor'.
+    // Restore the last rail section so chat (or whatever was open) stays center.
+    if (tab === 'editor') {
+      const saved = readLocal('monitor.tab', 'session');
+      setTab(TAB_IDS.includes(saved) ? saved : 'session');
+      return;
+    }
     writeLocal('monitor.tab', tab);
   }, [tab]);
 
@@ -683,7 +760,15 @@ export default function App() {
 
   useEffect(() => {
     const push = (next) => {
-      setData(next);
+      setData((prev) => {
+        if (!next || typeof next !== 'object') return prev;
+        // Keep the just-saved / in-flight settings view while busy so Fields
+        // keyed on resetKey do not remount from a stale monitor-data payload.
+        if (settingsBusyRef.current && prev?.settings) {
+          return { ...next, settings: prev.settings };
+        }
+        return next;
+      });
       setLastLoadOk(Date.now());
       setLoadFailed(false);
     };
@@ -923,6 +1008,7 @@ export default function App() {
   async function saveSettings(patch) {
     if (!canPersistSettings || settingsBusy) return;
     setSettingsBusy(true);
+    const saveGen = ++settingsSaveGenRef.current;
     try {
       const res = await fetch('/settings', {
         method: 'POST',
@@ -943,11 +1029,14 @@ export default function App() {
           return { ...prev, settings };
         });
       }
-      poll();
+      // Wait out in-flight monitor-data polls under the busy guard. Clearing
+      // busy immediately (and kicking poll()) let a pre-save script land and
+      // remount endpoint Fields from the stale snapshot.
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
     } catch (err) {
       window.alert(`Could not save settings: ${err?.message || err}`);
     } finally {
-      setSettingsBusy(false);
+      if (settingsSaveGenRef.current === saveGen) setSettingsBusy(false);
     }
   }
 
@@ -968,6 +1057,95 @@ export default function App() {
       setSessionSubTab('chat');
       setTab('session');
     }
+  }
+
+  /**
+   * Open (or focus) a workspace file in the left editor drawer.
+   * When a chat session is selected, stay on Chat Session so the screen can
+   * split as editor | agent chat | plan drawer (dock Plans to the right).
+   * @param {string} path
+   * @param {{ line?: number, column?: number }} [opts]
+   */
+  function openWorkspaceFile(path, opts = {}) {
+    const rel = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+    if (!rel || rel.endsWith('/')) return;
+    const line = Number(opts?.line);
+    const column = Number(opts?.column);
+    setActiveExtensionId(null);
+    setEditorTabs((prev) => (
+      prev.some((entry) => entry.path === rel)
+        ? prev
+        : [...prev, { path: rel, name: basenameOfPath(rel) }]
+    ));
+    setEditorActivePath(rel);
+    setEditorReveal(
+      Number.isFinite(line) && line > 0
+        ? { path: rel, line, column: Number.isFinite(column) && column > 0 ? column : 1 }
+        : null,
+    );
+    // Prefer the 3-pane layout: keep / restore agent chat in the center column.
+    if (chatSession) {
+      setSessionSubTab('chat');
+      setTab('session');
+    } else if (tab === 'editor') {
+      const saved = readLocal('monitor.tab', 'session');
+      setTab(TAB_IDS.includes(saved) ? saved : 'session');
+    }
+  }
+
+  function closeEditorTab(path) {
+    setEditorTabs((prev) => {
+      const idx = prev.findIndex((entry) => entry.path === path);
+      const next = prev.filter((entry) => entry.path !== path);
+      setEditorActivePath((active) => {
+        if (active !== path) return active;
+        const neighbor = next[Math.min(Math.max(idx, 0), next.length - 1)] || next[0] || null;
+        return neighbor?.path || null;
+      });
+      return next;
+    });
+  }
+
+  function beginEditorDrawerResize(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    handle.setPointerCapture?.(pointerId);
+    const startX = event.clientX;
+    const startW = editorDrawerWidth;
+    const paneW = mainPaneRef.current?.getBoundingClientRect().width || 0;
+    const maxW = paneW > 0 ? Math.floor(paneW * 0.6) : 720;
+    const onMove = (moveEvent) => {
+      const next = Math.min(
+        maxW,
+        Math.max(EDITOR_DRAWER_MIN_WIDTH, startW + (moveEvent.clientX - startX)),
+      );
+      setEditorDrawerWidth(next);
+      writeLocal(EDITOR_DRAWER_WIDTH_KEY, String(next));
+    };
+    const onUp = () => {
+      handle.releasePointerCapture?.(pointerId);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  /** Open a chat Agent by id or session key (Plan drawer planner chip, etc.). */
+  function openAgentSession(agentIdOrKey) {
+    const raw = String(agentIdOrKey || '').trim();
+    if (!raw) return;
+    const byKey = chatSessions.find((s) => s.key === raw);
+    const byId = chatSessions.find((s) => s.id === raw);
+    const row = byKey || byId;
+    if (row?.key) {
+      selectLane(row.key);
+      return;
+    }
+    // Unknown / not yet listed — try the raw value if it already looks like a key.
+    if (isChatSessionKey(raw)) selectLane(raw);
   }
 
   async function createSession({ provider = 'kusa', kind = 'standard', workflowId = null } = {}) {
@@ -1170,6 +1348,7 @@ export default function App() {
               relayed: ev.relayed === true,
               sourceAgentId: ev.sourceAgentId || null,
               sourceRole: ev.sourceRole || null,
+              gatePrompt: typeof ev.gatePrompt === 'string' ? ev.gatePrompt : null,
             };
             return { ...live, parts: applyApprovalToParts(live.parts, approval) };
           });
@@ -1195,8 +1374,42 @@ export default function App() {
               relayed: ev.relayed === true,
               sourceAgentId: ev.sourceAgentId || null,
               sourceRole: ev.sourceRole || null,
+              gatePrompt: typeof ev.gatePrompt === 'string' ? ev.gatePrompt : null,
             };
             return { ...live, parts: applyAskToParts(live.parts, ask) };
+          });
+        } else if (ev.type === 'interrupted') {
+          // Soft-steer: freeze the half-finished assistant bubble into history
+          // so the next stream's content events start a fresh live.text, and
+          // seal thinking so the re-issue opens a new Thought container.
+          const partialText = (typeof ev.text === 'string' && ev.text)
+            || liveSnap.text
+            || '';
+          const partialThinking = (typeof ev.thinking === 'string' && ev.thinking)
+            || mirrorsFromParts(liveSnap.parts).thinking
+            || liveSnap.thinking
+            || '';
+          if (partialText.trim() || partialThinking.trim()) {
+            const row = {
+              id: `partial_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              role: 'assistant',
+              text: partialText.trim(),
+              thinking: partialThinking.trim(),
+              at: Date.now(),
+              interrupted: true,
+            };
+            patchKusaSession(setChatSessions, sessionKey, (s) => {
+              const msgs = [...(turnMessages || s.messages || []), row];
+              turnMessages = msgs;
+              return { ...s, messages: msgs };
+            });
+          }
+          updateLive((live) => {
+            const parts = Array.isArray(live.parts) ? [...live.parts] : [];
+            if (parts.length && parts[parts.length - 1]?.type === 'thinking') {
+              parts.push({ type: 'steer_break' });
+            }
+            return { ...live, text: '', parts };
           });
         } else if (ev.type === 'steer') {
           const steeredText = typeof ev.text === 'string' ? ev.text : '';
@@ -1619,10 +1832,11 @@ export default function App() {
   }
 
   /**
-   * Persist the composer's Mode / Rule / Model picks onto THIS session's record
-   * (`.kusa/kusa/<id>.chat.json`). Pickers belong to a chat, not to the browser:
-   * another session keeps its own, and one that never picked keeps following
-   * Settings → Kusă agent. Written straight to disk so a refresh — even mid-turn —
+   * Persist the composer's Agent / Mode / Rule / Model picks onto THIS session's
+   * record. Pickers belong to a chat, not to the browser: another session keeps
+   * its own, and one that never picked keeps following Settings → Kusă agent.
+   * Also handles Mode → Orchestrator conversion (kind / workflowId / role /
+   * allow*Override). Written straight to disk so a refresh — even mid-turn —
    * reopens the chat with the same pickers.
    */
   async function updateChatSessionOptions(sessionKey, {
@@ -1630,27 +1844,84 @@ export default function App() {
     rules = null,
     model = null,
     endpointId = null,
+    provider = null,
+    kind = null,
+    workflowId = null,
+    role = null,
+    allowModeOverride = null,
+    allowRuleOverride = null,
+    allowModelOverride = null,
   } = {}) {
     if (!canPersistSettings || !sessionKey) return;
+    const providerId = typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+    const kindId = typeof kind === 'string' ? kind.trim().toLowerCase() : '';
     const patch = {
       ...(mode ? { mode } : {}),
       ...(rules ? { rules } : {}),
       ...(model ? { model } : {}),
       // Allow clearing back to Default when the user picks a Default model.
       ...(endpointId != null ? { endpointId: String(endpointId).trim() } : {}),
+      ...(providerId ? { provider: providerId === 'github-copilot' ? 'copilot' : providerId } : {}),
+      ...(kindId ? { kind: kindId } : {}),
+      ...(allowModeOverride != null ? { allowModeOverride: allowModeOverride === true } : {}),
+      ...(allowRuleOverride != null ? { allowRuleOverride: allowRuleOverride === true } : {}),
+      ...(allowModelOverride != null ? { allowModelOverride: allowModelOverride === true } : {}),
     };
-    if (!Object.keys(patch).length) return;
+    // workflowId / role: present (including '') means set-or-clear for Orchestrator take-back.
+    const clearWorkflow = workflowId !== null && typeof workflowId === 'string' && !workflowId.trim();
+    const clearRole = role !== null && typeof role === 'string' && !role.trim();
+    if (typeof workflowId === 'string' && workflowId.trim()) patch.workflowId = workflowId.trim();
+    if (typeof role === 'string' && role.trim()) patch.role = role.trim().toLowerCase();
+    if (!Object.keys(patch).length && !clearWorkflow && !clearRole && kindId !== 'standard') return;
     const session = chatSessions.find((s) => s.key === sessionKey);
     if (!session) return;
     // Merge with what the record already says: one picker changing must never
     // erase the others, or a refresh would reopen the chat half-picked.
     const options = { ...(session?.options || {}), ...patch };
+    if (clearWorkflow || kindId === 'standard') delete options.workflowId;
+    if (clearRole || kindId === 'standard') delete options.role;
+    if (kindId === 'standard') {
+      options.kind = 'standard';
+      delete options.allowModeOverride;
+      delete options.allowRuleOverride;
+      delete options.allowModelOverride;
+    }
+    const nextProvider = options.provider || session.provider || 'kusa';
+    const nextKind = options.kind || session.kind || 'standard';
+    // Adapter/CAO providers don't use BYOK endpoints; Cursor owns its model list.
+    const cliBacked = nextProvider === 'cursor' || nextProvider === 'copilot'
+      || nextProvider === 'github-copilot';
+    const ownsModels = nextProvider === 'cursor';
+    const top = {
+      provider: nextProvider === 'github-copilot' ? 'copilot' : nextProvider,
+      kind: nextKind,
+      cliBacked,
+      ownsModels,
+      modelsPath: ownsModels ? '/adapters/cursor/models' : null,
+      workspaceTrust: nextProvider === 'cursor'
+        ? (session.workspaceTrust || {
+          path: '/adapters/cursor/trust',
+          label: 'Trust workspace',
+          title: 'Cursor workspace trust required',
+          summary: '',
+        })
+        : null,
+    };
     // Allow / Deny are sticky, so the record carries no expiry at all: nothing
     // here can disagree with a live picker about whether a rule is still in
     // effect, and a refresh reopens the chat on the rule the user chose.
-    setChatSessions((prev) => prev.map((s) => (s.key === sessionKey ? { ...s, options } : s)));
+    setChatSessions((prev) => prev.map((s) => (
+      s.key === sessionKey ? { ...s, ...top, options } : s
+    )));
     try {
-      await persistChatSession({ ...session, options });
+      const saved = await persistChatSession({ ...session, ...top, options });
+      if (saved?.key) {
+        setChatSessions((prev) => prev.map((s) => (
+          s.key === sessionKey
+            ? { ...s, ...saved, live: s.live, status: s.status }
+            : s
+        )));
+      }
     } catch {
       /* the pickers still apply this session; only a refresh could lose them */
     }
@@ -1956,20 +2227,35 @@ export default function App() {
     setPendingDelete({ keys: list });
   }
 
-  async function runDelete() {
+  async function runDelete({ force = false } = {}) {
     const list = pendingDelete?.keys || [];
     if (!list.length || deleteBusy) return;
     const chatKeys = list.filter(isChatSessionKey);
+    // Force only applies after EPLAN_LOCK — otherwise leave the gate as a
+    // normal confirm. Callers that already know plans block can pass force.
+    const forceDelete = force === true || pendingDelete?.code === 'EPLAN_LOCK';
 
     setDeleteBusy(true);
     try {
       const res = await fetch('/sessions', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keys: list }),
+        body: JSON.stringify({ keys: list, ...(forceDelete ? { force: true } : {}) }),
       });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
+        // Plan still owns this Agent — keep the gate open and switch the
+        // confirm button to Force delete (server drops the plan first).
+        if (detail?.code === 'EPLAN_LOCK') {
+          const plans = Array.isArray(detail.plans) ? detail.plans.filter(Boolean) : [];
+          setPendingDelete({
+            keys: list,
+            code: 'EPLAN_LOCK',
+            plans,
+            error: detail?.error || 'Delete the plan first',
+          });
+          return;
+        }
         throw new Error(detail?.error || `HTTP ${res.status}`);
       }
       const body = await res.json().catch(() => ({}));
@@ -2061,6 +2347,8 @@ export default function App() {
   }
 
   const sessionChatFill = Boolean(chatSession) && tab === 'session';
+  const editorOpen = editorTabs.length > 0;
+  const mainFill = (sessionChatFill || editorOpen) && !activeExtensionId;
   const sessionSubTabIds = chatSession
     ? SESSION_SUBTAB_IDS
     : SESSION_SUBTAB_IDS.filter((id) => id !== 'chat');
@@ -2196,12 +2484,23 @@ export default function App() {
     }
     for (const s of chatSessions) byKey.set(s.key, sessionLabel(s));
     const labels = keys.map((key) => byKey.get(key) || key);
+    const plans = Array.isArray(pendingDelete.plans) ? pendingDelete.plans : [];
+    const planLocked = pendingDelete.code === 'EPLAN_LOCK' && plans.length > 0;
+    const planLabels = plans.map((p) => `Plan: ${p.name || p.id}`);
     return {
       open: true,
       title: keys.length === 1 ? `Delete ${labels[0]}` : `Delete ${keys.length} sessions`,
-      detail: 'This removes their session files, task lists, and per-session settings, and cannot be undone.',
-      items: labels,
-      confirmLabel: keys.length === 1 ? 'Delete session' : `Delete ${keys.length} sessions`,
+      detail: planLocked
+        ? (
+          plans.length === 1
+            ? 'A linked plan still owns this Agent. Force delete removes the plan with the session and cannot be undone.'
+            : `${plans.length} linked plans still own these Agents. Force delete removes those plans with the sessions and cannot be undone.`
+        )
+        : 'This removes their session files, task lists, and per-session settings, and cannot be undone.',
+      items: planLocked ? [...labels, ...planLabels] : labels,
+      confirmLabel: planLocked
+        ? (plans.length === 1 ? 'Force delete' : `Force delete (${plans.length} plans)`)
+        : (keys.length === 1 ? 'Delete session' : `Delete ${keys.length} sessions`),
       cancelLabel: keys.length === 1 ? 'Keep it' : 'Keep them',
       error: pendingDelete.error,
     };
@@ -2221,6 +2520,7 @@ export default function App() {
         onSelectLane={selectLane}
         onNewSession={createSession}
         chatSessions={chatSessions}
+        agentsLoading={!chatSessionsReady}
         sessionFilter={sessionFilter}
         onSessionFilterChange={(next) => {
           const normalized = normalizeSessionFilter(next);
@@ -2248,17 +2548,60 @@ export default function App() {
             writeLocal('monitor.sidebar', 'open');
           }
         }}
+        onOpenFile={openWorkspaceFile}
       />
 
-      <main className={`min-w-0 flex-1 ${sessionChatFill && !activeExtensionId ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'}`}>
+      <main
+        ref={mainPaneRef}
+        className={`min-w-0 flex-1 ${mainFill || editorOpen ? 'flex overflow-hidden' : 'overflow-y-auto'}`}
+      >
+        {editorOpen ? (
+          <aside
+            className="editor-drawer-in relative flex h-full min-h-0 shrink-0 flex-col border-r border-gray-800 bg-gray-950"
+            style={{ width: editorDrawerWidth, maxWidth: '60%' }}
+            aria-label="Code editor"
+          >
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuenow={editorDrawerWidth}
+              aria-valuemin={EDITOR_DRAWER_MIN_WIDTH}
+              aria-label="Resize editor width"
+              title="Drag to resize"
+              onPointerDown={beginEditorDrawerResize}
+              className="absolute inset-y-0 -right-0.5 z-10 w-2 cursor-ew-resize touch-none hover:bg-emerald-500/25"
+            />
+            <EditorPaneBoundary>
+              <Suspense
+                fallback={
+                  <div className="flex h-full min-h-0 flex-1 items-center justify-center px-6">
+                    <p className="text-xs text-gray-500">Loading editor…</p>
+                  </div>
+                }
+              >
+                <EditorWorkbench
+                  tabs={editorTabs}
+                  activePath={editorActivePath}
+                  reveal={editorReveal}
+                  theme={theme}
+                  onSelectTab={setEditorActivePath}
+                  onCloseTab={closeEditorTab}
+                  onRevealHandled={() => setEditorReveal(null)}
+                />
+              </Suspense>
+            </EditorPaneBoundary>
+          </aside>
+        ) : null}
         <div
           id={activeExtensionId ? `extension-panel-${activeExtensionId}` : `panel-${tab}`}
           role="tabpanel"
           aria-labelledby={activeExtensionId ? 'sidebar-view-extensions' : `tab-${tab}`}
           className={
-            sessionChatFill && !activeExtensionId
-              ? 'flex min-h-0 flex-1 flex-col'
-              : 'space-y-8 px-6 py-4 pb-6'
+            mainFill
+              ? 'flex min-h-0 min-w-0 flex-1 flex-col'
+              : editorOpen
+                ? 'min-h-0 min-w-0 flex-1 overflow-y-auto space-y-8 px-6 py-4 pb-6'
+                : 'space-y-8 px-6 py-4 pb-6'
           }
         >
           {activeExtensionId ? (
@@ -2291,6 +2634,7 @@ export default function App() {
                   onToggleTool={toggleTool}
                   chatSession={chatSession}
                   peerSessions={peerSessions}
+                  lanes={data?.lanes || null}
                   chatQueue={queueForSession(queueByKey, chatSession?.key)}
                   onSendMessage={sendChatMessage}
                   onQueueMessage={queueFromComposer}
@@ -2299,6 +2643,7 @@ export default function App() {
                   onAsk={resolveChatAsk}
                   onTurnOptions={updateChatTurnOptions}
                   onSessionOptions={updateChatSessionOptions}
+                  onOpenAgent={openAgentSession}
                   agentDefaults={{
                     mode: 'agent',
                     rules: settings.agentApprovalMode || 'ask-deny',
@@ -2387,7 +2732,7 @@ export default function App() {
           {...deleteDialog}
           icon={TrashIcon}
           disabled={deleteBusy}
-          onConfirm={runDelete}
+          onConfirm={() => runDelete()}
           onDismiss={() => setPendingDelete(null)}
         />
       ) : null}

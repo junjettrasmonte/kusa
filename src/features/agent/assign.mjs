@@ -1,7 +1,8 @@
 /**
  * Orchestrator assign tool — spawn a Subagent for a workflow role.
- * Role defaults (provider / mode / prompt template / plan gate) come from
- * `.kusa/workflows/{workflowId}.json` via the parent's session options.
+ * Role defaults (provider / mode / rules / model / prompt template / plan gate)
+ * come from `.kusa/workflows/{workflowId}.json` via the parent's session options.
+ * Kusă Subagent tool gates resolve under the role's `rules`.
  */
 import {
   createSubagent,
@@ -11,6 +12,7 @@ import {
 } from '#features/chat/data/chat-store.mjs';
 import { loadQueues, saveQueues } from '#features/chat/data/queue-store.mjs';
 import { readPlan } from '#features/chat/data/plan-store.mjs';
+import { normalizeApprovalMode } from '#features/agent/approval.mjs';
 import {
   ORCHESTRATOR_ROLE,
   assignableWorkflowRoles,
@@ -18,6 +20,7 @@ import {
   listWorkflows,
   readWorkflow,
   renderRolePrompt,
+  resolveWorkflowModelId,
   workflowRole,
 } from '#features/workflows/store.mjs';
 import { randomBytes } from 'node:crypto';
@@ -74,6 +77,7 @@ function queueEntryId() {
 function enqueuePrompt(dataDir, sessionKey, text, options = {}) {
   const { queued, steering } = loadQueues(dataDir);
   const list = queued.get(sessionKey) || [];
+  const rules = String(options.rules || options.approvalMode || '').trim();
   const entry = {
     id: queueEntryId(),
     text: String(text || '').trim(),
@@ -81,7 +85,9 @@ function enqueuePrompt(dataDir, sessionKey, text, options = {}) {
     options: {
       mode: options.mode || '',
       model: options.model || '',
-      approvalMode: '',
+      // Workflow role Rule — resumeIdleSubagentTurns feeds this into startAssignedTurn.
+      approvalMode: rules || '',
+      ...(rules ? { rules } : {}),
     },
   };
   if (!entry.text) return null;
@@ -167,14 +173,59 @@ export function createAssignTools({
     }
 
     const provider = String(args.provider || roleCfg.provider || 'kusa').trim();
-    const mode = String(args.mode || roleCfg.mode || 'agent').trim().toLowerCase();
+    const orchCfg = workflowRole(dataDir, workflowId, ORCHESTRATOR_ROLE) || {};
+    // Parent composer picks (orchestrator message box) may override role defaults
+    // when allow*Override is true on the target role or the orchestrator role.
+    const parentMode = String(parentConfig.mode || parent?.options?.mode || '').trim().toLowerCase();
+    const parentRules = String(parentConfig.rules || parent?.options?.rules || '').trim().toLowerCase();
+    const parentModel = resolveWorkflowModelId(
+      parentConfig.model || parent?.options?.model || '',
+    );
+    const parentProvider = String(
+      parentConfig.provider || parent?.provider || parent?.options?.provider || 'kusa',
+    ).trim().toLowerCase();
+    const childProvider = provider.trim().toLowerCase();
+    // Model catalogs are per-provider (Kusă BYOK ≠ Cursor --list-models). Never
+    // copy the orchestrator's Kusă pick onto a Cursor/Copilot Subagent.
+    const sameModelCatalog = parentProvider === childProvider;
+    const canOverrideMode = roleCfg.allowModeOverride === true || orchCfg.allowModeOverride === true;
+    const canOverrideRules = roleCfg.allowRuleOverride === true || orchCfg.allowRuleOverride === true;
+    const canOverrideModel = (
+      (roleCfg.allowModelOverride === true || orchCfg.allowModelOverride === true)
+      && sameModelCatalog
+    );
+
+    const mode = String(
+      args.mode
+      || (canOverrideMode && parentMode ? parentMode : '')
+      || roleCfg.mode
+      || 'agent',
+    ).trim().toLowerCase();
     const rendered = renderRolePrompt(roleCfg.promptTemplate, {
       prompt: promptText,
       planName: plan?.name || '',
       planBody: [plan?.overview, plan?.body].filter(Boolean).join('\n\n') || '',
     });
 
-    const model = String(roleCfg.model || args.model || '').trim();
+    // Blank / auto → '' so startAssignedTurn leaves modelOverride unset and the
+    // agent uses that provider's default (Kusă Settings endpoints / Cursor auto).
+    const model = resolveWorkflowModelId(
+      args.model
+      || (canOverrideModel && parentModel ? parentModel : '')
+      || roleCfg.model
+      || '',
+    );
+    // Role Rule is where Kusă tool gates resolve for this Subagent:
+    // ask-deny / ask-allow → human (orchestrator); allow / deny → auto-settle.
+    const rulesRaw = String(
+      args.rules
+      || (canOverrideRules && parentRules ? parentRules : '')
+      || roleCfg.rules
+      || '',
+    ).trim().toLowerCase();
+    const rules = rulesRaw && normalizeApprovalMode(rulesRaw) === rulesRaw
+      ? rulesRaw
+      : '';
     let child;
     try {
       child = createSubagent(dataDir, {
@@ -185,16 +236,28 @@ export function createAssignTools({
         workflowId,
         planId: plan?.id || null,
         mode,
+        rules,
+        model,
       });
     } catch (err) {
       return { ok: false, error: err?.message || String(err), code: err?.code || 'EFAIL' };
     }
 
-    // Stamp model on the child so the merged transcript header can show it
-    // after refresh without re-reading the workflow.
-    if (model) {
+    // Stamp mode / rules / model on the child so resume + merged transcript
+    // header survive refresh without re-reading the workflow.
+    if (mode || rules || model) {
       try {
-        writeSessionConfig(dataDir, child.id, { model }, child.harness, parentId);
+        writeSessionConfig(
+          dataDir,
+          child.id,
+          {
+            ...(mode ? { mode } : {}),
+            ...(rules ? { rules } : {}),
+            ...(model ? { model } : {}),
+          },
+          child.harness,
+          parentId,
+        );
       } catch { /* best-effort */ }
     }
 
@@ -214,6 +277,7 @@ export function createAssignTools({
           prompt: rendered,
           mode,
           model,
+          rules,
           parentId,
           role: roleName,
           planId: plan?.id || null,
@@ -229,6 +293,7 @@ export function createAssignTools({
       queued = enqueuePrompt(dataDir, child.key, rendered, {
         mode,
         model,
+        rules,
       });
     }
 
@@ -242,6 +307,7 @@ export function createAssignTools({
       workflowId,
       planId: plan?.id || null,
       model: model || null,
+      rules: rules || null,
       subagent: {
         id: child.id,
         key: child.key,
@@ -250,6 +316,7 @@ export function createAssignTools({
         role: roleName,
         parentId,
         model: model || null,
+        rules: rules || null,
       },
       queued: Boolean(queued),
       started,

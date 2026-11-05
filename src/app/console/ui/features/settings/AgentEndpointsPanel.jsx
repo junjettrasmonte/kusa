@@ -348,7 +348,7 @@ export function AgentEndpointsPanel({ defaultEndpoint, endpoints, canPersist, on
             disabled={disabled || atLimit}
             placeholder="Acme Proxy"
             resetKey={draft.name}
-            onCommit={(v) => setDraft({ ...draft, name: v })}
+            onCommit={(v) => setDraft((prev) => ({ ...prev, name: v }))}
           />
           <Field
             label="Base URL"
@@ -357,7 +357,7 @@ export function AgentEndpointsPanel({ defaultEndpoint, endpoints, canPersist, on
             disabled={disabled || atLimit}
             placeholder="https://api.acme.test/v1"
             resetKey={draft.baseUrl}
-            onCommit={(v) => setDraft({ ...draft, baseUrl: v })}
+            onCommit={(v) => setDraft((prev) => ({ ...prev, baseUrl: v }))}
           />
           <Field
             label="Models (comma-delimited)"
@@ -366,7 +366,7 @@ export function AgentEndpointsPanel({ defaultEndpoint, endpoints, canPersist, on
             disabled={disabled || atLimit}
             placeholder="model-one, model-two"
             resetKey={draft.models}
-            onCommit={(v) => setDraft({ ...draft, models: v })}
+            onCommit={(v) => setDraft((prev) => ({ ...prev, models: v }))}
           />
           <Field
             label="API key (optional)"
@@ -379,7 +379,7 @@ export function AgentEndpointsPanel({ defaultEndpoint, endpoints, canPersist, on
             onCommit={(v) => {
               const next = String(v || '').trim();
               if (!next) return;
-              setDraft({ ...draft, apiKey: next });
+              setDraft((prev) => ({ ...prev, apiKey: next }));
             }}
           />
           <div className="flex flex-wrap justify-end gap-2">

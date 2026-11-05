@@ -208,6 +208,7 @@ export function ingestTurnEvent(job, ev) {
       relayed: ev.relayed === true,
       sourceAgentId: ev.sourceAgentId || null,
       sourceRole: ev.sourceRole || null,
+      gatePrompt: typeof ev.gatePrompt === 'string' ? ev.gatePrompt : null,
     };
     job.live.parts = applyApprovalToParts(job.live.parts, approval);
     const mirrors = mirrorsFromParts(job.live.parts);
@@ -236,11 +237,44 @@ export function ingestTurnEvent(job, ev) {
       relayed: ev.relayed === true,
       sourceAgentId: ev.sourceAgentId || null,
       sourceRole: ev.sourceRole || null,
+      gatePrompt: typeof ev.gatePrompt === 'string' ? ev.gatePrompt : null,
     };
     job.live.parts = applyAskToParts(job.live.parts, ask);
     const mirrors = mirrorsFromParts(job.live.parts);
     job.live.thinking = mirrors.thinking;
     job.live.tools = mirrors.tools;
+    return;
+  }
+  if (type === 'interrupted') {
+    // Codex/OpenCode soft-steer: freeze the half-finished assistant bubble so
+    // the next completion's content events do not wipe it, and seal thinking
+    // so the re-issue opens a new Thought container instead of overwriting.
+    const text = (typeof ev.text === 'string' && ev.text)
+      || (typeof job.live.text === 'string' ? job.live.text : '')
+      || '';
+    const thinking = (typeof ev.thinking === 'string' && ev.thinking)
+      || (typeof job.live.thinking === 'string' ? job.live.thinking : '')
+      || mirrorsFromParts(job.live.parts).thinking
+      || '';
+    if (text.trim() || thinking.trim()) {
+      job.partials = Array.isArray(job.partials) ? job.partials : [];
+      job.partials.push({
+        id: `partial_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        text: text.trim(),
+        thinking: thinking.trim(),
+        at: Date.now(),
+        interrupted: true,
+      });
+    }
+    const parts = Array.isArray(job.live.parts) ? [...job.live.parts] : [];
+    if (parts.length && parts[parts.length - 1]?.type === 'thinking') {
+      parts.push({ type: 'steer_break' });
+    }
+    job.live = {
+      ...job.live,
+      text: '',
+      parts,
+    };
     return;
   }
   if (type === 'steer' && typeof ev.text === 'string' && ev.text.trim()) {
@@ -429,7 +463,20 @@ export function persistTurnCompletion(dataDir, job, terminal) {
     || job.live?.thinking
     || '';
   const relayFallback = job.relayOnly
-    ? 'Subagent asked for your input.'
+    ? (() => {
+      const lastGate = [...parts].reverse().find((p) => (
+        (p?.type === 'approval' && (p.approval?.gatePrompt || p.approval?.sourceRole))
+        || (p?.type === 'ask' && (p.ask?.gatePrompt || p.ask?.sourceRole))
+      ));
+      const prompt = lastGate?.approval?.gatePrompt || lastGate?.ask?.gatePrompt || '';
+      if (prompt) return `${prompt.replace(/\bis asking\b/i, 'asked')}.`;
+      const role = lastGate?.approval?.sourceRole || lastGate?.ask?.sourceRole || '';
+      if (role) {
+        const titled = String(role).replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+        return `${titled} agent asked for your input.`;
+      }
+      return 'A subagent asked for your input.';
+    })()
     : '';
 
   const usedModel = String(terminal?.model || '').trim();
@@ -457,25 +504,62 @@ export function persistTurnCompletion(dataDir, job, terminal) {
 
   let messages = Array.isArray(session.messages) ? [...session.messages] : [];
 
-  // Steered prompts that landed mid-turn (skip if already present by id/text).
+  // Mid-turn soft-steer timeline: interrupted assistant stubs (kept for the
+  // model and the UI) then the steered user prompts, in arrival order by `at`.
+  const midRows = [];
+  for (const partial of job.partials || []) {
+    if (!partial?.text && !partial?.thinking) continue;
+    midRows.push({
+      kind: 'partial',
+      at: Number(partial.at) || 0,
+      row: {
+        id: partial.id || newMessageId(),
+        role: 'assistant',
+        text: String(partial.text || ''),
+        thinking: String(partial.thinking || ''),
+        at: partial.at || Date.now(),
+        turnId: job.turnId,
+        interrupted: true,
+        backend: terminal?.backend || null,
+      },
+    });
+  }
   for (const steered of job.steered || []) {
     if (!steered?.text) continue;
-    const exists = messages.some(
-      (m) => m.id === steered.id
-        || (m.role === 'user' && m.steered && m.text === steered.text),
-    );
-    if (!exists) {
-      messages.push({
+    midRows.push({
+      kind: 'steer',
+      at: Number(steered.at) || 0,
+      row: {
         id: steered.id || newMessageId(),
         role: 'user',
         text: String(steered.text),
         at: steered.at || Date.now(),
         steered: true,
-      });
-    }
+      },
+    });
+  }
+  midRows.sort((a, b) => a.at - b.at);
+  for (const { kind, row } of midRows) {
+    const exists = kind === 'steer'
+      ? messages.some(
+        (m) => m.id === row.id
+          || (m.role === 'user' && m.steered && m.text === row.text),
+      )
+      : messages.some(
+        (m) => m.id === row.id
+          || (m.role === 'assistant' && m.interrupted && m.text === row.text
+            && m.turnId === job.turnId),
+      );
+    if (!exists) messages.push(row);
   }
 
-  const existingIdx = messages.findIndex((m) => m.role === 'assistant' && m.turnId === job.turnId);
+  // Soft-steer leaves interrupted assistant stubs on the same turnId — those
+  // stay as their own rows; only replace a prior non-interrupted assistant.
+  const existingIdx = messages.findIndex((m) => (
+    m.role === 'assistant'
+    && m.turnId === job.turnId
+    && !m.interrupted
+  ));
   if (existingIdx >= 0) {
     messages[existingIdx] = { ...messages[existingIdx], ...assistantMsg, id: messages[existingIdx].id };
   } else {

@@ -170,23 +170,38 @@ function isExternalSession(session) {
   return true;
 }
 
+/** Map session provider id → harness used by HarnessLogo (icon follows Agent picker). */
+function sessionProviderHarness(session) {
+  const providerId = String(
+    session?.provider
+    || session?.options?.provider
+    || '',
+  ).trim().toLowerCase();
+  if (providerId) {
+    const group = CHAT_PROVIDER_GROUPS.find((g) => (
+      g.id === providerId
+      || g.harness === providerId
+      || (providerId === 'github-copilot' && g.id === 'copilot')
+    ));
+    if (group) return group.harness;
+  }
+  if (typeof session?.harness === 'string' && session.harness.trim()) {
+    return session.harness.trim();
+  }
+  if (typeof session?.key === 'string' && session.key.includes(':')) {
+    return session.key.slice(0, session.key.indexOf(':'));
+  }
+  return 'kusa';
+}
+
 function SessionProviderIcon({ session, className = '' }) {
   const statusKey = session?.archived ? 'archived' : session?.status;
   const color = `${PROVIDER_COLOR[statusKey] || PROVIDER_COLOR.idle}${className ? ` ${className}` : ''}`;
   const external = isExternalSession(session);
   const orchestrated = isOrchestratedSession(session);
-  // Prefer provider/harness on the row (Subagents carry cursor/kusa/… even when
-  // they inherit a parent workflowId).
-  const harness = session?.harness
-    || (typeof session?.provider === 'string' && session.provider.trim()
-      ? session.provider.trim()
-      : null)
-    || (typeof session?.options?.provider === 'string' && session.options.provider.trim()
-      ? session.options.provider.trim()
-      : null)
-    || (typeof session?.key === 'string' && session.key.includes(':')
-      ? session.key.slice(0, session.key.indexOf(':'))
-      : 'kusa');
+  // Prefer provider (Agent picker) over key/harness so a kusa-keyed session
+  // switched to Cursor/Copilot shows that mark without remounting the lane.
+  const harness = sessionProviderHarness(session);
   const baseTitle = orchestrated
     ? 'Orchestrated · chat group'
     : (HARNESS_NAMES[harness] || harness);
@@ -241,17 +256,10 @@ const VIEW_ICONS = {
       <path d="M9 13v2" />
     </svg>
   ),
-  explorer: (
-    <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 4h3.5l1.5 1.5h6v7h-11z" />
-    </svg>
-  ),
-  'search-names': (
-    <svg className="h-[18px] w-[18px]" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <circle cx="7" cy="7" r="3.5" />
-      <path strokeLinecap="round" d="M10 10.5 13.5 14" />
-    </svg>
-  ),
+  explorer: <LucideIcon name="folders" className="h-[18px] w-[18px]" />,
+  search: <LucideIcon name="search" className="h-[18px] w-[18px]" />,
+  // Placeholder — Terminal pane not implemented yet (reminder in the top bar).
+  terminal: <LucideIcon name="terminal" className="h-[18px] w-[18px]" />,
   // lucide `blocks` (icons/blocks.svg), paths verbatim from upstream. 18×18 box
   // on lucide’s 24×24 grid at stroke 2 → 1.5px ink (same as ExtensionIcon).
   extensions: (
@@ -371,6 +379,8 @@ export function Sidebar({
   onSelectLane,
   onNewSession,
   chatSessions = [],
+  /** True until the first /kusa/agents hydrate finishes — hide the list so harness-only rows do not flash ungrouped. */
+  agentsLoading = false,
   sessionFilter = EMPTY_SESSION_FILTER,
   onSessionFilterChange,
   selectMode = false,
@@ -390,16 +400,13 @@ export function Sidebar({
   canPersistExtensions = false,
   activeExtensionId = null,
   onSelectExtension = null,
+  /** Open a workspace file in the main-pane editor (Explorer / Search). */
+  onOpenFile = null,
 }) {
   const harnesses = data?.harnesses || [];
   const [view, setView] = useState(initialSidebarView);
   const [filterOpen, setFilterOpen] = useState(false);
-  const [newSessionOpen, setNewSessionOpen] = useState(false);
-  const [newSessionSub, setNewSessionSub] = useState(null); // 'standard' | 'orchestrated' | null
-  const [workflows, setWorkflows] = useState([]);
-  const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const filterRef = useRef(null);
-  const newSessionRef = useRef(null);
   const filterActive = isSessionFilterActive(sessionFilter);
   const filterLabel = filterSummaryLabel(sessionFilter);
   const sessionsView = view === 'agents';
@@ -409,8 +416,6 @@ export function Sidebar({
     setView(next);
     writeLocal('monitor.sidebarView', next);
     setFilterOpen(false);
-    setNewSessionOpen(false);
-    setNewSessionSub(null);
     if (next !== 'agents' && selectMode) {
       onSelectModeChange?.(false);
       onClearChecked?.();
@@ -418,22 +423,14 @@ export function Sidebar({
   }
 
   useEffect(() => {
-    if (!filterOpen && !newSessionOpen) return undefined;
+    if (!filterOpen) return undefined;
     function onPointerDown(event) {
-      if (filterOpen && filterRef.current && !filterRef.current.contains(event.target)) {
+      if (filterRef.current && !filterRef.current.contains(event.target)) {
         setFilterOpen(false);
-      }
-      if (newSessionOpen && newSessionRef.current && !newSessionRef.current.contains(event.target)) {
-        setNewSessionOpen(false);
-        setNewSessionSub(null);
       }
     }
     function onKeyDown(event) {
-      if (event.key === 'Escape') {
-        setFilterOpen(false);
-        setNewSessionOpen(false);
-        setNewSessionSub(null);
-      }
+      if (event.key === 'Escape') setFilterOpen(false);
     }
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
@@ -441,63 +438,11 @@ export function Sidebar({
       document.removeEventListener('mousedown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [filterOpen, newSessionOpen]);
+  }, [filterOpen]);
 
   useEffect(() => {
-    if (collapsed) {
-      setFilterOpen(false);
-      setNewSessionOpen(false);
-      setNewSessionSub(null);
-    }
+    if (collapsed) setFilterOpen(false);
   }, [collapsed]);
-
-  useEffect(() => {
-    if (!newSessionOpen || newSessionSub !== 'orchestrated') return undefined;
-    let cancelled = false;
-    setWorkflowsLoading(true);
-    // Prefer local `.kusa/workflows` (seeded plan-execute); fall back to CAO.
-    Promise.all([
-      fetch('/kusa/workflows', { headers: { Accept: 'application/json' } })
-        .then(async (res) => {
-          if (!res.ok) return [];
-          const body = await res.json().catch(() => ({}));
-          const list = Array.isArray(body?.workflows) ? body.workflows : [];
-          return list.map((w) => ({
-            id: String(w?.id || w?.name || '').trim(),
-            label: String(w?.label || w?.name || w?.id || '').trim(),
-            provider: typeof w?.provider === 'string' ? w.provider : 'kusa',
-          })).filter((w) => w.id);
-        })
-        .catch(() => []),
-      fetch('/cao/workflows', { headers: { Accept: 'application/json' } })
-        .then(async (res) => {
-          if (!res.ok) return [];
-          const body = await res.json().catch(() => ({}));
-          const list = Array.isArray(body?.workflows) ? body.workflows : Array.isArray(body) ? body : [];
-          return list.map((w) => ({
-            id: String(w?.name || w?.id || '').trim(),
-            label: String(w?.name || w?.id || w?.title || '').trim(),
-            provider: typeof w?.provider === 'string' ? w.provider : null,
-          })).filter((w) => w.id);
-        })
-        .catch(() => []),
-    ])
-      .then(([local, cao]) => {
-        if (cancelled) return;
-        const seen = new Set();
-        const merged = [];
-        for (const w of [...local, ...cao]) {
-          if (seen.has(w.id)) continue;
-          seen.add(w.id);
-          merged.push(w);
-        }
-        setWorkflows(merged);
-      })
-      .finally(() => {
-        if (!cancelled) setWorkflowsLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [newSessionOpen, newSessionSub]);
 
   // Agents list: every chat + monitor-only agent, newest rank first.
   // Dedup by id (and key) so a kusa hook shadow of a cursor/copilot
@@ -783,119 +728,15 @@ export function Sidebar({
             Agents
           </span>
           <div className="ml-auto flex items-center gap-0.5">
-            <div className="relative" ref={newSessionRef}>
-              <ToolIconButton
-                label="New agent"
-                active={newSessionOpen}
-                aria-haspopup="menu"
-                aria-expanded={newSessionOpen}
-                onClick={() => {
-                  setFilterOpen(false);
-                  setNewSessionOpen((open) => !open);
-                  setNewSessionSub(null);
-                }}
-              >
-                <PlusIcon className="h-3.5 w-3.5" />
-              </ToolIconButton>
-              {newSessionOpen && (
-                <div
-                  role="menu"
-                  aria-label="New agent"
-                  className="absolute right-0 top-full z-30 mt-1 min-w-[12rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
-                >
-                  {!newSessionSub ? (
-                    <>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
-                        onClick={() => setNewSessionSub('standard')}
-                      >
-                        <span>Standard Agent</span>
-                        <span className="text-gray-500">›</span>
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
-                        onClick={() => setNewSessionSub('orchestrated')}
-                      >
-                        <span className="flex items-center gap-2">
-                          <LucideIcon name="messages-square" className="h-3.5 w-3.5 text-gray-400" />
-                          Orchestrated Agent
-                        </span>
-                        <span className="text-gray-500">›</span>
-                      </button>
-                    </>
-                  ) : null}
-                  {newSessionSub === 'standard' ? (
-                    <>
-                      <button
-                        type="button"
-                        className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
-                        onClick={() => setNewSessionSub(null)}
-                      >
-                        ‹ Standard Agent
-                      </button>
-                      {CHAT_PROVIDER_GROUPS.map((group) => (
-                        <button
-                          key={group.id}
-                          type="button"
-                          role="menuitem"
-                          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
-                          onClick={() => {
-                            setNewSessionOpen(false);
-                            setNewSessionSub(null);
-                            onNewSession?.({ provider: group.id, kind: 'standard' });
-                          }}
-                        >
-                          <HarnessLogo harness={group.harness} size="h-3.5 w-3.5" />
-                          <span>{group.label}</span>
-                        </button>
-                      ))}
-                    </>
-                  ) : null}
-                  {newSessionSub === 'orchestrated' ? (
-                    <>
-                      <button
-                        type="button"
-                        className="flex w-full items-center gap-1 px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500 hover:text-gray-300"
-                        onClick={() => setNewSessionSub(null)}
-                      >
-                        ‹ Orchestrated Agent
-                      </button>
-                      {workflowsLoading ? (
-                        <p className="px-3 py-2 text-[11px] text-gray-500">Loading workflows…</p>
-                      ) : workflows.length ? (
-                        workflows.map((wf) => (
-                          <button
-                            key={wf.id}
-                            type="button"
-                            role="menuitem"
-                            className="flex w-full items-center px-3 py-1.5 text-left text-xs text-gray-200 hover:bg-gray-800"
-                            onClick={() => {
-                              setNewSessionOpen(false);
-                              setNewSessionSub(null);
-                              onNewSession?.({
-                                provider: wf.provider || 'kusa',
-                                kind: 'orchestrated',
-                                workflowId: wf.id,
-                              });
-                            }}
-                          >
-                            {wf.label || wf.id}
-                          </button>
-                        ))
-                      ) : (
-                        <p className="px-3 py-2 text-[11px] text-gray-500">
-                          No workflows yet. Seeded plan-execute appears after serve starts.
-                        </p>
-                      )}
-                    </>
-                  ) : null}
-                </div>
-              )}
-            </div>
+            <ToolIconButton
+              label="New agent"
+              onClick={() => {
+                setFilterOpen(false);
+                onNewSession?.({ provider: 'kusa', kind: 'standard' });
+              }}
+            >
+              <PlusIcon className="h-3.5 w-3.5" />
+            </ToolIconButton>
             <ToolIconButton
               label={selectMode ? 'Done selecting' : 'Select agents'}
               pressed={selectMode}
@@ -917,8 +758,6 @@ export function Sidebar({
                 aria-haspopup="menu"
                 aria-expanded={filterOpen}
                 onClick={() => {
-                  setNewSessionOpen(false);
-                  setNewSessionSub(null);
                   setFilterOpen((open) => !open);
                 }}
               >
@@ -1036,7 +875,18 @@ export function Sidebar({
           className="flex-1 overflow-y-auto py-2 text-sm"
           aria-label="Agents"
         >
-          {!filteredSessions.length ? (
+          {agentsLoading ? (
+            collapsed ? null : (
+              <div
+                className="flex items-center gap-2 px-3 py-3 text-[11px] text-gray-500 sidebar-label"
+                role="status"
+                aria-live="polite"
+              >
+                <LucideIcon name="loader-circle" className="h-3.5 w-3.5 animate-spin text-gray-500" />
+                Loading agents…
+              </div>
+            )
+          ) : !filteredSessions.length ? (
             collapsed ? null : (
               <p className="px-3 py-2 text-[11px] text-gray-600 sidebar-label">
                 No agents yet. Use + to start one.
@@ -1076,17 +926,18 @@ export function Sidebar({
         </nav>
       ) : (
         <>
-          {!collapsed && (
+          {/* Explorer / Search own their section headers (label + refresh). */}
+          {!collapsed && view !== 'explorer' && view !== 'search' ? (
             <div className="flex h-9 shrink-0 items-center border-b border-gray-800 px-2 sidebar-label">
               <span className="truncate pl-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
                 {SIDEBAR_VIEW_LABELS[view]}
               </span>
             </div>
-          )}
+          ) : null}
           {view === 'explorer' ? (
-            <ExplorerPanel />
-          ) : view === 'search-names' ? (
-            <SearchPanel />
+            <ExplorerPanel onOpenFile={onOpenFile} collapsed={collapsed} />
+          ) : view === 'search' ? (
+            <SearchPanel onOpenFile={onOpenFile} collapsed={collapsed} />
           ) : view === 'extensions' ? (
             <ExtensionsPanel
               canPersist={canPersistExtensions}
@@ -1101,7 +952,11 @@ export function Sidebar({
               aria-labelledby={`sidebar-view-${view}`}
               className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-3 sidebar-label"
             >
-              <p className="text-[11px] leading-relaxed text-gray-600">Coming soon.</p>
+              <p className="text-[11px] leading-relaxed text-gray-600">
+                {view === 'terminal'
+                  ? 'Terminal — not implemented yet.'
+                  : 'Coming soon.'}
+              </p>
             </div>
           )}
         </>

@@ -1,5 +1,5 @@
 /**
- * Workspace plan tools — create / read / update plans shared across Agents.
+ * Workspace plan tools — create / ingest / read / update plans shared across Agents.
  * Plans live in `.kusa/plans/` (not per-session), so the Plan drawer and any
  * Subagent can see the same records. Approval is a status flip (usually from UI);
  * approving continues the orchestrated workflow (assign execution).
@@ -11,8 +11,13 @@ import {
   plansLockingAgentIds,
   readPlan,
   updatePlan,
+  upsertPlanFromSource,
   PLAN_STATUSES,
 } from '#features/chat/data/plan-store.mjs';
+import { parsePlanMarkdown } from '#features/monitor/lib.mjs';
+import { resolveWorkspacePath } from './files.mjs';
+import { basename } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import {
   listChatSessions,
   readChatSession,
@@ -78,6 +83,51 @@ export const PLAN_TOOL_DEFS = [
     },
   },
   {
+    name: 'kusa_plan_ingest',
+    description:
+      'Create or update a workspace plan from a plan file already in the workspace — a repo PLAN.md, a '
+      + 'Cursor *.plan.md, or a .kusa/plans/*.json record. Markdown may carry --- frontmatter '
+      + '(name:, overview:, todos: with id/content/status items); everything after it is the plan body, '
+      + 'and a file without frontmatter is taken as body. A file that matches an existing plan (same path, '
+      + 'or the planId you pass) refreshes that plan instead of creating a duplicate. Use this instead of '
+      + 'pasting a long body into kusa_plan_create.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Workspace-relative plan file to ingest (e.g. PLAN.md, docs/plan.md)',
+        },
+        planId: {
+          type: 'string',
+          description: 'Refresh this specific plan instead of matching the file to one by its source path',
+        },
+        mode: {
+          type: 'string',
+          enum: ['upsert', 'create', 'update'],
+          description:
+            'upsert (default): add a plan when the file is new, refresh it when it is known. '
+            + 'create: refuse if a plan already matches this file. update: refuse unless one matches.',
+        },
+        name: {
+          type: 'string',
+          description: 'Plan title when the file has no frontmatter name (defaults to the file name)',
+        },
+        overview: {
+          type: 'string',
+          description: 'One-paragraph summary when the file has none',
+        },
+        status: {
+          type: 'string',
+          enum: ['draft', 'ready'],
+          description: 'Status for a newly created plan (default ready). Never approved — the human Approves in the UI.',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'kusa_plan_read',
     description: 'Read one workspace plan by id (full body + todos + status).',
     parameters: {
@@ -94,7 +144,8 @@ export const PLAN_TOOL_DEFS = [
     description:
       'Update an existing workspace plan (name, overview, body, todos, status). '
       + 'Prefer status ready when the plan is complete enough for human review. '
-      + 'Do not set approved yourself — that is the Plan drawer Approve action.',
+      + 'Do not set approved yourself — that is the Plan drawer Approve action. '
+      + 'When implementation is finished, prefer kusa_plan_complete over setting status=done here.',
     parameters: {
       type: 'object',
       properties: {
@@ -122,6 +173,28 @@ export const PLAN_TOOL_DEFS = [
         },
       },
       required: ['planId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'kusa_plan_complete',
+    description:
+      'Mark a workspace plan as done after its implementation is finished. '
+      + 'Sets status to done and marks open todos completed. '
+      + 'planId defaults to the plan this Agent was assigned (session planId). '
+      + 'Call this once execution is complete so the Plan drawer shows the plan as done.',
+    parameters: {
+      type: 'object',
+      properties: {
+        planId: {
+          type: 'string',
+          description: 'Plan id. Optional when this Agent was assigned with that planId.',
+        },
+        summary: {
+          type: 'string',
+          description: 'Optional one-line note about what was implemented (returned in the tool result).',
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -430,12 +503,20 @@ function appendParentApprovalNote(dataDir, orchestrator, plan) {
 /**
  * After a human Approves a plan, assign the workflow's execution role on the
  * owning orchestrator (idempotent if execution for this planId already exists).
+ *
+ * Optional overrides from the Plan drawer:
+ * - `prompt` — execution prompt (falls back to plan.executionPrompt / first user prompt)
+ * - `assignToAgentId` — run under / on this Agent instead of the linked orchestrator
+ * - `detachWorkflow` — clear workflowId / orchestratorAgentId before continuing
  */
 export async function continueWorkflowAfterPlanApproval({
   dataDir = '',
   plan = null,
   workspaceRoot = process.cwd(),
   startTurn = null,
+  prompt = '',
+  assignToAgentId = '',
+  detachWorkflow = false,
 } = {}) {
   if (!dataDir || !plan?.id) {
     return { ok: false, error: 'dataDir and plan required', code: 'EINVAL' };
@@ -445,7 +526,22 @@ export async function continueWorkflowAfterPlanApproval({
     return { ok: false, error: `plan status is "${plan.status}" — need approved`, code: 'EPLAN' };
   }
 
-  const orchestrator = resolveOrchestratorForPlan(dataDir, plan);
+  if (detachWorkflow) {
+    try {
+      plan = updatePlan(dataDir, plan.id, {
+        workflowId: '',
+        orchestratorAgentId: '',
+      });
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  const overrideId = String(assignToAgentId || '').trim();
+  let orchestrator = overrideId
+    ? (readChatSession(dataDir, overrideId) || null)
+    : resolveOrchestratorForPlan(dataDir, plan);
+
   if (!orchestrator?.id) {
     return { ok: false, error: 'no orchestrator Agent found for this plan', code: 'ENOENT' };
   }
@@ -461,33 +557,89 @@ export async function continueWorkflowAfterPlanApproval({
   }
 
   // Backfill linkage when the Planner wrote the plan without kusa_plan_create metadata.
-  try {
-    const planner = (Array.isArray(orchestrator.subagents) ? orchestrator.subagents : [])
-      .find((kid) => isPlannerRole(kid?.role));
-    plan = linkPlanToAgents(dataDir, plan, {
-      plannerId: plan.createdByAgentId || planner?.id || '',
-      orchestratorId: orchestrator.id,
-    });
-    if (!plan.workflowId && sessionWorkflowId(orchestrator)) {
-      plan = updatePlan(dataDir, plan.id, { workflowId: sessionWorkflowId(orchestrator) });
+  // Skip when the human explicitly detached or picked a different Agent.
+  if (!detachWorkflow && !overrideId) {
+    try {
+      const planner = (Array.isArray(orchestrator.subagents) ? orchestrator.subagents : [])
+        .find((kid) => isPlannerRole(kid?.role));
+      plan = linkPlanToAgents(dataDir, plan, {
+        plannerId: plan.createdByAgentId || planner?.id || '',
+        orchestratorId: orchestrator.id,
+      });
+      if (!plan.workflowId && sessionWorkflowId(orchestrator)) {
+        plan = updatePlan(dataDir, plan.id, { workflowId: sessionWorkflowId(orchestrator) });
+      }
+    } catch {
+      /* non-fatal */
     }
-  } catch {
-    /* non-fatal */
   }
 
-  const original = firstUserPrompt(orchestrator) || plan.overview || plan.name || plan.id;
-  const sessionKey = orchestrator.key || `kusa:${orchestrator.id}`;
-  const assign = createAssignTools({
-    dataDir,
-    sessionKey,
-    workspaceRoot,
-    startTurn,
-  });
-  const result = await assign.assign({
-    role: 'executor',
-    planId: plan.id,
-    prompt: original,
-  });
+  const promptText = String(prompt || plan.executionPrompt || '').trim()
+    || firstUserPrompt(orchestrator)
+    || plan.overview
+    || plan.name
+    || plan.id;
+
+  if (promptText && promptText !== plan.executionPrompt) {
+    try {
+      plan = updatePlan(dataDir, plan.id, { executionPrompt: promptText });
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  const canAssignExecutor = isOrchestratorSession(orchestrator)
+    || Boolean(sessionWorkflowId(orchestrator));
+
+  let result;
+  if (canAssignExecutor) {
+    const sessionKey = orchestrator.key || `kusa:${orchestrator.id}`;
+    const assign = createAssignTools({
+      dataDir,
+      sessionKey,
+      workspaceRoot,
+      startTurn,
+    });
+    result = await assign.assign({
+      role: 'executor',
+      planId: plan.id,
+      prompt: promptText,
+    });
+  } else if (typeof startTurn === 'function') {
+    // Detached / non-orchestrated Agent: start a turn directly with the plan.
+    const planBlock = [plan.name, plan.overview, plan.body].filter(Boolean).join('\n\n');
+    const composed = [
+      promptText,
+      planBlock ? `\n\n---\nApproved plan (${plan.id}):\n${planBlock}` : '',
+    ].join('').trim();
+    try {
+      result = await startTurn({
+        sessionId: orchestrator.id,
+        queueKey: orchestrator.key || `kusa:${orchestrator.id}`,
+        harness: orchestrator.harness || 'kusa',
+        provider: orchestrator.provider || orchestrator.options?.provider || 'kusa',
+        prompt: composed,
+        mode: orchestrator.options?.mode || 'agent',
+        model: orchestrator.options?.model || '',
+        rules: orchestrator.options?.rules || '',
+        planId: plan.id,
+      });
+      result = {
+        ok: Boolean(result?.ok || result?.started),
+        started: Boolean(result?.started ?? result?.ok),
+        ...(result && typeof result === 'object' ? result : {}),
+        assignedDirectly: true,
+      };
+    } catch (err) {
+      result = { ok: false, error: err?.message || String(err), code: 'EFAIL' };
+    }
+  } else {
+    result = {
+      ok: false,
+      error: 'Selected Agent is not orchestrated and no turn starter is available',
+      code: 'EINVAL',
+    };
+  }
 
   if (result?.ok) {
     appendParentApprovalNote(dataDir, orchestrator, plan);
@@ -502,10 +654,61 @@ export async function continueWorkflowAfterPlanApproval({
     ...result,
     orchestratorId: orchestrator.id,
     planId: plan.id,
+    detached: Boolean(detachWorkflow),
   };
 }
 
-export function createPlanTools({ dataDir = '', sessionKey = '' } = {}) {
+/**
+ * One plan file, read once, for the ingest tool to refuse rather than truncate
+ * silently. Matches the store's own body cap (100k chars) with headroom.
+ */
+const MAX_INGEST_BYTES = 256 * 1024;
+
+/**
+ * Turn a plan file on disk into plan fields: `.json` records are read as-is
+ * (they already carry an id), everything else goes through the Cursor-style
+ * markdown parser (`---` frontmatter + body).
+ */
+function parseIngestedPlanFile(text, absPath) {
+  if (/\.json$/i.test(absPath)) {
+    let raw;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      return { ok: false, error: `plan file is not valid JSON: ${err?.message || String(err)}`, code: 'EINVAL' };
+    }
+    if (!raw || typeof raw !== 'object') {
+      return { ok: false, error: 'plan file JSON must be an object', code: 'EINVAL' };
+    }
+    return {
+      ok: true,
+      id: String(raw.id || '').trim(),
+      name: String(raw.name || '').trim(),
+      overview: String(raw.overview || '').trim(),
+      body: String(raw.body || '').trim(),
+      todos: Array.isArray(raw.todos) ? raw.todos : [],
+    };
+  }
+  const parsed = parsePlanMarkdown(text, absPath);
+  if (!parsed) return { ok: false, error: 'plan file is empty', code: 'EINVAL' };
+  return {
+    ok: true,
+    id: '',
+    name: String(parsed.plan.name || '').trim(),
+    overview: String(parsed.plan.overview || '').trim(),
+    body: String(parsed.plan.body || '').trim(),
+    todos: parsed.todos || [],
+  };
+}
+
+/** "PLAN.md" / "docs/refactor.plan.md" → a title the file itself never gave. */
+function fallbackPlanName(absPath) {
+  const base = basename(String(absPath || ''));
+  const withoutExt = base.replace(/\.(md|markdown|txt|json)$/i, '');
+  return withoutExt || base;
+}
+
+export function createPlanTools({ dataDir = '', sessionKey = '', workspaceRoot = process.cwd() } = {}) {
   function list(args = {}) {
     if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
     let plans = listPlans(dataDir).map(planSummary);
@@ -541,6 +744,77 @@ export function createPlanTools({ dataDir = '', sessionKey = '' } = {}) {
     }
   }
 
+  function ingest(args = {}) {
+    if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
+    const rawPath = String(args.path || '').trim();
+    if (!rawPath) return { ok: false, error: 'path is required (workspace-relative plan file)', code: 'EINVAL' };
+    const mode = ['create', 'update'].includes(String(args.mode || '').trim().toLowerCase())
+      ? String(args.mode).trim().toLowerCase()
+      : 'upsert';
+
+    let target;
+    try {
+      target = resolveWorkspacePath(workspaceRoot, rawPath);
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err), code: err?.code || 'EINVAL' };
+    }
+    if (!existsSync(target.abs)) {
+      return { ok: false, error: `plan file not found: ${target.rel}`, code: 'ENOENT' };
+    }
+    let text;
+    try {
+      text = readFileSync(target.abs, 'utf8');
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err), code: err?.code || 'EISDIR' };
+    }
+    if (text.length > MAX_INGEST_BYTES) {
+      return {
+        ok: false,
+        error: `plan file is too large to ingest (${text.length} chars; cap ${MAX_INGEST_BYTES})`,
+        code: 'EINVAL',
+      };
+    }
+
+    const parsed = parseIngestedPlanFile(text, target.abs);
+    if (!parsed.ok) return parsed;
+
+    const agentId = agentIdFromSessionKey(sessionKey);
+    const config = agentId ? (readSessionConfig(dataDir, agentId) || {}) : {};
+    const orchestratorAgentId = String(config.parentId || '').trim();
+    const requestedStatus = args.status === 'draft' ? 'draft' : 'ready';
+
+    const result = upsertPlanFromSource(dataDir, {
+      id: parsed.id || String(args.planId || '').trim(),
+      sourcePath: target.abs,
+      mode,
+      name: String(args.name || '').trim() || parsed.name || fallbackPlanName(target.abs),
+      overview: String(args.overview || '').trim() || parsed.overview,
+      body: parsed.body,
+      todos: parsed.todos,
+      status: requestedStatus,
+      createdByAgentId: agentId,
+    });
+    if (!result?.ok) return result;
+
+    let plan = result.plan;
+    // A brand-new ingested plan owns the same linkage a kusa_plan_create would have written.
+    if (result.created) {
+      plan = linkPlanToAgents(dataDir, plan, {
+        plannerId: agentId,
+        orchestratorId: orchestratorAgentId,
+      });
+    }
+    return {
+      ok: true,
+      path: target.rel,
+      created: Boolean(result.created),
+      updated: Boolean(result.updated),
+      matchedBy: result.matchedBy || '',
+      plan,
+      ...(result.note ? { note: result.note } : {}),
+    };
+  }
+
   function read(args = {}) {
     if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
     const plan = readPlan(dataDir, args.planId);
@@ -570,11 +844,57 @@ export function createPlanTools({ dataDir = '', sessionKey = '' } = {}) {
     }
   }
 
+  function complete(args = {}) {
+    if (!dataDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
+    const agentId = agentIdFromSessionKey(sessionKey);
+    const config = agentId ? (readSessionConfig(dataDir, agentId) || {}) : {};
+    const planId = String(args.planId || config.planId || '').trim();
+    if (!planId) {
+      return {
+        ok: false,
+        error: 'planId is required (or assign this Agent with a planId first)',
+        code: 'EINVAL',
+      };
+    }
+    const existing = readPlan(dataDir, planId);
+    if (!existing) return { ok: false, error: `plan not found: ${planId}`, code: 'ENOENT' };
+    const status = String(existing.status || '').toLowerCase();
+    if (status === 'done') {
+      return { ok: true, plan: existing, alreadyDone: true };
+    }
+    if (status === 'cancelled') {
+      return { ok: false, error: 'plan is cancelled — cannot mark done', code: 'EPLAN' };
+    }
+    if (status === 'draft' || status === 'ready') {
+      return {
+        ok: false,
+        error: `plan status is "${status}" — approve and execute before completing`,
+        code: 'EPLAN',
+      };
+    }
+    const todos = Array.isArray(existing.todos)
+      ? existing.todos.map((todo) => (
+        todo?.status === 'cancelled'
+          ? todo
+          : { ...todo, status: 'completed' }
+      ))
+      : [];
+    try {
+      const plan = updatePlan(dataDir, planId, { status: 'done', todos });
+      const summary = typeof args.summary === 'string' ? args.summary.trim().slice(0, 2000) : '';
+      return { ok: true, plan, ...(summary ? { summary } : {}) };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err), code: err?.code || 'EINVAL' };
+    }
+  }
+
   function call(name, args = {}) {
     if (name === 'kusa_plan_list' || name === 'plan_list') return list(args);
     if (name === 'kusa_plan_create' || name === 'plan_create') return create(args);
+    if (name === 'kusa_plan_ingest' || name === 'plan_ingest') return ingest(args);
     if (name === 'kusa_plan_read' || name === 'plan_read') return read(args);
     if (name === 'kusa_plan_update' || name === 'plan_update') return update(args);
+    if (name === 'kusa_plan_complete' || name === 'plan_complete') return complete(args);
     return { ok: false, error: `unknown plan tool: ${name}`, code: 'ENOENT' };
   }
 
@@ -583,18 +903,24 @@ export function createPlanTools({ dataDir = '', sessionKey = '' } = {}) {
     call,
     list,
     create,
+    ingest,
     read,
     update,
+    complete,
   };
 }
 
 export function planSystemPromptAddon() {
   return [
-    'Workspace plans are shared across Agents via kusa_plan_list / kusa_plan_create /',
-    'kusa_plan_read / kusa_plan_update. When planning work, write the plan with these tools',
-    'so it appears in the Plan drawer. Humans Approve plans in the UI — never set status',
-    'to approved yourself. After approval, an Orchestrator may kusa_assign role=executor',
-    'with that planId.',
+    'Workspace plans are shared across Agents via kusa_plan_list / kusa_plan_create / kusa_plan_ingest /',
+    'kusa_plan_read / kusa_plan_update / kusa_plan_complete. When planning work, write the',
+    'plan with these tools so it appears in the Plan drawer. Humans Approve plans in the UI',
+    '— never set status to approved yourself. After approval, an Orchestrator may kusa_assign',
+    'role=executor with that planId. When implementation is finished, call kusa_plan_complete',
+    'so the Plan drawer marks the plan done (planId is optional if this Agent was assigned that plan). '
+    + 'When the plan already exists as a file in the workspace (PLAN.md, a *.plan.md, a .kusa/plans/*.json), '
+    + 'ingest it with kusa_plan_ingest instead of pasting its body into kusa_plan_create — the same file '
+    + 'refreshes the same plan, it never creates a duplicate.',
   ].join(' ');
 }
 

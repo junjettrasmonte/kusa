@@ -252,7 +252,10 @@ export function createTrailAwareTools(
     sessionKey,
     ask: (prompt, callId) => ask.call('kusa_ask', prompt, callId),
   });
-  const plans = createPlanTools({ dataDir, sessionKey });
+  // workspaceRoot is needed by kusa_plan_ingest: it reads a plan file from the
+  // workspace, so the tool resolves that path against the same sandbox the file
+  // tools use (never an absolute jump out of the tree).
+  const plans = createPlanTools({ dataDir, sessionKey, workspaceRoot });
   const assign = createAssignTools({
     dataDir,
     sessionKey,
@@ -260,13 +263,15 @@ export function createTrailAwareTools(
     startTurn: onAssignTurn,
   });
   // One-turn provider handoff for orchestrated Agents only; awaits the result
-  // so the caller resumes with the other provider's reply.
+  // so the caller resumes with the other provider's reply. Shares the same
+  // approval gate as terminal/browse so Rules apply to escalations too.
   const escalate = createEscalateTools({
     dataDir,
     sessionKey,
     workspaceRoot,
     runTurn: onEscalateTurn,
     signal,
+    approval,
   });
   // Session naming owns the same per-session sidecar the task tools write, so it
   // takes the same dataDir / sessionKey pair: absent, the name stays unpersisted
@@ -315,7 +320,7 @@ export function createTrailAwareTools(
     }
 
     // Workspace plans are not Trail-gated (shared JSON under .kusa/plans/).
-    if (/^kusa_plan_|^(plan_list|plan_create|plan_read|plan_update)$/.test(name)) {
+    if (/^kusa_plan_|^(plan_list|plan_create|plan_ingest|plan_read|plan_update|plan_complete)$/.test(name)) {
       return plans.call(name, args, callId);
     }
 

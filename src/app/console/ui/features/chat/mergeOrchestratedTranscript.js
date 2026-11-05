@@ -23,16 +23,85 @@ export function transcriptLaneKey(msg) {
 }
 
 /**
- * True when `msg` starts a handoff section relative to `prev`: a Delegated
- * marker, or a switch to another agent lane (assign / escalate / return).
+ * True when `msg` starts a handoff section relative to `prev`: a switch to
+ * another agent lane (assign / escalate / return). Delegated briefs are folded
+ * into the orchestrator's turn as fine-print stubs — they are not sections.
  */
 export function isTranscriptHandoff(prev, msg) {
-  if (!msg) return false;
-  if (msg.role === 'delegate' || msg.role === 'meta') return true;
-  if (!prev) return false;
+  if (!msg || !prev) return false;
+  if (msg.role === 'delegate' || msg.role === 'meta') return false;
   const from = transcriptLaneKey(prev);
   const to = transcriptLaneKey(msg);
   return Boolean(from && to && from !== to);
+}
+
+/** One fine-print stub describing a handoff that belongs on the caller turn. */
+export function delegateStubFromMessage(msg) {
+  if (!msg) return null;
+  const roleLabel = String(
+    msg.roleLabel
+    || msg.speaker?.role
+    || 'agent',
+  ).trim() || 'agent';
+  return {
+    id: msg.id || '',
+    roleLabel,
+    text: typeof msg.text === 'string' ? msg.text : '',
+    speaker: msg.speaker || null,
+  };
+}
+
+/**
+ * Fold standalone `delegate` / `meta` rows into the prior caller assistant turn
+ * as `delegates: […]` fine-print stubs. Leftovers (no host yet — e.g. parent
+ * still streaming) stay as `role: 'delegate'` for the live turn to peel.
+ */
+export function foldDelegatesIntoTurns(messages = []) {
+  const out = [];
+  for (const msg of messages || []) {
+    if (!msg || (msg.role !== 'delegate' && msg.role !== 'meta')) {
+      if (msg) out.push(msg);
+      continue;
+    }
+    const stub = delegateStubFromMessage(msg);
+    if (!stub) continue;
+    const childLane = transcriptLaneKey(msg);
+    let host = -1;
+    for (let i = out.length - 1; i >= 0; i -= 1) {
+      const row = out[i];
+      if (row?.role !== 'assistant') continue;
+      const lane = transcriptLaneKey(row);
+      // Attach to the agent who handed off — never onto the child's own lane.
+      if (childLane && lane && lane === childLane) continue;
+      host = i;
+      break;
+    }
+    if (host < 0) {
+      out.push(msg);
+      continue;
+    }
+    const target = out[host];
+    const delegates = [...(Array.isArray(target.delegates) ? target.delegates : []), stub];
+    out[host] = { ...target, delegates };
+  }
+  return out;
+}
+
+/**
+ * Peel trailing unhosted delegate rows (parent still streaming when assign
+ * fired). Caller attaches them to the live orchestrator ChatTurn.
+ */
+export function peelTrailingDelegates(messages = []) {
+  const rest = Array.isArray(messages) ? messages.slice() : [];
+  const trailing = [];
+  while (rest.length) {
+    const last = rest[rest.length - 1];
+    if (last?.role !== 'delegate' && last?.role !== 'meta') break;
+    rest.pop();
+    const stub = delegateStubFromMessage(last);
+    if (stub) trailing.unshift(stub);
+  }
+  return { messages: rest, delegates: trailing };
 }
 
 export function speakerFromSession(session) {
@@ -75,7 +144,14 @@ function isRelayOnlyAssistant(msg) {
   if (!msg || msg.role !== 'assistant') return false;
   if (msg.relayOnly === true) return true;
   const text = typeof msg.text === 'string' ? msg.text.trim() : '';
-  if (text === 'Subagent asked for your input.') return true;
+  // Parent relay shell completions (legacy + role-attributed).
+  if (
+    text === 'Subagent asked for your input.'
+    || text === 'A subagent asked for your input.'
+    || /agent asked for your input\.?$/i.test(text)
+  ) {
+    return true;
+  }
   const parts = Array.isArray(msg.parts) ? msg.parts : [];
   if (!parts.length) return false;
   // Parent relay shells are approval/ask parts stamped relayed — drop them so
@@ -180,7 +256,9 @@ export function mergeOrchestratedMessages(parent, children = []) {
     if (diff !== 0) return diff;
     return String(a.id).localeCompare(String(b.id));
   });
-  return items;
+  // Delegated briefs belong on the orchestrator turn as fine print — not as
+  // their own transcript sections (those start at the child's reply).
+  return foldDelegatesIntoTurns(items);
 }
 
 /**

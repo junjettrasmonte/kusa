@@ -1,4 +1,18 @@
-import { DrawerCloseIcon, DrawerDockIcon } from './ChatGlyphs.jsx';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
+
+/**
+ * One glyph box and one chip for every drawer header action, exported so a
+ * drawer that supplies its own actions through `headerStart` / `headerEnd`
+ * (Plans adds + / refresh / filter) cannot drift from the dock and close this
+ * control owns: identical 18×18 glyphs (lucide 24 grid, stroke 2 → ~1.5px ink)
+ * inside identical 24×24 chips, one gap between them. Prefer a Fragment for
+ * `headerEnd` so every chip is a direct sibling on this row — a nested flex
+ * wrapper shifts baseline alignment against dock/close.
+ */
+export const DRAWER_ICON_SIZE = 'h-[18px] w-[18px]';
+
+export const DRAWER_ICON_BTN =
+  'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-gray-500 hover:bg-gray-800/70 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50';
 
 /**
  * Shared machinery for the composer's popup lists — the Prompt Queue, the Task
@@ -131,6 +145,10 @@ export function PopupList({
   // the list fills that box instead of applying a fixed pixel cap here.
   maxHeightPx: _maxHeightPx,
   summary = '',
+  // Optional leading control in the same row as dock/close (e.g. plan back).
+  headerStart = null,
+  // Optional controls immediately before dock/close (e.g. Refresh).
+  headerEnd = null,
   ariaLabel,
   dock = 'bottom',
   onDockToggle = null,
@@ -140,27 +158,27 @@ export function PopupList({
   if (!expanded || !count) return null;
   const right = dock === 'right';
   const dockLabel = right ? 'Dock to bottom' : 'Dock to right';
-  const headerBtn =
-    'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-gray-500 hover:bg-gray-800/70 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50';
   return (
     <div
       className={
         right
-          ? 'flex h-full min-h-0 flex-1 flex-col border-0 bg-transparent px-3 pt-3 pb-1.5'
-          : 'mx-2.5 -mb-px flex h-full min-h-0 flex-col rounded-t-xl border border-gray-800 bg-gray-950/70 px-4 sm:px-6 pt-3 pb-1.5'
+          ? 'relative flex h-full min-h-0 flex-1 flex-col border-0 bg-transparent px-3 pt-3 pb-1.5'
+          : 'relative mx-2.5 -mb-px flex h-full min-h-0 flex-col rounded-t-xl border border-gray-800 bg-gray-950/70 px-4 sm:px-6 pt-3 pb-1.5'
       }
     >
-      <div className="flex shrink-0 items-center gap-1">
-        <p className="min-w-0 flex-1 truncate text-[10px] text-gray-500">{summary}</p>
+      <div className="flex h-6 shrink-0 items-center gap-1">
+        {headerStart}
+        <p className="min-w-0 flex-1 truncate text-[10px] leading-6 text-gray-500">{summary}</p>
+        {headerEnd}
         {onDockToggle ? (
           <button
             type="button"
             title={dockLabel}
             aria-label={dockLabel}
             onClick={() => onDockToggle()}
-            className={headerBtn}
+            className={DRAWER_ICON_BTN}
           >
-            <DrawerDockIcon dock={dock} />
+            <LucideIcon name={right ? 'panel-bottom' : 'panel-right'} className={DRAWER_ICON_SIZE} />
           </button>
         ) : null}
         {onClose ? (
@@ -169,14 +187,14 @@ export function PopupList({
             title="Close"
             aria-label="Close drawer"
             onClick={() => onClose()}
-            className={headerBtn}
+            className={DRAWER_ICON_BTN}
           >
-            <DrawerCloseIcon />
+            <LucideIcon name="x" className={DRAWER_ICON_SIZE} />
           </button>
         ) : null}
       </div>
       <div
-        className="mt-0.5 flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto"
+        className="relative mt-0.5 flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto"
         role="list"
         aria-label={ariaLabel}
       >

@@ -251,6 +251,15 @@ export function agentErrorDisplayText(msgOrText) {
       ? raw
       : `${raw}\n\nCursor Agent could not verify TLS (often HTTP_PROXY). Retry — kusa now strips proxy for Cursor/Copilot spawns.`;
   }
+  // Native Kusă → OpenAI-compatible endpoint TLS failures (undici "fetch failed").
+  if (
+    (typeof msgOrText === 'object' && msgOrText?.code === 'ETLS')
+    || /UNABLE_TO_VERIFY|TLS to model endpoint failed|unable to get local issuer/i.test(raw)
+  ) {
+    return raw.includes('NODE_EXTRA_CA_CERTS')
+      ? raw
+      : `${raw}\n\nThe model host’s certificate is not trusted by Node. Install the issuer CA or set NODE_EXTRA_CA_CERTS to a PEM bundle, then restart kusa serve.`;
+  }
   return raw || 'Something went wrong talking to the model.';
 }
 

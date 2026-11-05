@@ -204,7 +204,9 @@ export function QueueStack({ held, steering, sessionKey, onQueue, expanded = tru
 }
 
 /**
- * One held prompt. "Send now" moves it into the running turn — the loop polls
+ * One held prompt. "Send now" soft-steers the running turn (Codex/OpenCode):
+ * soft-cancel the in-flight completion, keep partial text + thinking, skip
+ * tools not yet started, inject before the next model call. The loop polls
  * the queue per streamed chunk, so the prompt interrupts the model call in
  * flight and the agent reacts to it right away; "Edit" rewrites the held text
  * in place — same id, same position, same carried options — so the user can fix

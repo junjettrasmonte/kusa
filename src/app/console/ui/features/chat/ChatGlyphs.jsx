@@ -266,12 +266,18 @@ export function LiveChatIcon({ expanded = true, className = 'text-gray-500' }) {
  * Drawer dock toggle — lucide `panel-right` / `panel-bottom`. Shows the
  * destination the click will move to (not the current dock), so a bottom-docked
  * drawer offers "dock to the right" and a right-docked drawer offers bottom.
+ * Drawn on the lucide 24 grid at stroke 2 in an 18×18 box — the same glyph box
+ * the drawer header's other actions use (see DRAWER_ICON_SIZE in PopupList.jsx).
  */
-export function DrawerDockIcon({ dock = 'bottom', className = 'text-gray-500' }) {
+export function DrawerDockIcon({
+  dock = 'bottom',
+  className = 'text-gray-500',
+  size = 'h-[18px] w-[18px]',
+}) {
   const toRight = dock !== 'right';
   return (
     <svg
-      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      className={`block ${size} shrink-0 ${className}`}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -286,11 +292,16 @@ export function DrawerDockIcon({ dock = 'bottom', className = 'text-gray-500' })
   );
 }
 
-/** Small × for closing a drawer list (same size as DrawerDockIcon). */
-export function DrawerCloseIcon({ className = 'text-gray-500' }) {
+/**
+ * × for closing a drawer list. Same 18×18 box and 24-grid stroke 2 as
+ * DrawerDockIcon, so every glyph in a drawer header is one equal square.
+ * PopupList prefers LucideIcon `x` so the plan drawer header shares one
+ * renderer; keep this export for any non-drawer callers.
+ */
+export function DrawerCloseIcon({ className = 'text-gray-500', size = 'h-[18px] w-[18px]' }) {
   return (
     <svg
-      className={`h-3.5 w-3.5 shrink-0 ${className}`}
+      className={`block ${size} shrink-0 ${className}`}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"

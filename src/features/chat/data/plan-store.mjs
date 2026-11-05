@@ -72,6 +72,10 @@ export function normalizePlan(raw) {
     /** Orchestrated parent Agent that owns the planner Subagent (if any). */
     orchestratorAgentId: String(raw.orchestratorAgentId || '').trim().slice(0, 120),
     workflowId: String(raw.workflowId || '').trim().slice(0, 200),
+    /** Prompt sent with Approve → assign / execute (editable in the Plan drawer). */
+    executionPrompt: String(raw.executionPrompt || '').trim().slice(0, 20_000),
+    /** Origin path when intercepted from CreatePlan / `*.plan.md` (dedupe key). */
+    sourcePath: String(raw.sourcePath || '').trim().slice(0, 500),
     createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(),
     updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now(),
   };
@@ -133,9 +137,143 @@ export function createPlan(monitorDir, input = {}) {
     createdByAgentId: input.createdByAgentId || input.createdBySessionId || '',
     orchestratorAgentId: input.orchestratorAgentId || '',
     workflowId: input.workflowId || '',
+    executionPrompt: input.executionPrompt || '',
+    sourcePath: input.sourcePath || '',
     createdAt: now,
     updatedAt: now,
   });
+}
+
+/**
+ * Resolve which workspace plan an external source belongs to — an explicit planId,
+ * otherwise the plan already stamped with the same `sourcePath` — then create or
+ * refresh it. Shared by the monitor's lane capture and `kusa_plan_ingest`, so a
+ * plan file on disk and a captured CreatePlan land in the same record.
+ * @param {object} input { id?, sourcePath?, mode?: 'upsert'|'create'|'update', name, overview, body, todos, status, createdByAgentId }
+ * @returns {{ ok, plan?, created?, updated?, matchedBy?, error?, code? }}
+ */
+export function upsertPlanFromSource(monitorDir, input = {}) {
+  if (!monitorDir) return { ok: false, error: 'no data dir', code: 'ENOENT' };
+  const mode = ['create', 'update'].includes(String(input.mode || '').trim().toLowerCase())
+    ? String(input.mode).trim().toLowerCase()
+    : 'upsert';
+  const sourcePath = String(input.sourcePath || '').trim().slice(0, 500);
+  const explicitId = String(input.id || '').trim();
+  const agentId = String(input.createdByAgentId || '').trim();
+  const name = String(input.name || '').trim();
+  const overview = String(input.overview || '').trim();
+  const body = String(input.body || '').trim();
+  const todos = Array.isArray(input.todos) ? input.todos : [];
+  if (!name && !overview && !body && !todos.length) {
+    return { ok: false, error: 'plan source carries no name, overview, body, or todos', code: 'EINVAL' };
+  }
+
+  let existing = null;
+  let matchedBy = '';
+  if (explicitId) {
+    const byId = readPlan(monitorDir, explicitId);
+    if (byId) {
+      existing = byId;
+      matchedBy = 'planId';
+    }
+  }
+  if (!existing && sourcePath) {
+    const byPath = listPlans(monitorDir).find((plan) => plan.sourcePath && plan.sourcePath === sourcePath);
+    if (byPath) {
+      existing = byPath;
+      matchedBy = 'sourcePath';
+    }
+  }
+
+  const label = sourcePath || explicitId || 'this source';
+
+  if (existing) {
+    if (mode === 'create') {
+      return {
+        ok: false,
+        error: `a plan already matches ${label} (${existing.id}) — pass mode "upsert" to refresh it`,
+        code: 'EEXISTS',
+        existing: planSummary(existing),
+      };
+    }
+    const status = String(existing.status || 'draft');
+    const editable = status === 'draft' || status === 'ready';
+    // Only refresh content while the human has not moved past ready: an approved /
+    // executing plan is being run, so a re-read of the file must not rewrite it.
+    const patch = editable
+      ? {
+        name: name || existing.name,
+        overview: overview || existing.overview,
+        body: body || existing.body,
+        ...(todos.length ? { todos } : {}),
+        ...(sourcePath ? { sourcePath } : {}),
+        ...(agentId && !existing.createdByAgentId ? { createdByAgentId: agentId } : {}),
+      }
+      : {
+        ...(agentId && !existing.createdByAgentId ? { createdByAgentId: agentId } : {}),
+        ...(sourcePath && !existing.sourcePath ? { sourcePath } : {}),
+      };
+    try {
+      const plan = updatePlan(monitorDir, existing.id, patch);
+      return {
+        ok: true,
+        plan,
+        updated: true,
+        matchedBy,
+        ...(editable ? {} : { note: `plan is "${status}" — content left untouched, only linkage refreshed` }),
+      };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err), code: err?.code || 'EINVAL' };
+    }
+  }
+
+  if (mode === 'update') {
+    return {
+      ok: false,
+      error: `no workspace plan matches ${label} — pass mode "create" (or "upsert") to add one`,
+      code: 'EPLAN',
+      ...(sourcePath ? { sourcePath } : {}),
+    };
+  }
+
+  try {
+    const plan = createPlan(monitorDir, {
+      id: explicitId,
+      name: name || 'Untitled plan',
+      overview,
+      body,
+      todos,
+      status: input.status || 'ready',
+      createdByAgentId: agentId,
+      sourcePath,
+    });
+    return { ok: true, plan, created: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err), code: err?.code || 'EINVAL' };
+  }
+}
+
+/**
+ * Upsert a workspace plan from a monitor lane's intercepted CreatePlan /
+ * `*.plan.md` snapshot so external (Cursor IDE) sessions land in the Plan drawer.
+ * Stamps `lane.plan.workspacePlanId` for stable updates on later edits.
+ */
+export function upsertPlanFromLaneCapture(monitorDir, lane) {
+  if (!monitorDir || !lane?.plan || typeof lane.plan !== 'object') return null;
+  const snap = lane.plan;
+  const result = upsertPlanFromSource(monitorDir, {
+    id: String(snap.workspacePlanId || '').trim(),
+    sourcePath: String(snap.path || '').trim(),
+    name: String(snap.name || '').trim(),
+    overview: String(snap.overview || '').trim(),
+    body: String(snap.body || '').trim(),
+    todos: Array.isArray(lane.todos) ? lane.todos : (Array.isArray(snap.todos) ? snap.todos : []),
+    status: 'ready',
+    createdByAgentId: String(lane.id || '').trim(),
+  });
+  if (!result?.ok) return null;
+  snap.workspacePlanId = result.plan.id;
+  return result.plan;
 }
 
 export function updatePlan(monitorDir, planId, patch = {}) {
@@ -188,6 +326,8 @@ export function planSummary(plan) {
     createdByAgentId: plan.createdByAgentId,
     orchestratorAgentId: plan.orchestratorAgentId,
     workflowId: plan.workflowId,
+    executionPrompt: plan.executionPrompt || '',
+    sourcePath: plan.sourcePath || '',
   };
 }
 

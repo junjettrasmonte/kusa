@@ -34,13 +34,20 @@
  *   PUT /kusa/agents          upsert one `{ session }` or many `{ sessions }`
  *   POST /kusa/agents/migrate import legacy browser-local chats
  *   GET /kusa/workflows         local orchestration workflow configs (.kusa/workflows)
+ *   GET/PUT /kusa/workflows/:id  one workflow (PUT saves role→profile bindings)
+ *   GET /kusa/workflows/:id/graph  LangGraph drawable nodes/edges (React Flow preview)
+ *   GET/POST /kusa/agent-profiles  central agent profiles (.kusa/agent-profiles)
+ *   GET/PUT/DELETE /kusa/agent-profiles/:id
  *   GET/POST /kusa/plans        workspace plans (.kusa/plans); GET/PUT /kusa/plans/:id
  *   GET /kusa/tools   the tool set the Kusă agent advertises for a chat session
  *   GET /kusa/models  models every active endpoint has, grouped by endpoint / provider name (for the picker)
  *   GET /git          live working-copy status (git status for the workspace)
  *   GET /trail        live Trail CLI + .trail/cache readiness
  *   GET /files        workspace file tree (sidebar Explorer view; ?depth= ?entries=)
- *   GET /search       workspace file-name search (sidebar File names pane; ?q= required, ?path= scope)
+ *   GET /files/rev    cheap tree generation (Explorer soft-refresh; create/delete bumps)
+ *   GET /search       workspace file-name search (?q= required, ?path= scope)
+ *   GET /grep         workspace content search (sidebar Search; ?q= + flags)
+ *   POST /grep/replace  content replace across matches (dryRun supported)
  *   GET /ready        combined git + trail readiness (dashboard load check)
  *   GET /health       lightweight serve-up probe (PWA splash; no auth; live:true under --live)
  *   GET /auth/status  console auth gate status
@@ -83,13 +90,22 @@ import {
   listAgentModelGroups,
   normalizeAgentMode,
   normalizeApprovalMode,
+  readStrataContext,
+  resolveAgentEndpoint,
   resolveTrailPolicy,
   requestSessionName,
   runKusaAgent,
+  supportsVision,
   trailNotReadyMessage,
 } from '#features/agent/index.mjs';
 import { collectWorkspaceTree } from '#features/explorer/tree.mjs';
+import { getWorkspaceTreeRev } from '#features/explorer/tree-rev.mjs';
 import { searchWorkspaceFiles } from '#features/explorer/search.mjs';
+import {
+  replaceWorkspaceContent,
+  searchWorkspaceContent,
+} from '#features/explorer/content-search.mjs';
+import { readWorkspaceFile, writeWorkspaceFile } from '#features/explorer/file.mjs';
 import {
   createChatSession,
   listChatSessions,
@@ -132,12 +148,32 @@ import {
 } from '#features/chat/data/plan-store.mjs';
 import {
   claimUnownedPlansForAgent,
-  continueWorkflowAfterPlanApproval,
   plansBlockingAgentDelete,
   resolveAgentDeleteKeys,
 } from '#features/agent/plans.mjs';
-import { listWorkflows, ensureWorkflowsSeeded } from '#features/workflows/store.mjs';
-import { supportsVision } from '#features/agent/index.mjs';
+import {
+  listWorkflows,
+  ensureWorkflowsSeeded,
+  readWorkflow,
+  readWorkflowSource,
+  writeWorkflow,
+  workflowRoleAgentLabel,
+  workflowRoleGatePrompt,
+} from '#features/workflows/store.mjs';
+import {
+  deleteAgentProfile,
+  ensureAgentProfilesSeeded,
+  listAgentProfiles,
+  readAgentProfile,
+  writeAgentProfile,
+} from '#features/agent-profiles/store.mjs';
+import {
+  drawableWorkflowGraph,
+  isPlanExecuteOrchestrator,
+  isSessionAwaitingPlanApproval,
+  onOrchestratorTurnSettled,
+  resumeAfterPlanApproval,
+} from '#features/workflows/langgraph/index.mjs';
 import {
   buildProfileDocument,
   collectCaoStatus,
@@ -405,9 +441,16 @@ export function createMonitorServer({
     const job = turnJobs.get(parentKey);
     if (!job?.relayOnly || job.terminal) return;
     if (parentRelayHasPendingGates(job)) return;
+    const parts = Array.isArray(job?.live?.parts) ? job.live.parts : [];
+    const lastGate = [...parts].reverse().find((p) => (
+      (p?.type === 'approval' && p.approval?.sourceRole)
+      || (p?.type === 'ask' && p.ask?.sourceRole)
+    ));
+    const role = lastGate?.approval?.sourceRole || lastGate?.ask?.sourceRole || '';
+    const who = workflowRoleAgentLabel(role);
     finishTurnJob(parentKey, {
       type: 'done',
-      text: 'Subagent asked for your input.',
+      text: `${who} asked for your input.`,
       relayOnly: true,
     });
   };
@@ -420,11 +463,43 @@ export function createMonitorServer({
     const parentId = parentKey.includes(':')
       ? parentKey.slice(parentKey.indexOf(':') + 1)
       : parentKey;
+    const status = String(ev?.status || 'pending').toLowerCase();
+    const pending = status === 'pending';
+    // Workflow / session Rule of Allow or Deny settles inside the gate with no
+    // human wait (decision mode-allow / mode-deny). Do not open an orchestrator
+    // relay shell for those — only mirror a settle onto a shell already waiting
+    // on a prior ask-* pending gate.
+    const existingRelay = turnJobs.get(parentKey);
+    const relayShellOpen = Boolean(existingRelay?.relayOnly && !existingRelay.terminal);
+    if (!pending) {
+      if (!relayShellOpen) return;
+      let role = '';
+      try {
+        role = String(readSessionConfig(dataDir, childSessionId)?.role || '').trim();
+      } catch { /* ignore */ }
+      const relayed = {
+        ...ev,
+        sourceAgentId: String(childSessionId || ''),
+        sourceQueueKey: String(childQueueKey || ''),
+        sourceRole: role,
+        relayed: true,
+        gatePrompt: null,
+      };
+      ingestTurnEvent(existingRelay, relayed);
+      broadcastTurn(existingRelay, type, relayed);
+      maybeFinishParentRelayJob(parentKey);
+      return;
+    }
     let role = '';
     try {
       role = String(readSessionConfig(dataDir, childSessionId)?.role || '').trim();
     } catch { /* ignore */ }
-    const tag = role ? `Subagent · ${role}` : 'Subagent';
+    const kind = type === 'ask_request' ? 'ask' : 'approval';
+    const tag = workflowRoleGatePrompt(role, kind);
+    const alreadyTagged = (text) => {
+      const s = String(text || '');
+      return s.startsWith('[') && (s.includes('asking for an approval') || s.includes('asking a question') || s.startsWith('[Subagent'));
+    };
     const parentJob = ensureParentRelayJob(parentKey, parentId);
     const relayed = {
       ...ev,
@@ -432,18 +507,17 @@ export function createMonitorServer({
       sourceQueueKey: String(childQueueKey || ''),
       sourceRole: role,
       relayed: true,
-      ...(typeof ev.message === 'string' && ev.message && !ev.message.startsWith('[Subagent')
+      // Only pending human waits: "Executor agent is asking for an approval"
+      gatePrompt: tag,
+      ...(typeof ev.message === 'string' && ev.message && !alreadyTagged(ev.message)
         ? { message: `[${tag}] ${ev.message}` }
         : {}),
-      ...(typeof ev.question === 'string' && ev.question && !ev.question.startsWith('[Subagent')
+      ...(typeof ev.question === 'string' && ev.question && !alreadyTagged(ev.question)
         ? { question: `[${tag}] ${ev.question}` }
         : {}),
     };
     ingestTurnEvent(parentJob, relayed);
     broadcastTurn(parentJob, type, relayed);
-    if (ev.status && ev.status !== 'pending') {
-      maybeFinishParentRelayJob(parentKey);
-    }
   };
 
   // Composer message queue (Cursor/Copilot style). While a turn is running for a
@@ -454,8 +528,11 @@ export function createMonitorServer({
   //              flushes them in order as follow-up turns (action=take).
   //   parked   — workspace-shared (WORKSPACE_QUEUE_KEY). Any session can resume
   //              or send them; flush skips them until resumed onto a session.
-  //   steering — "send now". Per-session; the running loop polls these while it
-  //              runs (onSteer below) and injects them the moment they arrive.
+  //   steering — "send now" (Codex/OpenCode soft-steer). Per-session; the
+  //              running loop polls these per streamed chunk and after each
+  //              tool, soft-cancels the in-flight completion (keeps partial
+  //              text + thinking), skips tools not yet started, and injects
+  //              the prompt before the next model call. Stop stays separate.
   // Hydrated from each session's `queues.json` (held/steering) plus shared
   // `kusa/queues.json` (parked only) so a serve restart keeps queues
   // (steering folds into that session's held on cold load).
@@ -555,6 +632,7 @@ export function createMonitorServer({
     prompt = '',
     mode = 'agent',
     model = '',
+    rules = '',
     signal = null,
     awaitCompletion = false,
     role = '',
@@ -577,6 +655,14 @@ export function createMonitorServer({
     const chatHarness = harness || chatProvider?.harness || 'kusa';
     const useCaoTurn = Boolean(chatProvider && isCaoChatProvider(chatProvider.id));
     const agentMode = normalizeAgentMode(mode);
+    // Workflow role Rule wins for Subagent gates; then session sidecar; then Settings.
+    let sessionRules = '';
+    try {
+      sessionRules = String(readSessionConfig(dataDir, sessionId)?.rules || '').trim();
+    } catch { /* ignore */ }
+    const approvalMode = normalizeApprovalMode(
+      rules || sessionRules || settings?.agentApprovalMode,
+    );
     const hooks = createKusaHookEmitter({
       dataDir,
       sessionId,
@@ -603,7 +689,7 @@ export function createMonitorServer({
       prompt: text,
       promptMessageId: null,
       mode: agentMode,
-      approvalMode: settings?.agentApprovalMode || '',
+      approvalMode,
       attachments: [],
     });
     activeTurns.set(jobKey, turnAbort);
@@ -688,8 +774,12 @@ export function createMonitorServer({
           hooks,
           mode: agentMode,
           modelOverride: model,
-          approvalMode: settings?.agentApprovalMode,
+          // Role / workflow Rule — same value the turn job and gate UI show.
+          approvalMode,
           signal: turnAbort.signal,
+          // Parent "send now" / assign-queue steers drain into this Subagent the
+          // same way the main chat loop does (Codex/OpenCode soft-steer).
+          onSteer: () => drainSteering(jobKey),
           onApprove: (ask) => waitForApproval(ask, jobKey),
           onAsk: (ask) => waitForAsk(ask, jobKey),
           onAssignTurn: startAssignedTurn,
@@ -700,6 +790,8 @@ export function createMonitorServer({
             if (type === 'content' && typeof ev.text === 'string') streamedText = ev.text;
             ingestTurnEvent(job, ev);
             if (type === 'approval_request' || type === 'ask_request') {
+              // Mirror onto the orchestrator; POST /kusa/approval|ask by id
+              // settles this child's waiter (subagents have no own composer).
               relayChildGateEvent(sessionId, jobKey, ev);
             }
             broadcastTurn(job, type, ev);
@@ -784,6 +876,10 @@ export function createMonitorServer({
           prompt: entry.text,
           mode: entry.options?.mode || session.options?.mode || 'agent',
           model: entry.options?.model || session.options?.model || '',
+          rules: entry.options?.rules
+            || entry.options?.approvalMode
+            || session.options?.rules
+            || '',
           role: session.role || session.options?.role || '',
           parentId,
         });
@@ -802,6 +898,7 @@ export function createMonitorServer({
         prompt: orphanPrompt,
         mode: session.options?.mode || 'agent',
         model: session.options?.model || '',
+        rules: session.options?.rules || '',
         role: session.role || session.options?.role || '',
         parentId,
       });
@@ -862,6 +959,21 @@ export function createMonitorServer({
     setTimeout(() => {
       if (turnJobs.get(queueKey) === job) turnJobs.delete(queueKey);
     }, TURN_JOB_GRACE_MS);
+    // plan-execute LangGraph: after an orchestrator parent turn settles, park
+    // on await_approval when a draft/ready plan exists (LLM still owns assigns).
+    const termType = String(terminal?.type || '');
+    if (termType === 'done' || termType === 'stopped') {
+      const sessionKey = String(queueKey || job.sessionId || '').trim();
+      if (sessionKey) {
+        void onOrchestratorTurnSettled({
+          dataDir,
+          sessionKey,
+          prompt: String(job.prompt || terminal?.text || '').trim(),
+          workspaceRoot,
+          startTurn: startAssignedTurn,
+        }).catch(() => { /* lifecycle wrap must not break chat */ });
+      }
+    }
   };
 
   const shellHtml = { file: join(pageDir, 'index.html'), type: 'text/html; charset=utf-8' };
@@ -1737,6 +1849,7 @@ export function createMonitorServer({
               ...patch,
             });
             const saved = saveMonitorSettings(dataDir, { liveChat: next });
+            try { refreshMonitorArtifacts(dataDir, { origin: '' }); } catch { /* best-effort */ }
             sendJson(res, 200, {
               ...normalizeLiveChatSettings(saved.liveChat),
               resolvedBaseUrl: resolveLiveChatBaseUrl(process.env, saved),
@@ -1814,6 +1927,13 @@ export function createMonitorServer({
     // 50 entries (node_modules, a data dump) comes back as a counted stub. `path`
     // loads one such folder's children on demand — the parent row is always in the
     // payload, so the UI can offer the click that triggers this request.
+    // Cheap fingerprint for Explorer soft-refresh. Bumped on create/delete only
+    // (see tree-rev.mjs) so overwriting an open file does not re-walk the tree.
+    if (url.pathname === '/files/rev' && (req.method === 'GET' || req.method === 'HEAD')) {
+      sendJson(res, 200, { ok: true, ...getWorkspaceTreeRev() });
+      return;
+    }
+
     if (url.pathname === '/files' && (req.method === 'GET' || req.method === 'HEAD')) {
       const pathParam = url.searchParams.get('path');
       const opts = {
@@ -1825,7 +1945,8 @@ export function createMonitorServer({
           : {}),
         ...(pathParam ? { path: pathParam } : {}),
       };
-      sendJson(res, 200, collectWorkspaceTree(workspaceRoot, opts));
+      const tree = collectWorkspaceTree(workspaceRoot, opts);
+      sendJson(res, 200, { ...tree, rev: getWorkspaceTreeRev().rev });
       return;
     }
 
@@ -1850,6 +1971,109 @@ export function createMonitorServer({
           : {}),
       };
       sendJson(res, 200, searchWorkspaceFiles(workspaceRoot, searchOpts));
+      return;
+    }
+
+    // Sidebar Search: text inside workspace files (not just names). Same sandbox
+    // as agent grep; include/exclude globs and Aa / whole-word / regex flags.
+    if (url.pathname === '/grep' && (req.method === 'GET' || req.method === 'HEAD')) {
+      const q = String(url.searchParams.get('q') ?? '');
+      if (!String(q).trim()) {
+        sendJson(res, 400, { ok: false, error: 'q is required' });
+        return;
+      }
+      const result = searchWorkspaceContent(workspaceRoot, {
+        query: q,
+        path: url.searchParams.get('path') || '',
+        regex: url.searchParams.get('regex') === '1',
+        matchCase: url.searchParams.get('case') === '1',
+        wholeWord: url.searchParams.get('word') === '1',
+        include: url.searchParams.get('include') || '',
+        exclude: url.searchParams.get('exclude') || '',
+        ...(Number(url.searchParams.get('limit')) > 0
+          ? { maxHits: Number(url.searchParams.get('limit')) }
+          : {}),
+      });
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    if (url.pathname === '/grep/replace' && req.method === 'POST') {
+      let body = {};
+      try {
+        const raw = await readBody(req, 200_000);
+        body = raw.trim() ? JSON.parse(raw) : {};
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, { ok: false, error: 'expected a JSON object' });
+          return;
+        }
+      } catch (err) {
+        if (err && err.code === 'ELARGE') {
+          sendJson(res, 413, { ok: false, error: 'body too large' });
+          return;
+        }
+        sendJson(res, 400, { ok: false, error: 'invalid json body' });
+        return;
+      }
+      const result = replaceWorkspaceContent(workspaceRoot, {
+        query: String(body.query ?? body.q ?? ''),
+        replacement: body.replacement == null ? '' : String(body.replacement),
+        regex: Boolean(body.regex),
+        matchCase: Boolean(body.matchCase ?? body.case),
+        wholeWord: Boolean(body.wholeWord ?? body.word),
+        include: String(body.include || ''),
+        exclude: String(body.exclude || ''),
+        dryRun: Boolean(body.dryRun),
+        paths: Array.isArray(body.paths) ? body.paths.map(String) : null,
+      });
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    // Console editor: one workspace file at a time. Path is sandboxed the same
+    // way as agent file tools — never absolute, never outside workspaceRoot.
+    if (url.pathname === '/file' && (req.method === 'GET' || req.method === 'HEAD')) {
+      const pathParam = String(url.searchParams.get('path') ?? '').trim();
+      const result = readWorkspaceFile(workspaceRoot, pathParam);
+      if (!result.ok) {
+        const status = result.code === 'ENOENT' ? 404
+          : result.code === 'EPERM' || result.code === 'EBINARY' || result.code === 'EISDIR' ? 403
+          : result.code === 'ELARGE' ? 413
+          : 400;
+        sendJson(res, status, { ok: false, error: result.error, code: result.code });
+        return;
+      }
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (url.pathname === '/file' && req.method === 'PUT') {
+      const pathParam = String(url.searchParams.get('path') ?? '').trim();
+      let body = {};
+      try {
+        const raw = await readBody(req, 1_100_000);
+        body = raw.trim() ? JSON.parse(raw) : {};
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, { ok: false, error: 'expected a JSON object', code: 'EINVAL' });
+          return;
+        }
+      } catch (err) {
+        if (err && err.code === 'ELARGE') {
+          sendJson(res, 413, { ok: false, error: 'body too large', code: 'ELARGE' });
+          return;
+        }
+        sendJson(res, 400, { ok: false, error: 'invalid json body', code: 'EINVAL' });
+        return;
+      }
+      const result = writeWorkspaceFile(workspaceRoot, pathParam, body.contents);
+      if (!result.ok) {
+        const status = result.code === 'EPERM' || result.code === 'EISDIR' ? 403
+          : result.code === 'ELARGE' ? 413
+          : 400;
+        sendJson(res, status, { ok: false, error: result.error, code: result.code });
+        return;
+      }
+      sendJson(res, 200, result);
       return;
     }
 
@@ -1933,6 +2157,9 @@ export function createMonitorServer({
           );
         }
         const settings = saveMonitorSettings(dataDir, update);
+        // Push settings into monitor-data.js so the console poll cannot overwrite
+        // the POST response with a stale endpoints snapshot.
+        try { refreshMonitorArtifacts(dataDir, { origin: '' }); } catch { /* best-effort */ }
         sendJson(res, 200, publicSettings(settings));
       } catch (err) {
         const locked = err && err.code === 'ELOCK';
@@ -2099,21 +2326,183 @@ export function createMonitorServer({
       return;
     }
 
+    // Central agent profiles (.kusa/agent-profiles/) — source of truth for workflow roles.
+    if (url.pathname === '/kusa/agent-profiles' && (req.method === 'GET' || req.method === 'HEAD')) {
+      try {
+        ensureAgentProfilesSeeded(dataDir);
+        sendJson(res, 200, { profiles: listAgentProfiles(dataDir) });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || 'agent profiles list failed' });
+      }
+      return;
+    }
+    if (url.pathname === '/kusa/agent-profiles' && req.method === 'POST') {
+      try {
+        const raw = await readBody(req, 200_000);
+        const body = raw.trim() ? JSON.parse(raw) : {};
+        const saved = writeAgentProfile(dataDir, body);
+        sendJson(res, 201, { profile: saved });
+      } catch (err) {
+        const status = err?.code === 'EINVAL' ? 400 : (err?.code === 'ELARGE' ? 413 : 500);
+        sendJson(res, status, { error: err?.message || 'agent profile create failed' });
+      }
+      return;
+    }
+    if (/^\/kusa\/agent-profiles\/[^/]+$/.test(url.pathname)) {
+      const profileId = decodeURIComponent(url.pathname.slice('/kusa/agent-profiles/'.length)).trim();
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        try {
+          const profile = readAgentProfile(dataDir, profileId);
+          if (!profile) {
+            sendJson(res, 404, { error: 'agent profile not found' });
+            return;
+          }
+          sendJson(res, 200, { profile });
+        } catch (err) {
+          sendJson(res, 500, { error: err?.message || 'agent profile read failed' });
+        }
+        return;
+      }
+      if (req.method === 'PUT') {
+        try {
+          const raw = await readBody(req, 200_000);
+          const body = raw.trim() ? JSON.parse(raw) : {};
+          const saved = writeAgentProfile(dataDir, { ...body, id: profileId });
+          sendJson(res, 200, { profile: saved });
+        } catch (err) {
+          const status = err?.code === 'EINVAL' ? 400 : (err?.code === 'ELARGE' ? 413 : 500);
+          sendJson(res, status, { error: err?.message || 'agent profile save failed' });
+        }
+        return;
+      }
+      if (req.method === 'DELETE') {
+        try {
+          sendJson(res, 200, deleteAgentProfile(dataDir, profileId));
+        } catch (err) {
+          const status = err?.code === 'ENOENT' ? 404 : (err?.code === 'EINVAL' ? 400 : 500);
+          sendJson(res, status, { error: err?.message || 'agent profile delete failed' });
+        }
+        return;
+      }
+    }
+
     // Local orchestration workflows (seeded under .kusa/workflows/).
     if (url.pathname === '/kusa/workflows' && (req.method === 'GET' || req.method === 'HEAD')) {
       try {
         ensureWorkflowsSeeded(dataDir);
-        const workflows = listWorkflows(dataDir).map((wf) => ({
-          id: wf.id,
-          name: wf.name,
-          label: wf.name,
-          description: wf.description,
-          provider: 'kusa',
-          roles: Object.keys(wf.roles || {}),
-        }));
+        const workflows = listWorkflows(dataDir).map((wf) => {
+          const source = readWorkflowSource(dataDir, wf.id);
+          return {
+            id: wf.id,
+            name: wf.name,
+            label: wf.name,
+            description: wf.description,
+            provider: 'kusa',
+            ...(wf.runtime ? { runtime: wf.runtime } : {}),
+            // Name list kept for older callers; full role configs power tool-stats grouping.
+            roles: Object.keys(wf.roles || {}),
+            roleConfigs: wf.roles || {},
+            // Unresolved bindings for the workflow editor (profile refs).
+            roleBindings: source?.roles || {},
+          };
+        });
         sendJson(res, 200, { workflows });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || 'workflows list failed' });
+      }
+      return;
+    }
+
+    // One workflow: GET source+resolved, PUT save bindings.
+    if (
+      /^\/kusa\/workflows\/[^/]+$/.test(url.pathname)
+      && !url.pathname.endsWith('/graph')
+    ) {
+      const workflowId = decodeURIComponent(url.pathname.slice('/kusa/workflows/'.length)).trim();
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        try {
+          const resolved = readWorkflow(dataDir, workflowId);
+          const source = readWorkflowSource(dataDir, workflowId);
+          if (!resolved || !source) {
+            sendJson(res, 404, { error: 'workflow not found' });
+            return;
+          }
+          sendJson(res, 200, {
+            workflow: {
+              id: resolved.id,
+              name: resolved.name,
+              label: resolved.name,
+              description: resolved.description,
+              ...(resolved.runtime ? { runtime: resolved.runtime } : {}),
+              roles: Object.keys(resolved.roles || {}),
+              roleConfigs: resolved.roles || {},
+              roleBindings: source.roles || {},
+            },
+          });
+        } catch (err) {
+          sendJson(res, 500, { error: err?.message || 'workflow read failed' });
+        }
+        return;
+      }
+      if (req.method === 'PUT') {
+        try {
+          const raw = await readBody(req, 200_000);
+          const body = raw.trim() ? JSON.parse(raw) : {};
+          const saved = writeWorkflow(dataDir, {
+            id: workflowId,
+            name: body.name,
+            description: body.description,
+            runtime: body.runtime,
+            roles: body.roles || body.roleBindings || {},
+          });
+          const source = readWorkflowSource(dataDir, saved.id);
+          sendJson(res, 200, {
+            workflow: {
+              id: saved.id,
+              name: saved.name,
+              label: saved.name,
+              description: saved.description,
+              ...(saved.runtime ? { runtime: saved.runtime } : {}),
+              roles: Object.keys(saved.roles || {}),
+              roleConfigs: saved.roles || {},
+              roleBindings: source?.roles || {},
+            },
+          });
+        } catch (err) {
+          const status = err?.code === 'EINVAL' ? 400 : (err?.code === 'ELARGE' ? 413 : 500);
+          sendJson(res, status, { error: err?.message || 'workflow save failed' });
+        }
+        return;
+      }
+    }
+
+    // LangGraph drawable for a workflow (structure only — for the info modal).
+    if (
+      (req.method === 'GET' || req.method === 'HEAD')
+      && /^\/kusa\/workflows\/[^/]+\/graph$/.test(url.pathname)
+    ) {
+      try {
+        const workflowId = decodeURIComponent(
+          url.pathname.slice('/kusa/workflows/'.length).replace(/\/graph$/, ''),
+        ).trim();
+        ensureWorkflowsSeeded(dataDir);
+        const wf = listWorkflows(dataDir).find((entry) => entry.id === workflowId);
+        if (!wf) {
+          sendJson(res, 404, { error: 'workflow not found' });
+          return;
+        }
+        if (String(wf.runtime || '').toLowerCase() !== 'langgraph') {
+          sendJson(res, 404, { error: 'workflow has no LangGraph runtime' });
+          return;
+        }
+        const graph = drawableWorkflowGraph(workflowId);
+        if (!graph) {
+          sendJson(res, 404, { error: 'no drawable graph for this workflow' });
+          return;
+        }
+        sendJson(res, 200, { graph });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || 'workflow graph failed' });
       }
       return;
     }
@@ -2175,12 +2564,22 @@ export function createMonitorServer({
         sendJson(res, 400, { error: `plan status is "${plan.status}" — Approve it first` });
         return;
       }
+      let continueBody = {};
       try {
-        const continued = await continueWorkflowAfterPlanApproval({
+        const raw = await readBody(req, 64_000);
+        continueBody = raw.trim() ? JSON.parse(raw) : {};
+      } catch {
+        continueBody = {};
+      }
+      try {
+        const continued = await resumeAfterPlanApproval({
           dataDir,
           plan,
           workspaceRoot,
           startTurn: startAssignedTurn,
+          prompt: typeof continueBody?.prompt === 'string' ? continueBody.prompt : '',
+          assignToAgentId: typeof continueBody?.assignToAgentId === 'string' ? continueBody.assignToAgentId : '',
+          detachWorkflow: continueBody?.detachWorkflow === true,
         });
         const next = readPlan(dataDir, planId) || plan;
         sendJson(res, continued?.ok === false ? 409 : 200, { plan: next, continued });
@@ -2216,18 +2615,107 @@ export function createMonitorServer({
         }
         try {
           const before = readPlan(dataDir, planId);
-          const plan = updatePlan(dataDir, planId, body);
+          // Approve / assign options ride on the PUT body but are not plan fields.
+          const {
+            continue: forceContinueFlag,
+            prompt: approvePrompt,
+            assignToAgentId,
+            assignToSessionId,
+            detachWorkflow,
+            ...planPatch
+          } = body && typeof body === 'object' ? body : {};
+
+          const assignSessionId = typeof assignToSessionId === 'string'
+            ? assignToSessionId.trim()
+            : '';
+          if (assignSessionId) {
+            const target = readChatSession(dataDir, assignSessionId);
+            const targetCfg = readSessionConfig(dataDir, assignSessionId) || target?.options || {};
+            const parentId = String(targetCfg.parentId || target?.parentId || '').trim();
+            const orchId = parentId || assignSessionId;
+            planPatch.createdByAgentId = assignSessionId;
+            planPatch.orchestratorAgentId = orchId;
+            if (detachWorkflow === true) {
+              planPatch.workflowId = '';
+            } else {
+              const wf = String(targetCfg.workflowId || target?.workflowId || '').trim();
+              if (wf) planPatch.workflowId = wf;
+            }
+          }
+
+          const plan = updatePlan(dataDir, planId, planPatch);
           const becameApproved = String(plan?.status || '') === 'approved'
             && String(before?.status || '') !== 'approved';
-          const forceContinue = body?.continue === true;
+          const statusApproved = String(plan?.status || '') === 'approved'
+            || String(plan?.status || '') === 'executing';
+          // `continue: false` skips auto-assign (status reset / content-only edits).
+          const skipContinue = forceContinueFlag === false;
+          const forceContinue = forceContinueFlag === true;
+
+          // Auto-continue only when a plan-execute orchestrator is actually
+          // waiting — never for a plain status flip on a standard Agent.
+          async function orchestratorIsAwaiting(sessionOrId) {
+            const id = typeof sessionOrId === 'string'
+              ? sessionOrId.trim()
+              : String(sessionOrId?.id || '').trim();
+            if (!id) return false;
+            const row = typeof sessionOrId === 'object' && sessionOrId?.id
+              ? sessionOrId
+              : (readChatSession(dataDir, id) || { id });
+            const cfg = readSessionConfig(dataDir, id) || row?.options || {};
+            if (!isPlanExecuteOrchestrator(row, cfg)) return false;
+            const key = row?.key || `kusa:${id}`;
+            return isSessionAwaitingPlanApproval(dataDir, key, {
+              workspaceRoot,
+              startTurn: startAssignedTurn,
+            });
+          }
+
+          let assignedToWaitingSession = false;
+          if (!skipContinue && assignSessionId && statusApproved) {
+            const target = readChatSession(dataDir, assignSessionId);
+            const targetCfg = readSessionConfig(dataDir, assignSessionId) || target?.options || {};
+            const parentId = String(targetCfg.parentId || target?.parentId || '').trim();
+            assignedToWaitingSession = await orchestratorIsAwaiting(parentId || target || assignSessionId);
+          }
+
+          let awaitingLinkedOrchestrator = false;
+          if (!skipContinue && becameApproved && statusApproved && !assignedToWaitingSession) {
+            const orchId = String(plan.orchestratorAgentId || '').trim();
+            const creatorId = String(plan.createdByAgentId || '').trim();
+            // Only the explicitly linked orchestrator/creator — do not fall back
+            // to an unrelated plan-execute parent via resolveOrchestratorForPlan.
+            if (orchId) {
+              awaitingLinkedOrchestrator = await orchestratorIsAwaiting(orchId);
+            } else if (creatorId) {
+              const creator = readChatSession(dataDir, creatorId);
+              const creatorCfg = readSessionConfig(dataDir, creatorId) || creator?.options || {};
+              const parentId = String(creatorCfg.parentId || creator?.parentId || '').trim();
+              awaitingLinkedOrchestrator = await orchestratorIsAwaiting(parentId || creator || creatorId);
+            }
+          }
+
           let continued = null;
-          if (becameApproved || (forceContinue && String(plan?.status || '') === 'approved')) {
+          const shouldContinue = !skipContinue && (
+            (forceContinue && statusApproved)
+            || assignedToWaitingSession
+            || awaitingLinkedOrchestrator
+          );
+          if (shouldContinue && statusApproved) {
             try {
-              continued = await continueWorkflowAfterPlanApproval({
+              // Explicit agent override only — session assign links the plan then
+              // resumes the LangGraph interrupt on the linked orchestrator.
+              const continueAssignId = typeof assignToAgentId === 'string'
+                ? assignToAgentId.trim()
+                : '';
+              continued = await resumeAfterPlanApproval({
                 dataDir,
                 plan,
                 workspaceRoot,
                 startTurn: startAssignedTurn,
+                prompt: typeof approvePrompt === 'string' ? approvePrompt : '',
+                assignToAgentId: continueAssignId,
+                detachWorkflow: detachWorkflow === true,
               });
               // Prefer the post-continue plan (status may flip to executing).
               if (continued?.ok && !continued.skipped) {
@@ -2361,6 +2849,33 @@ export function createMonitorServer({
           models: withCapability(group.models),
         })),
         models: withCapability(listed.groups.flatMap((group) => group.models)),
+      });
+      return;
+    }
+
+    // GET /kusa/context — live context-window meter for the active endpoint.
+    // When that endpoint is Strata, reads GET /slots (n_prompt_tokens / n_ctx)
+    // so the composer ContextRing shows the server's real usage instead of the
+    // local char/4 estimate. Non-Strata endpoints return { strata: false }.
+    if (req.method === 'GET' && url.pathname === '/kusa/context') {
+      const settings = loadMonitorSettings(dataDir);
+      const model = String(url.searchParams.get('model') || settings?.agentModel || '').trim();
+      const endpointId = String(url.searchParams.get('endpointId') || '').trim();
+      const endpoint = resolveAgentEndpoint({
+        ...settings,
+        agentModel: model || settings?.agentModel,
+        agentEndpointId: endpointId,
+      });
+      if (!endpoint.baseUrl) {
+        sendJson(res, 200, { ok: true, strata: false });
+        return;
+      }
+      const ctx = await readStrataContext(endpoint.baseUrl, endpoint.headers);
+      sendJson(res, 200, {
+        ok: true,
+        ...ctx,
+        endpointId,
+        baseUrl: endpoint.baseUrl,
       });
       return;
     }
@@ -2950,9 +3465,10 @@ export function createMonitorServer({
             modelOverride: requestedModel,
             endpointIdOverride: requestedEndpointId,
             approvalMode: initialApproval,
-            // "Send now" while busy: the loop polls this per streamed chunk, so
-            // the prompt interrupts the in-flight model call and the agent
-            // reacts to it right away instead of at the next step boundary.
+            // "Send now" while busy: Codex/OpenCode soft-steer — poll per chunk
+            // and after each tool, soft-cancel the in-flight completion (keep
+            // partial text + thinking), skip tools not yet started, inject
+            // before the next model call. Stop remains a hard abort.
             onSteer: queueKey ? () => drainSteering(queueKey) : undefined,
             // Composer Mode / Rules while busy: POST /kusa/chat/options writes
             // job.options; the loop re-reads them before each model step and
@@ -3133,10 +3649,12 @@ export function createMonitorServer({
 
     if (req.method === 'DELETE' && url.pathname === '/sessions') {
       let keys = [];
+      let force = false;
       try {
         const raw = await readBody(req);
         const parsed = raw.trim() ? JSON.parse(raw) : {};
         keys = Array.isArray(parsed.keys) ? parsed.keys : [];
+        force = parsed.force === true;
       } catch (err) {
         if (err && err.code === 'ELARGE') {
           sendJson(res, 413, { error: 'body too large' });
@@ -3157,12 +3675,16 @@ export function createMonitorServer({
         }
         const locked = plansBlockingAgentDelete(dataDir, resolved.keys);
         if (locked.length) {
-          sendJson(res, 409, {
-            error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
-            code: 'EPLAN_LOCK',
-            plans: locked.map(planSummary),
-          });
-          return;
+          if (!force) {
+            sendJson(res, 409, {
+              error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
+              code: 'EPLAN_LOCK',
+              plans: locked.map(planSummary),
+            });
+            return;
+          }
+          // Force delete: drop blocking plans, then wipe the sessions.
+          for (const plan of locked) deletePlan(dataDir, plan.id);
         }
         const result = deleteSessions(dataDir, resolved.keys);
         // Drop session-bound held + steering; workspace parked stays claimable.
@@ -3174,7 +3696,10 @@ export function createMonitorServer({
           if (steeringMessages.delete(qk)) queueDirty = true;
         }
         if (queueDirty) persistQueues();
-        sendJson(res, 200, result);
+        sendJson(res, 200, {
+          ...result,
+          deletedPlans: force && locked.length ? locked.map((p) => p.id) : undefined,
+        });
       } catch (err) {
         const locked = err && err.code === 'ELOCK';
         sendJson(res, locked ? 503 : 500, { error: locked ? 'monitor lock timeout' : 'delete failed' });
@@ -3217,6 +3742,10 @@ export function createMonitorServer({
         if (!keys.length && route.harness && route.harness !== AGENTS_DIR) {
           keys = [laneKey(route.harness, stem)];
         }
+        // Stem deletes rarely carry a JSON body; `?force=1` matches the bulk
+        // DELETE's `{ force: true }` and drops blocking plans before the wipe.
+        const force = url.searchParams.get('force') === '1'
+          || url.searchParams.get('force') === 'true';
         try {
           const resolved = resolveAgentDeleteKeys(dataDir, keys);
           if (!resolved.keys.length) {
@@ -3229,12 +3758,15 @@ export function createMonitorServer({
           }
           const locked = plansBlockingAgentDelete(dataDir, resolved.keys);
           if (locked.length) {
-            sendJson(res, 409, {
-              error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
-              code: 'EPLAN_LOCK',
-              plans: locked.map(planSummary),
-            });
-            return;
+            if (!force) {
+              sendJson(res, 409, {
+                error: `Delete the plan first: ${locked.map((p) => p.name || p.id).join(', ')}`,
+                code: 'EPLAN_LOCK',
+                plans: locked.map(planSummary),
+              });
+              return;
+            }
+            for (const plan of locked) deletePlan(dataDir, plan.id);
           }
           const result = deleteSessions(dataDir, resolved.keys);
           let queueDirty = false;
@@ -3245,7 +3777,10 @@ export function createMonitorServer({
             if (steeringMessages.delete(qk)) queueDirty = true;
           }
           if (queueDirty) persistQueues();
-          sendJson(res, 200, result);
+          sendJson(res, 200, {
+            ...result,
+            deletedPlans: force && locked.length ? locked.map((p) => p.id) : undefined,
+          });
         } catch (err) {
           const locked = err && err.code === 'ELOCK';
           sendJson(res, locked ? 503 : 500, { error: locked ? 'monitor lock timeout' : 'delete failed' });

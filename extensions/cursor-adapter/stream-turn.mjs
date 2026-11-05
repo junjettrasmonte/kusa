@@ -8,6 +8,7 @@ import { readChatSession, writeSessionConfig } from '#features/chat/data/chat-st
 import { runNdjsonCli } from '#features/chat/data/cli-ndjson-stream.mjs';
 import { looksLikeCliTlsCertError } from '#features/chat/data/cli-agent-env.mjs';
 import { looksLikeCursorTrustRequired } from './cli-trust.mjs';
+import { resolveCursorCliModel } from './models.mjs';
 import {
   applyCursorStreamEvent,
   emptyCursorStreamState,
@@ -62,7 +63,22 @@ export async function runCursorStreamTurn({
   const state = emptyCursorStreamState(
     String(opts.cursorCliSessionId || opts.cliSessionId || '').trim(),
   );
-  const model = String(modelOverride || opts.model || '').trim();
+  const requestedModel = String(modelOverride || opts.model || '').trim();
+  // Drop foreign / stale ids (e.g. Kusă endpoint model after workflow edit).
+  const resolved = resolveCursorCliModel(requestedModel);
+  const model = resolved.model;
+  const parentId = String(opts.parentId || session?.parentId || '').trim() || null;
+  if (resolved.fallback && dataDir && sessionId) {
+    try {
+      // Clear the bad stamp so the next resume does not keep asking Cursor for
+      // a model it cannot run; empty → provider auto on the next turn too.
+      writeSessionConfig(dataDir, sessionId, {
+        provider: 'cursor',
+        kind: session?.kind || opts.kind || 'standard',
+        model: '',
+      }, harness, parentId);
+    } catch { /* best-effort */ }
+  }
 
   const args = [
     '-p',
@@ -88,7 +104,6 @@ export async function runCursorStreamTurn({
   });
 
   const resolvedModel = String(state.model || model || '').trim();
-  const parentId = String(opts.parentId || session?.parentId || '').trim() || null;
   if (state.cliSessionId || resolvedModel) {
     try {
       writeSessionConfig(dataDir, sessionId, {

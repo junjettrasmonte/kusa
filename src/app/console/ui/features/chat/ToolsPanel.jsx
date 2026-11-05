@@ -1,12 +1,23 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { fmt } from '#ui/shared/lib/format.js';
 import { CloseIcon, IconButton, RefreshIcon } from '#ui/shared/IconButton.jsx';
+import {
+  buildOrchestratedToolStats,
+  isOrchestratedChat,
+  providerLabel,
+  roleTitle,
+} from '#ui/features/chat/orchestratedToolStats.js';
 
 const TOOL_GROUP_LABELS = {
   file: 'File',
   trail: 'Trail',
   task: 'Tasks',
+  plan: 'Plan',
+  assign: 'Assign',
+  escalate: 'Escalate',
+  session: 'Session',
+  ask: 'Ask',
   terminal: 'Terminal',
   browser: 'Browser',
 };
@@ -19,6 +30,15 @@ async function fetchSessionTools() {
   return JSON.parse(raw);
 }
 
+async function fetchWorkflows() {
+  const res = await fetch('/kusa/workflows', { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const raw = await res.text();
+  if (!raw) return [];
+  const body = JSON.parse(raw);
+  return Array.isArray(body?.workflows) ? body.workflows : [];
+}
+
 function groupRows(rows) {
   const groups = [];
   for (const row of rows || []) {
@@ -28,9 +48,35 @@ function groupRows(rows) {
   return groups;
 }
 
-export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool }) {
+export function ToolsPanel({
+  lane,
+  toolWarnMs,
+  now,
+  expandedTools,
+  onToggleTool,
+  chatSession = null,
+  peerSessions = null,
+  lanes = null,
+}) {
   const [available, setAvailable] = useState(null);
   const [availableError, setAvailableError] = useState(null);
+  const [workflow, setWorkflow] = useState(null);
+  // Provider / role sections start open; this set holds the ones the user collapsed.
+  const [collapsedGroups, setCollapsedGroups] = useState(() => new Set());
+
+  const toggleGroup = useCallback((key) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const orchestrated = isOrchestratedChat(chatSession);
+  const workflowId = String(
+    chatSession?.options?.workflowId || chatSession?.workflowId || '',
+  ).trim();
 
   useEffect(() => {
     const load = async () => {
@@ -44,6 +90,24 @@ export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool 
     void load();
   }, []);
 
+  useEffect(() => {
+    if (!orchestrated || !workflowId) {
+      setWorkflow(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await fetchWorkflows();
+        if (cancelled) return;
+        setWorkflow(list.find((wf) => wf.id === workflowId) || null);
+      } catch {
+        if (!cancelled) setWorkflow(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [orchestrated, workflowId]);
+
   const refreshTools = useCallback(async () => {
     try {
       setAvailable(await fetchSessionTools());
@@ -53,17 +117,40 @@ export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool 
     }
   }, []);
 
-  if (!lane) return null;
-  const usedNames = new Set((lane.rows || []).map((row) => String(row.name || '')));
-  const overdueOpen = (lane.open || []).filter((inv) => now - inv.startedWall >= toolWarnMs);
+  const orchStats = useMemo(() => {
+    if (!orchestrated || !chatSession) return null;
+    return buildOrchestratedToolStats({
+      chatSession,
+      peerSessions,
+      lanes: lanes || {},
+      workflow,
+    });
+  }, [orchestrated, chatSession, peerSessions, lanes, workflow]);
+
+  if (!lane && !orchestrated) return null;
+
+  const usedNames = orchStats?.usedNames
+    || new Set((lane?.rows || []).map((row) => String(row.name || '')));
+  const openInvocations = orchStats?.open || lane?.open || [];
+  const overdueOpen = openInvocations.filter((inv) => now - inv.startedWall >= toolWarnMs);
   const overdueTools = new Set(overdueOpen.map((inv) => inv.toolName));
   const overdueCommands = new Set(overdueOpen.map((inv) => inv.subName).filter(Boolean));
-  const groups = groupRows(lane.rows);
+  const plainGroups = groupRows(lane?.rows);
+  const workflowName = workflow?.name || workflow?.label || workflowId || null;
+  const hasOrchRows = Boolean(orchStats?.providers?.some((p) => p.roles.some((r) => r.toolGroups.length)));
 
   return (
     <div className="space-y-8">
       <section>
-        <h2 className="mb-2 text-base font-semibold">Tool Call Statistics</h2>
+        <h2 className="mb-1 text-base font-semibold">Tool Call Statistics</h2>
+        {orchestrated && workflowName ? (
+          <p className="mb-2 text-xs text-gray-500">
+            Workflow <span className="text-sky-300">{workflowName}</span>
+            {workflowId && workflowName !== workflowId ? (
+              <span className="text-gray-600"> · {workflowId}</span>
+            ) : null}
+          </p>
+        ) : null}
         <div className="overflow-x-auto rounded-xl border border-gray-800">
           <table className="w-full text-sm">
             <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-400">
@@ -80,7 +167,24 @@ export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool 
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800">
-              {groups.length ? groups.map(({ row, children }) => {
+              {orchestrated && orchStats ? (
+                hasOrchRows || orchStats.providers.length ? (
+                  orchStats.providers.map((prov) => (
+                    <ProviderToolSection
+                      key={prov.provider}
+                      provider={prov}
+                      collapsedGroups={collapsedGroups}
+                      onToggleGroup={toggleGroup}
+                      expandedTools={expandedTools}
+                      overdueTools={overdueTools}
+                      overdueCommands={overdueCommands}
+                      onToggleTool={onToggleTool}
+                    />
+                  ))
+                ) : (
+                  <tr><td colSpan={9} className="px-3 py-3 text-gray-500">No tool calls yet.</td></tr>
+                )
+              ) : plainGroups.length ? plainGroups.map(({ row, children }) => {
                 const open = expandedTools.has(row.name);
                 const overdue = overdueTools.has(row.name);
                 return (
@@ -104,11 +208,19 @@ export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool 
       <section>
         <h2 className="mb-2 text-base font-semibold">In flight</h2>
         <ul className="space-y-1 text-sm">
-          {(lane.open || []).length ? lane.open.map((inv) => {
+          {openInvocations.length ? openInvocations.map((inv) => {
             const age = now - inv.startedWall;
             const overdue = age >= toolWarnMs;
             return (
-              <li key={inv.id} className={overdue ? 'text-amber-300' : ''}>
+              <li key={`${inv.sessionKey || ''}:${inv.id}`} className={overdue ? 'text-amber-300' : ''}>
+                {inv.provider || inv.role ? (
+                  <span className="text-gray-500">
+                    {inv.provider ? providerLabel(inv.provider) : ''}
+                    {inv.provider && inv.role ? ' · ' : ''}
+                    {inv.role ? roleTitle(inv.role) : ''}
+                    {' · '}
+                  </span>
+                ) : null}
                 <code className="text-sky-300">{inv.toolName}</code>{' '}
                 {inv.subName ? <code className="text-xs text-gray-300">{inv.subName}</code> : null}{' '}
                 <span className="text-gray-500">{inv.id}</span> · {fmt(age)}
@@ -128,6 +240,120 @@ export function ToolsPanel({ lane, toolWarnMs, now, expandedTools, onToggleTool 
         onRefresh={refreshTools}
       />
     </div>
+  );
+}
+
+function GroupChevron({ open }) {
+  return (
+    <svg
+      className={`mr-1.5 inline h-3 w-3 shrink-0 text-gray-500 transition-transform ${open ? 'rotate-90' : ''}`}
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M6 4l4 4-4 4z" />
+    </svg>
+  );
+}
+
+function ProviderToolSection({
+  provider,
+  collapsedGroups,
+  onToggleGroup,
+  expandedTools,
+  overdueTools,
+  overdueCommands,
+  onToggleTool,
+}) {
+  const groupKey = `provider:${provider.provider}`;
+  const open = !collapsedGroups.has(groupKey);
+  const roleCount = provider.roles.length;
+  const toolCount = provider.roles.reduce((sum, role) => sum + role.toolGroups.length, 0);
+
+  return (
+    <>
+      <tr
+        className="cursor-pointer select-none bg-gray-950/80 hover:bg-gray-900/80"
+        aria-expanded={open}
+        onClick={() => onToggleGroup(groupKey)}
+      >
+        <td colSpan={9} className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-sky-300">
+          <GroupChevron open={open} />
+          {provider.label}
+          <span className="ml-2 font-normal normal-case tracking-normal text-gray-600">{provider.provider}</span>
+          <span className="ml-2 rounded-full bg-gray-800 px-1.5 text-[10px] font-normal normal-case tracking-normal text-gray-400">
+            {roleCount} role{roleCount === 1 ? '' : 's'}
+            {toolCount ? ` · ${toolCount} tool${toolCount === 1 ? '' : 's'}` : ''}
+          </span>
+        </td>
+      </tr>
+      {open ? provider.roles.map((role) => (
+        <RoleToolSection
+          key={`${provider.provider}:${role.role}`}
+          providerId={provider.provider}
+          role={role}
+          collapsedGroups={collapsedGroups}
+          onToggleGroup={onToggleGroup}
+          expandedTools={expandedTools}
+          overdueTools={overdueTools}
+          overdueCommands={overdueCommands}
+          onToggleTool={onToggleTool}
+        />
+      )) : null}
+    </>
+  );
+}
+
+function RoleToolSection({
+  providerId,
+  role,
+  collapsedGroups,
+  onToggleGroup,
+  expandedTools,
+  overdueTools,
+  overdueCommands,
+  onToggleTool,
+}) {
+  const groupKey = `role:${providerId}:${role.role}`;
+  const open = !collapsedGroups.has(groupKey);
+  const toolCount = role.toolGroups.length;
+
+  return (
+    <>
+      <tr
+        className="cursor-pointer select-none bg-gray-900/60 hover:bg-gray-800/60"
+        aria-expanded={open}
+        onClick={() => onToggleGroup(groupKey)}
+      >
+        <td colSpan={9} className="px-3 py-2 pl-5 text-xs text-gray-300">
+          <GroupChevron open={open} />
+          <span className="font-medium text-gray-200">{role.label}</span>
+          <span className="ml-2 text-gray-500">
+            Rule · <span className="text-amber-300/90">{role.rulesLabel}</span>
+          </span>
+          <span className="ml-2 rounded-full bg-gray-800 px-1.5 text-[10px] text-gray-400">
+            {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : 'no tools yet'}
+          </span>
+        </td>
+      </tr>
+      {open ? role.toolGroups.map(({ row, children }) => {
+        const expandKey = `${providerId}:${role.role}:${row.name}`;
+        const toolOpen = expandedTools.has(expandKey) || expandedTools.has(row.name);
+        const overdue = overdueTools.has(row.name);
+        return (
+          <ToolGroup
+            key={expandKey}
+            row={row}
+            childrenRows={children}
+            open={toolOpen}
+            overdue={overdue}
+            overdueCommands={overdueCommands}
+            onToggle={() => onToggleTool(expandKey)}
+            indent
+          />
+        );
+      }) : null}
+    </>
   );
 }
 
@@ -274,12 +500,12 @@ function CommandModal({ name, commands, onClose }) {
   );
 }
 
-function CommandRow({ row, overdue }) {
+function CommandRow({ row, overdue, indent = false }) {
   const commands = Array.isArray(row.commands) ? row.commands : [];
   const [open, setOpen] = useState(false);
   return (
     <tr className={`child text-xs text-gray-400 ${overdue ? 'overdue bg-amber-950/40 text-amber-200' : ''}`}>
-      <td className="px-3 py-2 pl-10">
+      <td className={`px-3 py-2 ${indent ? 'pl-14' : 'pl-10'}`}>
         {commands.length ? (
           <button
             type="button"
@@ -320,7 +546,7 @@ function Cells({ row }) {
   );
 }
 
-function ToolGroup({ row, childrenRows, open, overdue, overdueCommands, onToggle }) {
+function ToolGroup({ row, childrenRows, open, overdue, overdueCommands, onToggle, indent = false }) {
   return (
     <>
       <tr
@@ -329,7 +555,7 @@ function ToolGroup({ row, childrenRows, open, overdue, overdueCommands, onToggle
         className={`${childrenRows.length ? 'tool-group cursor-pointer select-none hover:bg-gray-800/60 ' : ''}${overdue ? 'overdue bg-amber-950/40 text-amber-200' : ''}`}
         onClick={childrenRows.length ? onToggle : undefined}
       >
-        <td className="px-3 py-2">
+        <td className={`px-3 py-2 ${indent ? 'pl-8' : ''}`}>
           {childrenRows.length ? (
             <svg className={`mr-1.5 inline h-3 w-3 text-gray-500 transition-transform ${open ? 'rotate-90' : ''}`} viewBox="0 0 16 16" fill="currentColor">
               <path d="M6 4l4 4-4 4z" />
@@ -349,6 +575,7 @@ function ToolGroup({ row, childrenRows, open, overdue, overdueCommands, onToggle
           key={child.name}
           row={child}
           overdue={overdueCommands.has(child.name)}
+          indent={indent}
         />
       ))}
     </>

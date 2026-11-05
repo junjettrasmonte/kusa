@@ -29,6 +29,11 @@ import { createKusaHookEmitter } from '#features/agent/hooks.mjs';
 import { AGENT_MODE_ASK, AGENT_MODE_AGENT, AGENT_MODE_PLAN } from '#features/agent/modes.mjs';
 import { normalizeApprovalMode } from '#features/agent/approval.mjs';
 import {
+  ORCHESTRATOR_ROLE,
+  resolveWorkflowModelId,
+  workflowRole,
+} from '#features/workflows/store.mjs';
+import {
   CHAT_FILE,
   ensureSessionDirs,
   findNestedSubagentFiles,
@@ -43,6 +48,7 @@ import {
   SUBAGENTS_DIR,
   subagentFiles,
 } from '#features/monitor/lib.mjs';
+import { isMistakenAgentProfileLane } from '#features/monitor/agent-profile-lane.mjs';
 import {
   CHAT_HARNESSES,
   CHAT_PROVIDERS,
@@ -241,6 +247,10 @@ function normalizeMessage(m, { dir = null, sessionId = '', harness = KUSA_HARNES
     ...(typeof m.turnId === 'string' && m.turnId ? { turnId: m.turnId } : {}),
     ...(m.stopped === true ? { stopped: true } : {}),
     ...(m.steered === true ? { steered: true } : {}),
+    // Soft-steer (Send now) freezes a half-finished assistant bubble before the
+    // steered user row; keep the flag so a later persist of the same turnId
+    // does not overwrite that stub with the final reply.
+    ...(m.interrupted === true ? { interrupted: true } : {}),
     ...(m.error === true ? { error: true } : {}),
     ...(attachments.length ? { attachments } : {}),
   };
@@ -333,7 +343,7 @@ function normalizeSessionOptions(raw) {
   if (rules && normalizeApprovalMode(rules) === rules) {
     out.rules = rules;
   }
-  const model = typeof raw.model === 'string' ? raw.model.trim().slice(0, 200) : '';
+  const model = typeof raw.model === 'string' ? resolveWorkflowModelId(raw.model) : '';
   if (model) out.model = model;
   // Which agentEndpoints[] id the Model pick sat under (empty = Default). Kept
   // so a probed-only model still routes to that endpoint after a refresh.
@@ -342,6 +352,13 @@ function normalizeSessionOptions(raw) {
   // after the user switched back to Default.
   if (Object.hasOwn(raw, 'endpointId')) {
     out.endpointId = typeof raw.endpointId === 'string' ? raw.endpointId.trim().slice(0, 80) : '';
+  }
+  // Workflow orchestrator flags: when false, the composer picker is locked to
+  // the role default; when true, the human may override via the message box.
+  for (const key of ['allowModeOverride', 'allowRuleOverride', 'allowModelOverride']) {
+    if (Object.hasOwn(raw, key)) {
+      out[key] = raw[key] === true || raw[key] === 1 || String(raw[key]).trim().toLowerCase() === 'true';
+    }
   }
   const provider = resolveChatProvider(raw.provider);
   if (provider) out.provider = provider.id;
@@ -395,6 +412,17 @@ function normalizeSessionOptions(raw) {
     if (typeof raw[key] === 'string' && raw[key].trim()) {
       out[key] = raw[key].trim().slice(0, 200);
     }
+  }
+  // Pre-start Mode take-back writes kind=standard while writeSessionConfig still
+  // merges the prior sidecar — without this strip, a leftover workflowId keeps
+  // the composer stuck on Orchestrator after the user picked Ask/Plan/Agent.
+  // Subagents are also kind=standard but keep parentId + role — leave those alone.
+  if (out.kind === SESSION_KIND_STANDARD && !out.parentId) {
+    delete out.workflowId;
+    delete out.role;
+    delete out.allowModeOverride;
+    delete out.allowRuleOverride;
+    delete out.allowModelOverride;
   }
   return Object.keys(out).length ? out : null;
 }
@@ -677,7 +705,8 @@ function listLaneFiles(dir) {
     const files = migrateFlatSessionFiles(dir, { harness: KUSA_HARNESS, id: entry.name });
     if (existsSync(files.json)) {
       const raw = readJsonSafe(files.json);
-      if (raw?.id) {
+      // Skip / ignore agent-profile docs that landed under agents/ by mistake.
+      if (raw?.id && !isMistakenAgentProfileLane(raw)) {
         const harness = CHAT_HARNESSES.includes(raw.harness) ? raw.harness : KUSA_HARNESS;
         out.push({ ...raw, harness });
       }
@@ -811,6 +840,28 @@ function preferListedChatSession(current, next) {
 }
 
 /**
+ * A `chat.json` sidecar can exist with zero messages — it was written by a
+ * turn writer before the lane was ever backfilled from disk. It is not
+ * authoritative for the transcript in that case, so the richer message list
+ * wins while the sidecar keeps its identity, picks, and attachments.
+ */
+function mergeRicherChatSession(existing, hydrated) {
+  if (!existing) return hydrated;
+  if (!hydrated) return existing;
+  const existingMsgs = Array.isArray(existing.messages) ? existing.messages : [];
+  const hydratedMsgs = Array.isArray(hydrated.messages) ? hydrated.messages : [];
+  if (hydratedMsgs.length <= existingMsgs.length) return existing;
+  return {
+    ...existing,
+    messages: hydratedMsgs,
+    attempts: Math.max(Number(existing.attempts) || 0, Number(hydrated.attempts) || 0),
+    endedAt: existing.endedAt ?? hydrated.endedAt,
+    createdAt: existing.createdAt ?? hydrated.createdAt,
+    title: existing.title || hydrated.title || null,
+  };
+}
+
+/**
  * All provider chats: prefer `chat.json` sidecars; fall back to hydrating from
  * monitor lane prompts when a sidecar is missing (pre-persistence sessions).
  * One row per session id — cross-harness copies of the same id collapse here
@@ -823,12 +874,19 @@ export function listChatSessions(dir) {
     byId.set(session.id, preferListedChatSession(byId.get(session.id), session));
   }
   for (const lane of listLaneFiles(dir)) {
-    if (!lane?.id || byId.has(lane.id)) continue;
+    if (!lane?.id) continue;
+    const existing = byId.get(lane.id);
+    // A sidecar that already carries messages wins outright. An empty one is a
+    // stale artifact, not proof of an empty session — a backfilled Cursor IDE
+    // lane would otherwise render as a blank Agents transcript.
+    if (existing?.messages?.length) continue;
     // Same gate as monitor buildView: prompt-less Cursor CLI/IDE blips must
     // not appear as empty Agents rows (tools alone ≠ a chat).
     if (!laneListedInSidebar(lane)) continue;
     const hydrated = chatSessionFromLane(lane);
-    if (hydrated) byId.set(hydrated.id, hydrated);
+    if (!hydrated) continue;
+    if (existing) byId.set(lane.id, mergeRicherChatSession(existing, hydrated));
+    else byId.set(hydrated.id, hydrated);
   }
   const sessions = [...byId.values()];
   // Overlay each session's own settings. This is what makes a Rule survive a
@@ -842,6 +900,25 @@ export function listChatSessions(dir) {
       session.role = config.role || session.role || null;
       session.planId = config.planId || session.planId || null;
       session.subagents = Array.isArray(config.subagents) ? config.subagents : (session.subagents || []);
+    }
+    // Live workflow override flags for orchestrator parents (JSON edits apply
+    // without recreating the session). Subagents keep composer locked.
+    const wfId = session.options?.workflowId || '';
+    const isOrch = (session.role || session.options?.role) === ORCHESTRATOR_ROLE
+      || session.kind === 'orchestrated'
+      || Boolean(wfId && !session.parentId && !session.options?.parentId);
+    if (wfId && isOrch) {
+      try {
+        const orch = workflowRole(dir, wfId, ORCHESTRATOR_ROLE);
+        if (orch) {
+          session.options = {
+            ...(session.options || {}),
+            allowModeOverride: orch.allowModeOverride === true,
+            allowRuleOverride: orch.allowRuleOverride === true,
+            allowModelOverride: orch.allowModelOverride === true,
+          };
+        }
+      } catch { /* best-effort */ }
     }
   }
   // Rebuild parent.subagents[] from live children so the sidebar nest stays accurate.
@@ -888,10 +965,18 @@ export function readChatSession(dir, sessionId, harness = null) {
     hydrate: true,
     harness: h,
   });
-  if (fromFile) return config ? { ...fromFile, options: { ...fromFile.options, ...config } } : fromFile;
-  const lanePath = laneFiles(dir, { harness: h, id }).json;
-  const hydrated = chatSessionFromLane(readJsonSafe(lanePath));
-  return hydrated && config ? { ...hydrated, options: { ...hydrated.options, ...config } } : hydrated;
+  const fileMessages = fromFile && Array.isArray(fromFile.messages) ? fromFile.messages : [];
+  let resolved = fromFile;
+  if (!fileMessages.length) {
+    // Empty sidecar: fall through to the lane, which the monitor backfills from
+    // Cursor's own agent-transcripts. Hydrating here is what keeps an open
+    // session detail readable after a disk backfill.
+    const lanePath = laneFiles(dir, { harness: h, id }).json;
+    const hydrated = chatSessionFromLane(readJsonSafe(lanePath));
+    resolved = mergeRicherChatSession(fromFile, hydrated);
+  }
+  if (!resolved) return null;
+  return config ? { ...resolved, options: { ...(resolved.options || {}), ...config } } : resolved;
 }
 
 /**
@@ -955,16 +1040,30 @@ export function createChatSession(dir, {
     return existing;
   }
   const sessionKind = normalizeSessionKind(kind);
-  const orchestrated = sessionKind === SESSION_KIND_ORCHESTRATED
-    || (typeof workflowId === 'string' && Boolean(workflowId.trim()));
+  const wfId = typeof workflowId === 'string' ? workflowId.trim() : '';
+  const orchestrated = sessionKind === SESSION_KIND_ORCHESTRATED || Boolean(wfId);
+  // Seed composer triad + override flags from the workflow's orchestrator role.
+  const orchRole = (orchestrated && wfId) ? workflowRole(dir, wfId, ORCHESTRATOR_ROLE) : null;
+  const orchMode = typeof orchRole?.mode === 'string' ? orchRole.mode.trim().toLowerCase() : '';
+  const orchRules = typeof orchRole?.rules === 'string' ? orchRole.rules.trim().toLowerCase() : '';
+  // Blank / auto model is omitted — turn path uses Settings endpoint default.
+  const orchModel = resolveWorkflowModelId(orchRole?.model);
   const createOptions = {
     ...(meta.id !== 'kusa' ? { provider: meta.id } : {}),
     ...(sessionKind !== SESSION_KIND_STANDARD ? { kind: sessionKind } : {}),
-    ...(typeof workflowId === 'string' && workflowId.trim()
-      ? { workflowId: workflowId.trim(), kind: sessionKind, provider: meta.id }
+    ...(wfId
+      ? { workflowId: wfId, kind: sessionKind, provider: meta.id }
       : {}),
     // Orchestrated parents own the Orchestrator actor role in the workflow.
-    ...(orchestrated ? { role: 'orchestrator' } : {}),
+    ...(orchestrated ? { role: ORCHESTRATOR_ROLE } : {}),
+    ...(orchMode ? { mode: orchMode } : {}),
+    ...(orchRules && normalizeApprovalMode(orchRules) === orchRules ? { rules: orchRules } : {}),
+    ...(orchModel ? { model: orchModel } : {}),
+    ...(orchestrated ? {
+      allowModeOverride: orchRole?.allowModeOverride === true,
+      allowRuleOverride: orchRole?.allowRuleOverride === true,
+      allowModelOverride: orchRole?.allowModelOverride === true,
+    } : {}),
   };
   const session = writeChatSession(dir, {
     key: laneKey(harness, sessionId),
@@ -1003,6 +1102,8 @@ export function createSubagent(dir, {
   workflowId = null,
   planId = null,
   mode = null,
+  rules = null,
+  model = null,
   createdAt,
 } = {}) {
   const parent = String(parentId || '').trim();
@@ -1015,6 +1116,9 @@ export function createSubagent(dir, {
   const harness = meta.harness;
   const sessionId = (typeof id === 'string' && id.trim()) ? id.trim() : newId();
   const now = Number.isFinite(createdAt) ? createdAt : Date.now();
+  const rulesNorm = typeof rules === 'string' ? rules.trim().toLowerCase() : '';
+  // Blank / auto → omit; turn uses Settings → Kusă agent default endpoints.
+  const modelNorm = resolveWorkflowModelId(model);
   const createOptions = {
     provider: meta.id,
     parentId: parent,
@@ -1022,6 +1126,9 @@ export function createSubagent(dir, {
     ...(typeof workflowId === 'string' && workflowId.trim() ? { workflowId: workflowId.trim() } : {}),
     ...(typeof planId === 'string' && planId.trim() ? { planId: planId.trim() } : {}),
     ...(mode ? { mode: String(mode).trim().toLowerCase() } : {}),
+    // Workflow role Rule — Subagent gates resolve under this (composer Rules).
+    ...(rulesNorm && normalizeApprovalMode(rulesNorm) === rulesNorm ? { rules: rulesNorm } : {}),
+    ...(modelNorm ? { model: modelNorm } : {}),
   };
   const session = writeChatSession(dir, {
     key: laneKey(harness, sessionId),

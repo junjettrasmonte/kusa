@@ -1,4 +1,4 @@
-# Kusă
+# Kusă test 2026
 
 <p align="center">
   <img src="docs/logo.svg" alt="Kusă" width="160" height="150" />

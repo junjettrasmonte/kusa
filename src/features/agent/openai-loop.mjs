@@ -35,6 +35,63 @@ export const DEFAULT_MAX_STEPS = 100;
 const MAX_MAX_STEPS = 1000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
+/**
+ * Undici's TypeError("fetch failed") hides the useful `cause` (ECONNREFUSED,
+ * UNABLE_TO_VERIFY_LEAF_SIGNATURE, …). Surface that so the Model error card
+ * is actionable instead of a bare "fetch failed".
+ * @param {unknown} err
+ * @param {string} [url]
+ */
+export function formatModelFetchError(err, url = '') {
+  const top = err && typeof err === 'object' ? err : null;
+  const cause = top && 'cause' in top ? top.cause : null;
+  const causeObj = cause && typeof cause === 'object' ? cause : null;
+  const code = String(
+    (causeObj && 'code' in causeObj && causeObj.code)
+    || (top && 'code' in top && top.code)
+    || '',
+  ).trim();
+  const causeMsg = String(
+    (causeObj && 'message' in causeObj && causeObj.message)
+    || (typeof cause === 'string' ? cause : '')
+    || '',
+  ).trim();
+  const topMsg = String(top && 'message' in top ? top.message : err || '').trim()
+    || 'fetch failed';
+  const host = (() => {
+    try {
+      return url ? new URL(url).host : '';
+    } catch {
+      return '';
+    }
+  })();
+
+  if (code === 'ABORT' || top?.name === 'AbortError' || /aborted/i.test(topMsg)) {
+    const abort = new Error('Model request timed out or was aborted');
+    abort.code = 'ABORT';
+    return abort;
+  }
+
+  const tls = /UNABLE_TO_VERIFY|CERT_|TLS|SSL|self[- ]signed|unable to get local issuer/i
+    .test(`${code} ${causeMsg} ${topMsg}`);
+  let message;
+  if (tls) {
+    message = `TLS to model endpoint failed${host ? ` (${host})` : ''}: ${
+      code || causeMsg || topMsg
+    }. Fix the certificate chain (or NODE_EXTRA_CA_CERTS) for this host.`;
+  } else if (code || causeMsg) {
+    message = `Could not reach model endpoint${host ? ` (${host})` : ''}: ${
+      [code, causeMsg || (topMsg !== 'fetch failed' ? topMsg : '')].filter(Boolean).join(' — ')
+    }`;
+  } else {
+    message = topMsg;
+  }
+  const out = new Error(message);
+  out.code = tls ? 'ETLS' : (code || 'EFETCH');
+  out.cause = cause || err;
+  return out;
+}
+
 /** Auth headers for one endpoint's class + key (Default or extra — same rule). */
 function endpointHeaders(authMode, apiKey) {
   /** @type {Record<string, string>} */
@@ -508,10 +565,11 @@ function ingestSseBuffer(buffer, state) {
  * @param {{ onEvent?: (ev: object) => void, signal?: AbortSignal,
  *           onSteerPoll?: () => boolean }} opts
  *   [opts.onSteerPoll] asked before every chunk. A `true` return means the user
- *   just pushed a "send now" prompt: reading stops there so the prompt can reach
- *   the model right away. The half-finished reply comes back in `message` with
- *   `interrupted: true` — the caller must re-issue the call with the prompt
- *   injected, NOT treat the partial message as the turn's answer.
+ *   just pushed a "send now" prompt (Codex/OpenCode steer): reading stops so the
+ *   prompt can reach the model right away. The half-finished reply comes back in
+ *   `message` with `interrupted: true` — the caller must keep that partial
+ *   (text + thinking) as transcript context, inject the prompt, and re-issue;
+ *   it is NOT the turn's final answer.
  */
 async function consumeChatCompletionStream(response, { onEvent, signal, onSteerPoll = null } = {}) {
   const reader = response.body?.getReader?.();
@@ -730,12 +788,14 @@ export async function runOpenAiAgentLoop({
   let finalText = '';
   let allThinking = '';
   // Messages the user pushed while this turn was already running (Composer
-  // "queue" → "send now"). onSteer is the queue owner's handle; collectSteer()
-  // pulls whatever landed into pendingSteer and flushSteer() empties that into
-  // the transcript, so a steering message is seen by the model at the next safe
-  // point and never re-sent as a duplicate turn later. The stream consumer polls
-  // collectSteer() per chunk, which is what makes "send now" land right away
-  // instead of waiting for the current step to finish.
+  // "queue" → "send now"). Codex/OpenCode steer semantics:
+  //   • soft-cancel the in-flight completion (not the turn AbortSignal)
+  //   • keep partial assistant text + thinking as model context
+  //   • let a tool already running finish; skip tools not yet started
+  //   • inject the prompt before the next model call
+  // onSteer is the queue owner's handle; collectSteer() pulls into pendingSteer
+  // and flushSteer() empties that into the transcript once, so a steering
+  // message is never re-sent as a duplicate turn later.
   let steeredText = '';
   /** @type {string[]} */
   const pendingSteer = [];
@@ -759,6 +819,69 @@ export async function runOpenAiAgentLoop({
       transcript.push({ role: 'user', content: text });
       steeredText = steeredText ? `${steeredText}\n\n${text}` : text;
       onEvent?.({ type: 'steer', text });
+    }
+  };
+
+  /** Keep a soft-interrupted completion as model context, then re-issue. */
+  const retainInterruptedPartial = (choice) => {
+    const partial = asText(choice?.content);
+    const partialThinking = typeof choice?.reasoning_content === 'string'
+      ? choice.reasoning_content.trim()
+      : '';
+    if (partial || partialThinking) {
+      transcript.push({
+        role: 'assistant',
+        content: partial || null,
+        ...(partialThinking ? { reasoning_content: partialThinking } : {}),
+      });
+    }
+    // UI freezes the live bubble before the steered user row; the next stream
+    // starts a fresh live.text without wiping what the model already said.
+    onEvent?.({
+      type: 'interrupted',
+      text: partial || '',
+      thinking: partialThinking || '',
+    });
+  };
+
+  /**
+   * Codex: skip tool calls the model had not yet started. Emit cancelled
+   * results so the transcript stays well-formed (every tool_call has a result).
+   */
+  const skipRemainingTools = (calls, fromIndex) => {
+    for (let i = fromIndex; i < calls.length; i += 1) {
+      const call = calls[i];
+      const name = call?.function?.name || call?.name || '';
+      const callId = call.id || `tool_${toolTrace.length + 1}`;
+      let args = {};
+      const argText = call?.function?.arguments ?? call?.arguments ?? '{}';
+      try {
+        args = typeof argText === 'string' ? JSON.parse(argText || '{}') : (argText || {});
+      } catch {
+        args = { _raw: argText };
+      }
+      const result = {
+        ok: false,
+        error: 'Skipped — steered by user before this tool started',
+        interrupted: true,
+      };
+      const summary = `${name} skipped (steered)`;
+      toolTrace.push({ id: callId, name, ok: false, summary, args, result });
+      onEvent?.({
+        type: 'tool_result',
+        id: callId,
+        name,
+        ok: false,
+        summary,
+        args,
+        result,
+      });
+      transcript.push({
+        role: 'tool',
+        tool_call_id: callId,
+        name,
+        content: JSON.stringify(result),
+      });
     }
   };
 
@@ -832,27 +955,31 @@ export async function runOpenAiAgentLoop({
 
     let response;
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          ...headers,
-          ...(stream ? { Accept: 'text/event-stream' } : {}),
-        },
-        body: JSON.stringify({
-          model,
-          stream: Boolean(stream),
-          messages: [
-            {
-              role: 'system',
-              content: systemPrompt,
-            },
-            ...transcript,
-          ],
-          tools: toolSchemas,
-          tool_choice: 'auto',
-        }),
-        signal: controller.signal,
-      });
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            ...headers,
+            ...(stream ? { Accept: 'text/event-stream' } : {}),
+          },
+          body: JSON.stringify({
+            model,
+            stream: Boolean(stream),
+            messages: [
+              {
+                role: 'system',
+                content: systemPrompt,
+              },
+              ...transcript,
+            ],
+            tools: toolSchemas,
+            tool_choice: 'auto',
+          }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw formatModelFetchError(err, url);
+      }
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
@@ -895,11 +1022,9 @@ export async function runOpenAiAgentLoop({
         allThinking += (allThinking ? '\n' : '') + choice.reasoning_content;
       }
       if (consumed.interrupted) {
-        // Keep whatever the model already said as context, refund the aborted
-        // call (it produced no usable step), and let the next iteration inject
-        // the prompt and re-issue the call straight away.
-        const partial = asText(choice?.content);
-        if (partial) transcript.push({ role: 'assistant', content: partial });
+        // Soft interrupt (not Stop): keep text + thinking as context, refund
+        // the aborted call, inject the steer on the next iteration, re-issue.
+        retainInterruptedPartial(choice);
         steps -= 1;
         continue;
       }
@@ -956,11 +1081,19 @@ export async function runOpenAiAgentLoop({
       ...(stepThinking ? { reasoning_content: stepThinking } : {}),
     });
 
-    for (const call of toolCalls) {
+    for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
+      const call = toolCalls[toolIndex];
       if (signal?.aborted) {
         const err = new Error('aborted');
         err.code = 'ABORT';
         throw err;
+      }
+      // Steer arrived while earlier tools in this step were running: finish is
+      // already done for those; skip anything not yet started (Codex), then
+      // inject the prompt before the next model call.
+      if (pendingSteer.length) {
+        skipRemainingTools(toolCalls, toolIndex);
+        break;
       }
       const name = call?.function?.name || call?.name || '';
       const callId = call.id || `tool_${toolTrace.length + 1}`;
@@ -977,6 +1110,13 @@ export async function runOpenAiAgentLoop({
       // picked while they are running must reach the NEXT one, so switching to
       // Allow cannot leave the rest of this step asking under the old rule.
       await applyLiveOptions();
+      // Drain steers that landed before this tool starts — same skip path as
+      // above, so "send now" during a long prior tool does not wait for the
+      // whole remaining batch.
+      if (await collectSteer()) {
+        skipRemainingTools(toolCalls, toolIndex);
+        break;
+      }
 
       onEvent?.({ type: 'tool_start', id: callId, name, args });
       hooks?.preToolUse?.({ name, args, callId });
@@ -1024,6 +1164,13 @@ export async function runOpenAiAgentLoop({
         name,
         content: JSON.stringify(result),
       });
+
+      // After each finished tool: poll again. In-flight work is done; remaining
+      // calls in this step are skipped so the steer reaches the next model call.
+      if (await collectSteer()) {
+        skipRemainingTools(toolCalls, toolIndex + 1);
+        break;
+      }
     }
   }
 
