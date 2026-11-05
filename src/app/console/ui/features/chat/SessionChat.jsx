@@ -1,5 +1,4 @@
 import {
-  Fragment,
   useEffect,
   useMemo,
   useRef,
@@ -43,7 +42,6 @@ import { SetupGuide } from '#ui/shared/SetupGuide.jsx';
 import {
   ArrowUpIcon,
   AttachmentsIcon,
-  ChevronDownIcon,
   LiveChatIcon,
   PlanIcon,
   QueueIcon,
@@ -59,7 +57,6 @@ import { AssistantBubble, ChatTurn } from './TranscriptTurns.jsx';
 import { ChatMinimap, buildChatMinimapTurns } from './ChatMinimap.jsx';
 import {
   isOrchestratedChatSession,
-  isTranscriptHandoff,
   mergeOrchestratedLiveTurns,
   mergeOrchestratedMessages,
   peelTrailingDelegates,
@@ -195,8 +192,8 @@ const AGENT_EXPAND_HEIGHT_RATIO = 0.6;
 
 // Back-read tolerance: while the transcript sits within this many pixels of its
 // bottom it still counts as "parked at the newest turn", so auto-scroll keeps
-// running and no jump-to-bottom control shows. One wheel tick is ~100px, so
-// this only absorbs the sub-pixel drift a programmatic scroll can leave behind.
+// running. One wheel tick is ~100px, so this only absorbs the sub-pixel drift a
+// programmatic scroll can leave behind.
 const BACK_READ_SLOP_PX = 24;
 
 // The queue belongs to the composer, so it must never push the transcript away:
@@ -275,10 +272,12 @@ export function SessionChat({
   const [agentMaxHeight, setAgentMaxHeight] = useState(null);
   // Back-read mode: on once the user has scrolled up out of the newest turn.
   // While it is on the transcript stops pinning itself back to the bottom —
-  // that would drag the exchange they are re-reading away — and the floating
-  // jump-to-bottom control in the panel takes over instead. Pressing it, or
-  // scrolling back down, turns it off and auto-scroll resumes.
+  // that would drag the exchange they are re-reading away. Scrolling back
+  // down, or the minimap's jump-to-latest chevron, turns it off and
+  // auto-scroll resumes.
   const [backReading, setBackReading] = useState(false);
+  // True while the transcript overflows (scrollbar active) and the minimap is up.
+  const [minimapVisible, setMinimapVisible] = useState(false);
   // Composer pickers (VS Code Copilot style): Ask/Plan/Agent, approval rules,
   // model. They belong to THIS session — seeded from its own record, with
   // Settings filling in only when nothing has been picked yet. Allow / Deny are
@@ -1370,8 +1369,8 @@ export function SessionChat({
 
   // Auto-scroll: pin the newest turn to the bottom of the transcript — but only
   // while the user is reading AT the bottom. Once they scroll up to back-read,
-  // nothing may yank them back; the jump-to-bottom control (see the panel
-  // markup below) is how they return, and it clears this flag itself.
+  // nothing may yank them back; the minimap chevron-down (or scrolling down)
+  // is how they return.
   useEffect(() => {
     if (backReading) return;
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -1677,7 +1676,7 @@ export function SessionChat({
       <div className="relative z-0 min-h-0 flex-1">
       <div
         ref={panelRef}
-        className={`h-full min-h-0 overflow-y-auto px-6 py-6 ${minimapTurns.length >= 3 ? 'pr-10' : ''}`}
+        className={`h-full min-h-0 overflow-y-auto px-6 py-6 ${minimapVisible ? 'pr-10' : ''}`}
       >
         {showWorkspaceTrust ? (
           <div className="w-full pb-4">
@@ -1720,130 +1719,115 @@ export function SessionChat({
           </div>
         ) : (
           <div className="w-full flex flex-col gap-6">
-            {transcriptMessages.map((msg, index) => {
+            {transcriptMessages.map((msg) => {
               const gateKey = msg._queueKey || msg.speaker?.queueKey || session.key;
-              const handoff = isTranscriptHandoff(transcriptMessages[index - 1], msg);
               return (
-                <Fragment key={msg.id}>
-                  {handoff ? (
-                    <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
-                  ) : null}
-                  <div
-                    data-kusa-turn={msg.role === 'user' ? msg.id : undefined}
-                    className="scroll-mt-3"
-                  >
-                    <ChatTurn
-                      msg={msg}
-                      busy={selfBusy}
-                      editing={!composerLocked && editingId === msg.id}
-                      onStartEdit={
-                        composerLocked
-                          ? undefined
-                          : () => setEditingId(msg.id)
-                      }
-                      onCancelEdit={
-                        composerLocked
-                          ? undefined
-                          : () => setEditingId(null)
-                      }
-                      onResendEdit={
-                        composerLocked
-                          ? undefined
-                          : (text) => {
-                            if (!session || selfBusy) return;
-                            setEditingId(null);
-                            // The files staged now belong to the message being resent,
-                            // not to the one being edited — same rule as pressing Send.
-                            onSend?.(
-                              session.key,
-                              text,
-                              { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
-                            );
-                            setAttachments([]);
-                            setAttachNote('');
-                            setAttachmentsExpanded(false);
-                          }
-                      }
-                      agentMaxHeight={agentMaxHeight}
-                      onApproval={
-                        // Pending gate cards (incl. Subagent relays on the parent) must
-                        // stay answerable after they land in history — not only while live.
-                        externalOwned || !onApproval
-                          ? null
-                          : async (decision) => { await onApproval(gateKey, decision); }
-                      }
-                      onAsk={
-                        externalOwned || !onAsk
-                          ? null
-                          : (decision) => onAsk(gateKey, decision)
-                      }
-                      onTrustWorkspace={
-                        hasWorkspaceTrust && !trustGranted
-                          ? () => { void grantWorkspaceTrust(); }
-                          : null
-                      }
-                      trustBusy={trustBusy}
-                      trustNote={trustNote}
-                    />
-                  </div>
-                </Fragment>
+                <div
+                  key={msg.id}
+                  data-kusa-turn={
+                    msg.role === 'user' || msg.role === 'assistant' ? msg.id : undefined
+                  }
+                  className="scroll-mt-3"
+                >
+                  <ChatTurn
+                    msg={msg}
+                    busy={selfBusy}
+                    editing={!composerLocked && editingId === msg.id}
+                    onStartEdit={
+                      composerLocked
+                        ? undefined
+                        : () => setEditingId(msg.id)
+                    }
+                    onCancelEdit={
+                      composerLocked
+                        ? undefined
+                        : () => setEditingId(null)
+                    }
+                    onResendEdit={
+                      composerLocked
+                        ? undefined
+                        : (text) => {
+                          if (!session || selfBusy) return;
+                          setEditingId(null);
+                          // The files staged now belong to the message being resent,
+                          // not to the one being edited — same rule as pressing Send.
+                          onSend?.(
+                            session.key,
+                            text,
+                            { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
+                          );
+                          setAttachments([]);
+                          setAttachNote('');
+                          setAttachmentsExpanded(false);
+                        }
+                    }
+                    agentMaxHeight={agentMaxHeight}
+                    onApproval={
+                      // Pending gate cards (incl. Subagent relays on the parent) must
+                      // stay answerable after they land in history — not only while live.
+                      externalOwned || !onApproval
+                        ? null
+                        : async (decision) => { await onApproval(gateKey, decision); }
+                    }
+                    onAsk={
+                      externalOwned || !onAsk
+                        ? null
+                        : (decision) => onAsk(gateKey, decision)
+                    }
+                    onTrustWorkspace={
+                      hasWorkspaceTrust && !trustGranted
+                        ? () => { void grantWorkspaceTrust(); }
+                        : null
+                    }
+                    trustBusy={trustBusy}
+                    trustNote={trustNote}
+                  />
+                </div>
               );
             })}
             {orchestrated && liveTurns?.length ? (
-              liveTurns.map((turn, index) => {
+              liveTurns.map((turn) => {
                 const gateKey = turn._queueKey || turn.speaker?.queueKey || session.key;
-                const prev = index > 0
-                  ? liveTurns[index - 1]
-                  : transcriptMessages[transcriptMessages.length - 1];
-                const handoff = isTranscriptHandoff(prev, turn);
-                const rule = handoff ? (
-                  <hr className="w-full border-0 border-t border-gray-800" aria-hidden="true" />
-                ) : null;
                 const isParentLive = turn.id === 'live-parent' || turn.id === 'live-parent-relay';
                 const liveMsg = isParentLive && liveParentDelegates.length
                   ? { ...turn, delegates: [...(turn.delegates || []), ...liveParentDelegates] }
                   : turn;
                 if (turn._placeholder) {
                   return (
-                    <Fragment key={turn.id}>
-                      {rule}
-                      <AssistantBubble speaker={turn.speaker || null}>
-                        <div className="text-sm">
-                          <span className="chat-shimmer font-medium text-gray-300">
-                            {turn.speaker?.role
-                              ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
-                              : 'Thinking…'}
-                          </span>
-                        </div>
-                      </AssistantBubble>
-                    </Fragment>
+                    <AssistantBubble key={turn.id} speaker={turn.speaker || null}>
+                      <div className="text-sm">
+                        <span className="chat-shimmer font-medium text-gray-300">
+                          {turn.speaker?.role
+                            ? `${String(turn.speaker.role).replace(/\b\w/g, (c) => c.toUpperCase())}…`
+                            : 'Thinking…'}
+                        </span>
+                      </div>
+                    </AssistantBubble>
                   );
                 }
                 return (
-                  <Fragment key={turn.id}>
-                    {rule}
-                    <ChatTurn
-                      msg={liveMsg}
-                      agentMaxHeight={agentMaxHeight}
-                      onApproval={
-                        externalOwned || !onApproval
-                          ? null
-                          : async (decision) => { await onApproval(gateKey, decision); }
-                      }
-                      onAsk={
-                        externalOwned || !onAsk
-                          ? null
-                          : (decision) => onAsk(gateKey, decision)
-                      }
-                      onTrustWorkspace={
-                        hasWorkspaceTrust && !trustGranted
-                          ? () => { void grantWorkspaceTrust(); }
-                          : null
-                      }
-                      trustBusy={trustBusy}
-                      trustNote={trustNote}
-                    />
-                  </Fragment>
+                  <ChatTurn
+                    key={turn.id}
+                    msg={liveMsg}
+                    agentMaxHeight={agentMaxHeight}
+                    onApproval={
+                      externalOwned || !onApproval
+                        ? null
+                        : async (decision) => { await onApproval(gateKey, decision); }
+                    }
+                    onAsk={
+                      externalOwned || !onAsk
+                        ? null
+                        : (decision) => onAsk(gateKey, decision)
+                    }
+                    onTrustWorkspace={
+                      hasWorkspaceTrust && !trustGranted
+                        ? () => { void grantWorkspaceTrust(); }
+                        : null
+                    }
+                    trustBusy={trustBusy}
+                    trustNote={trustNote}
+                  />
                 );
               })
             ) : selfBusy && live ? (
@@ -1897,39 +1881,16 @@ export function SessionChat({
             <div ref={bottomRef} />
           </div>
         )}
-        {/*
-         * Jump-to-bottom control: only while back-reading. It sticks to the
-         * bottom centre of the transcript at any scroll offset, so it reads as
-         * a floating button on the chat window rather than a row in the
-         * transcript — the wrapper is zero-height so the control never adds
-         * scroll height, and the button itself is the only hit target.
-         */}
-        {backReading ? (
-          <div className="sticky bottom-0 h-0 w-full z-40">
-            <button
-              type="button"
-              onClick={() => {
-                const panel = panelRef.current;
-                if (panel) panel.scrollTop = panel.scrollHeight;
-                setBackReading(false);
-              }}
-              title="Jump back to the latest turn"
-              aria-label="Jump back to the latest turn"
-              className="absolute bottom-1 left-1/2 -translate-x-1/2 inline-flex h-9 w-9 items-center justify-center rounded-full border border-gray-700 bg-gray-950/92 text-gray-400 shadow-lg backdrop-blur hover:bg-gray-900 hover:text-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-            >
-              <ChevronDownIcon className="text-gray-300" />
-            </button>
-          </div>
-        ) : null}
       </div>
       <ChatMinimap
         panelRef={panelRef}
         turns={minimapTurns}
         sessionKey={session?.key || ''}
+        onVisibleChange={setMinimapVisible}
         onJump={(id) => {
           const last = minimapTurns[minimapTurns.length - 1]?.id;
-          // Jumping away from the newest prompt is back-reading: keep auto-scroll
-          // off until the user returns to the bottom (wheel or jump-to-bottom).
+          // Jumping away from the newest turn is back-reading: keep auto-scroll
+          // off until the user returns to the bottom (wheel or minimap ↓).
           setBackReading(Boolean(last && id !== last));
         }}
       />

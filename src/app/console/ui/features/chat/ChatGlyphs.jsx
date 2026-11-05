@@ -86,11 +86,7 @@ export function Chevron({ open, className = 'text-gray-500' }) {
   );
 }
 
-/**
- * Down chevron for the jump-to-bottom control. It only ever renders while the
- * transcript is parked above the newest turn, so the arrow alone carries the
- * whole message: the latest turn is further down, and this button reaches it.
- */
+/** Compact down chevron — chat minimap jump-to-latest, and similar affordances. */
 export function ChevronDownIcon({ className = 'text-gray-500' }) {
   return (
     <svg
@@ -104,6 +100,24 @@ export function ChevronDownIcon({ className = 'text-gray-500' }) {
       aria-hidden="true"
     >
       <path d="M4 5.5l4 4 4-4" />
+    </svg>
+  );
+}
+
+/** Compact up chevron — chat minimap jump-to-first. */
+export function ChevronUpIcon({ className = 'text-gray-500' }) {
+  return (
+    <svg
+      className={`h-4 w-4 shrink-0 ${className}`}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 10.5l4-4 4 4" />
     </svg>
   );
 }

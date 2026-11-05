@@ -22,19 +22,6 @@ export function transcriptLaneKey(msg) {
   ).trim();
 }
 
-/**
- * True when `msg` starts a handoff section relative to `prev`: a switch to
- * another agent lane (assign / escalate / return). Delegated briefs are folded
- * into the orchestrator's turn as fine-print stubs — they are not sections.
- */
-export function isTranscriptHandoff(prev, msg) {
-  if (!msg || !prev) return false;
-  if (msg.role === 'delegate' || msg.role === 'meta') return false;
-  const from = transcriptLaneKey(prev);
-  const to = transcriptLaneKey(msg);
-  return Boolean(from && to && from !== to);
-}
-
 /** One fine-print stub describing a handoff that belongs on the caller turn. */
 export function delegateStubFromMessage(msg) {
   if (!msg) return null;
