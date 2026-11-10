@@ -83,6 +83,24 @@ export const BUILTIN_EXTENSIONS = [
     detail:
       'Registers provider `copilot` (harness `github-copilot`, CAO `copilot_cli`). Headless `copilot -p --stream on` turns live here so core Kusă stays provider-agnostic.',
   },
+  {
+    id: 'atlassian-adapter',
+    name: 'Atlassian Adapter',
+    shortName: 'Atlassian',
+    root: 'extensions/atlassian-adapter',
+    builtin: true,
+    installed: true,
+    description:
+      'Connects Jira Cloud for tickets assigned to you or project members.',
+    detail:
+      'Stores host, email, and an encrypted API token (same master key as agent API keys). Dev Tools › Atlassian lists issues assigned to you in a project, then lets you view, transition, and comment.',
+    nav: {
+      placement: 'devtools',
+      id: 'atlassian',
+      label: 'Atlassian',
+      icon: 'clipboard-list',
+    },
+  },
 ];
 
 export function getBuiltinExtension(id) {

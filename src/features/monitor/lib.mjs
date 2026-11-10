@@ -53,6 +53,10 @@ import {
 import { loadTasks, saveTasks } from '#features/chat/data/task-store.mjs';
 import { upsertPlanFromLaneCapture } from '#features/chat/data/plan-store.mjs';
 import { applyCursorComposerTitles } from '#extensions/cursor-adapter/composer-titles.mjs';
+import {
+  mergeAtlassianSettingsPatch,
+  normalizeAtlassianSettings,
+} from '#extensions/atlassian-adapter/settings.mjs';
 import { consoleAsset, consoleHtmlPath } from '#shared/lib/pkg.mjs';
 import { isMistakenAgentProfileLane } from '#features/monitor/agent-profile-lane.mjs';
 
@@ -890,6 +894,15 @@ export function defaultMonitorSettings() {
       whisperModel: 'onnx-community/whisper-tiny.en',
       mode: 'browser',
     },
+    /**
+     * Atlassian Adapter — Jira Cloud host/email/project + API token (encrypted on disk).
+     */
+    atlassian: {
+      host: '',
+      email: '',
+      apiToken: '',
+      projectKey: '',
+    },
   };
 }
 
@@ -1127,6 +1140,7 @@ function normalizeMonitorSettings(raw = {}) {
     agentAvatar: normalizeAgentAvatar(raw.agentAvatar),
     auth: normalizeAuth(raw.auth),
     liveChat: normalizeLiveChatBlock(raw.liveChat),
+    atlassian: normalizeAtlassianSettings(raw.atlassian),
   };
 }
 
@@ -1164,6 +1178,13 @@ export function saveMonitorSettings(dir, patch = {}) {
     merged.auth = mergeAuthPatch(current.auth, patch.auth);
   } else {
     merged.auth = current.auth;
+  }
+  // Atlassian API token omitted from a patch keeps the value already on disk;
+  // an explicit empty string clears it (same pattern as endpoint keys).
+  if (patch.atlassian !== undefined) {
+    merged.atlassian = mergeAtlassianSettingsPatch(current.atlassian, patch.atlassian);
+  } else {
+    merged.atlassian = current.atlassian;
   }
   const normalized = normalizeMonitorSettings(merged);
   writeSettingsFile(dir, normalized);
@@ -1236,6 +1257,27 @@ function settingsFromDisk(raw) {
   out.auth = authDecoded.auth;
   if (authDecoded.migrate) migrate = true;
 
+  // Atlassian Adapter token — decrypt apiTokenEnc → apiToken for in-memory use.
+  if (raw.atlassian && typeof raw.atlassian === 'object') {
+    const block = { ...raw.atlassian };
+    const envelope = block.apiTokenEnc;
+    const plain = typeof block.apiToken === 'string' ? block.apiToken : '';
+    delete block.apiTokenEnc;
+    if (isSecretEnvelope(envelope)) {
+      try {
+        block.apiToken = decryptSecret(envelope);
+      } catch {
+        block.apiToken = '';
+      }
+    } else if (plain) {
+      block.apiToken = plain;
+      migrate = true;
+    } else {
+      block.apiToken = '';
+    }
+    out.atlassian = block;
+  }
+
   return { memory: out, migrate };
 }
 
@@ -1256,6 +1298,7 @@ function settingsToDisk(memorySettings) {
     agentApiKey,
     agentEndpoints,
     auth,
+    atlassian,
     ...rest
   } = s;
   /** @type {Record<string, unknown>} */
@@ -1273,6 +1316,15 @@ function settingsToDisk(memorySettings) {
     disk.agentApiKeyEnc = encryptSecret(agentApiKey);
   }
   disk.auth = authToDisk(auth);
+  // Atlassian token — never plaintext on disk.
+  {
+    const { apiToken, ...withoutToken } = atlassian || {};
+    if (typeof apiToken === 'string' && apiToken) {
+      disk.atlassian = { ...withoutToken, apiTokenEnc: encryptSecret(apiToken) };
+    } else {
+      disk.atlassian = withoutToken;
+    }
+  }
   return disk;
 }
 
@@ -2821,13 +2873,87 @@ export function laneHasUserPrompt(lane) {
  * harnesses (Kusă explicit create, Copilot) still list on sessionStart.
  * Shared by monitor `buildView` and chat `listChatSessions` so Agents cannot
  * resurrect prompt-less Cursor ghosts via lane hydration.
+ *
+ * `cliShadow` marks a Cursor conversation_id lane that belongs to a Kusă-owned
+ * Cursor CLI turn (same prompt / linked resume id) — observe-only noise, not a
+ * second Agents row.
  */
 export function laneListedInSidebar(lane) {
   if (!lane?.id) return false;
+  if (lane.cliShadow === true) return false;
   // Kusă-created Cursor CLI chats are listed before the first prompt. IDE
   // Cursor lanes stay hidden until a user prompt arrives.
   if (lane.harness === 'cursor' && !lane.kusaOwned) return laneHasUserPrompt(lane);
   return true;
+}
+
+/** Normalize prompt bodies for matching Kusă-owned CLI turns to Cursor hook ghosts. */
+export function chatPromptTextKey(text) {
+  return promptTextKey(text);
+}
+
+/**
+ * Hints used to hide Cursor hook lanes that are shadows of a Kusă-driven
+ * Cursor CLI session (different conversation_id, same turn).
+ * @param {Iterable<object>} sessions chat or lane-like rows with messages/prompts
+ * @param {{ linkedIds?: Iterable<string> }} [extra]
+ */
+export function collectCliShadowHints(sessions, extra = {}) {
+  const linkedIds = new Set();
+  const ownedPromptKeys = new Set();
+  for (const id of extra.linkedIds || []) {
+    const s = String(id || '').trim();
+    if (s) linkedIds.add(s);
+  }
+  for (const session of sessions || []) {
+    if (!session || session.external === true) continue;
+    const provider = String(
+      session.provider
+      || session.options?.provider
+      || '',
+    ).trim().toLowerCase();
+    // Only adapter CLI providers mint a foreign conversation_id that hooks re-list.
+    if (provider !== 'cursor' && provider !== 'cursor_cli'
+      && provider !== 'copilot' && provider !== 'copilot_cli') {
+      // Kusă-owned Cursor lanes (harness cursor + kusaOwned) still count even
+      // when the chat sidecar still says provider kusa after a provider switch.
+      if (!(session.kusaOwned && (session.harness === 'cursor' || session.harness === 'github-copilot'))) {
+        continue;
+      }
+    }
+    const opts = session.options && typeof session.options === 'object' ? session.options : {};
+    for (const key of ['cliSessionId', 'cursorCliSessionId', 'copilotCliSessionId']) {
+      const id = String(opts[key] || session[key] || '').trim();
+      if (id && id !== session.id) linkedIds.add(id);
+    }
+    for (const msg of session.messages || []) {
+      if (msg?.role !== 'user') continue;
+      const key = promptTextKey(msg.text);
+      if (key) ownedPromptKeys.add(key);
+    }
+    for (const prompt of session.prompts || []) {
+      const key = promptTextKey(prompt?.text);
+      if (key) ownedPromptKeys.add(key);
+    }
+  }
+  return { linkedIds, ownedPromptKeys };
+}
+
+/**
+ * True when a monitor lane is the Cursor/Copilot hook twin of a Kusă CLI turn.
+ */
+export function laneIsCliShadow(lane, hints) {
+  if (!lane?.id || lane.kusaOwned) return false;
+  if (lane.cliShadow === true) return true;
+  if (lane.harness !== 'cursor' && lane.harness !== 'github-copilot') return false;
+  if (hints?.linkedIds?.has(lane.id)) return true;
+  const owned = hints?.ownedPromptKeys;
+  if (!owned?.size) return false;
+  for (const prompt of lane.prompts || []) {
+    const key = promptTextKey(prompt?.text);
+    if (key && owned.has(key)) return true;
+  }
+  return false;
 }
 
 /** Tool-only / prompt-less Cursor noise — observe in memory, never leave files. */
@@ -4360,6 +4486,9 @@ function readState(dir, config, origin) {
   // real provider — move the lane onto that key so Prompt History and the
   // Tool Call Viewer open with the session the user selected.
   retagKusaChatLanes(dir, state);
+  // Cursor Agent CLI turns fire IDE hooks under Cursor's own conversation_id.
+  // Mark those as cliShadow so they never join the sidebar next to the owned row.
+  suppressCursorCliShadowLanes(dir, state);
   // Prompt-less Cursor blips left on disk from older builds — drop them on
   // load so Agents / chat hydration cannot resurrect empty ghosts.
   for (const lane of Object.values(state.sessions || {})) {
@@ -4368,6 +4497,56 @@ function readState(dir, config, origin) {
     try { removeSessionFiles(dir, lane, { dropChat: true }); } catch { /* ignore */ }
   }
   return { state: finishState(state), corrupted };
+}
+
+/**
+ * When Kusă drives `agent -p`, Cursor still emits hooks keyed by its own
+ * conversation_id. Those lanes duplicate the owned chat in Agents as
+ * "external" rows. Stamp `cliShadow` (and hide via laneListedInSidebar).
+ */
+function suppressCursorCliShadowLanes(dir, state) {
+  const owned = [];
+  const linkedIds = new Set();
+  for (const lane of Object.values(state.sessions || {})) {
+    if (!lane?.id) continue;
+    let external = null;
+    let provider = '';
+    let options = null;
+    try {
+      const chat = JSON.parse(readFileSync(laneFiles(dir, lane).chat, 'utf8'));
+      if (chat && typeof chat === 'object') {
+        external = chat.external === true;
+        provider = String(chat.provider || chat.options?.provider || '').trim();
+        options = chat.options && typeof chat.options === 'object' ? chat.options : null;
+      }
+    } catch { /* no chat sidecar */ }
+    try {
+      const cfgPath = laneFiles(dir, lane).config;
+      if (existsSync(cfgPath)) {
+        const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+        if (cfg && typeof cfg === 'object') {
+          provider = provider || String(cfg.provider || '').trim();
+          options = { ...(options || {}), ...cfg };
+        }
+      }
+    } catch { /* ignore */ }
+    if (external === true) continue;
+    owned.push({
+      id: lane.id,
+      harness: lane.harness,
+      kusaOwned: Boolean(lane.kusaOwned),
+      external: false,
+      provider,
+      options,
+      prompts: lane.prompts,
+      messages: [],
+    });
+  }
+  const hints = collectCliShadowHints(owned, { linkedIds });
+  for (const lane of Object.values(state.sessions || {})) {
+    if (!laneIsCliShadow(lane, hints)) continue;
+    lane.cliShadow = true;
+  }
 }
 
 function retagKusaChatLanes(dir, state) {

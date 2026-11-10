@@ -3,16 +3,37 @@
  * --stream-partial-output` mapped into SessionChat harness events
  * (thinking / tool_start / tool_result / content / done).
  */
-import { accessSync, constants as fsConstants } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { readChatSession, writeSessionConfig } from '#features/chat/data/chat-store.mjs';
 import { runNdjsonCli } from '#features/chat/data/cli-ndjson-stream.mjs';
 import { looksLikeCliTlsCertError } from '#features/chat/data/cli-agent-env.mjs';
+import { laneFiles } from '#features/monitor/lib.mjs';
 import { looksLikeCursorTrustRequired } from './cli-trust.mjs';
 import { resolveCursorCliModel } from './models.mjs';
 import {
   applyCursorStreamEvent,
   emptyCursorStreamState,
 } from './stream-map.mjs';
+
+/**
+ * Cursor IDE hooks re-list the CLI conversation_id as an external Agents row.
+ * Stamp that lane as a shadow of the Kusă-owned session as soon as we learn it.
+ */
+function markCursorCliShadowLane(dataDir, cliSessionId, ownerSessionId) {
+  const id = String(cliSessionId || '').trim();
+  const owner = String(ownerSessionId || '').trim();
+  if (!dataDir || !id || id === owner) return;
+  try {
+    const files = laneFiles(dataDir, { harness: 'cursor', id });
+    if (!existsSync(files.json)) return;
+    const raw = JSON.parse(readFileSync(files.json, 'utf8'));
+    if (!raw || typeof raw !== 'object') return;
+    if (raw.cliShadow === true && raw.cliShadowOf === owner) return;
+    raw.cliShadow = true;
+    if (owner) raw.cliShadowOf = owner;
+    writeFileSync(files.json, `${JSON.stringify(raw, null, 2)}\n`);
+  } catch { /* best-effort — listing still filters by resume id / prompt */ }
+}
 
 function resolveCursorBinary() {
   const names = ['cursor-agent', 'agent'];
@@ -95,30 +116,48 @@ export async function runCursorStreamTurn({
 
   const emit = (ev) => { onEvent?.(ev); };
 
+  let persistedCliId = String(opts.cursorCliSessionId || opts.cliSessionId || '').trim();
+  const persistCliLink = (resolvedModel = '') => {
+    if (!dataDir || !sessionId) return;
+    const cliId = String(state.cliSessionId || '').trim();
+    const modelOut = String(resolvedModel || '').trim();
+    if (!cliId && !modelOut) return;
+    if (cliId && cliId === persistedCliId && !modelOut) return;
+    try {
+      writeSessionConfig(dataDir, sessionId, {
+        provider: 'cursor',
+        kind: session?.kind || opts.kind || 'standard',
+        ...(modelOut ? { model: modelOut } : {}),
+        ...(cliId
+          ? {
+            cursorCliSessionId: cliId,
+            cliSessionId: cliId,
+          }
+          : {}),
+      }, harness, parentId);
+      if (cliId) {
+        persistedCliId = cliId;
+        markCursorCliShadowLane(dataDir, cliId, sessionId);
+      }
+    } catch { /* best-effort */ }
+  };
+
   const { code, stderr } = await runNdjsonCli({
     command: binary,
     args,
     cwd: workspaceRoot || process.cwd(),
     signal,
-    onJson: (ev) => applyCursorStreamEvent(state, ev, emit),
+    onJson: (ev) => {
+      applyCursorStreamEvent(state, ev, emit);
+      // Persist on system/init so Agents can suppress the hook twin mid-turn.
+      if (state.cliSessionId && state.cliSessionId !== persistedCliId) {
+        persistCliLink();
+      }
+    },
   });
 
   const resolvedModel = String(state.model || model || '').trim();
-  if (state.cliSessionId || resolvedModel) {
-    try {
-      writeSessionConfig(dataDir, sessionId, {
-        provider: 'cursor',
-        kind: session?.kind || opts.kind || 'standard',
-        ...(resolvedModel ? { model: resolvedModel } : {}),
-        ...(state.cliSessionId
-          ? {
-            cursorCliSessionId: state.cliSessionId,
-            cliSessionId: state.cliSessionId,
-          }
-          : {}),
-      }, harness, parentId);
-    } catch { /* best-effort */ }
-  }
+  persistCliLink(resolvedModel);
 
   if (signal?.aborted) {
     throw Object.assign(new Error('aborted'), { name: 'AbortError' });

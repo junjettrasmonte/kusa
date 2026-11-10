@@ -29,8 +29,9 @@ export function AuthSettingsPanel({ settings, canPersist, onSettingsChange, sett
       <h2 className="mb-2 text-base font-semibold">Authentication</h2>
       <p className="mb-3 text-xs text-gray-500">
         Gate the console behind a local password + TOTP (default), or switch to OIDC / SAML SSO.
-        Credentials are stored encrypted in{' '}
-        <code className="text-sky-300">.kusa/settings.json</code> with the same master key as agent API keys.
+        Credentials use the same secrets store as agent API keys — encrypted in{' '}
+        <code className="text-sky-300">.kusa/settings.json</code> (
+        <code className="text-sky-300">~/.config/kusa/master.key</code>).
       </p>
 
       <div className="mb-6">

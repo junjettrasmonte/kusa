@@ -1,7 +1,6 @@
 import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DevToolsPanel } from './shared/DevToolsPanel.jsx';
 import { HarnessPanel } from './shared/HarnessPanel.jsx';
-import { MonitorsPanel } from './shared/MonitorsPanel.jsx';
 import { SessionPanel } from './shared/SessionPanel.jsx';
 import { SettingsPanel } from './features/settings/SettingsPanel.jsx';
 import { UserPanel } from './features/user/UserPanel.jsx';
@@ -55,13 +54,12 @@ class EditorPaneBoundary extends Component {
   }
 }
 import {
+  CHAT_PROVIDER_GROUPS,
   HARNESS_NAMES,
   HARNESS_SUBTAB_IDS,
   HARNESS_SUBTAB_LABELS,
   isChatSessionKey,
   isKusaKey,
-  MONITOR_SUBTAB_IDS,
-  MONITOR_SUBTAB_LABELS,
   SESSION_SUBTAB_IDS,
   SESSION_SUBTAB_LABELS,
   sessionLabel,
@@ -85,13 +83,6 @@ function readEditorDrawerWidth() {
 /** Core Dev Tools ids plus installed extension nav placements (e.g. CAO). */
 const { ids: DEVTOOLS_SUBTAB_IDS, labels: DEVTOOLS_SUBTAB_LABELS } = resolveDevtoolsSubTabs();
 
-function initialMonitorsSubTab() {
-  const savedTab = readLocal('monitor.tab', 'monitors');
-  if (MONITOR_SUBTAB_IDS.includes(savedTab)) return savedTab;
-  const saved = readLocal('monitor.monitorsSubTab', 'counters');
-  return MONITOR_SUBTAB_IDS.includes(saved) ? saved : 'counters';
-}
-
 /** Chat is never an initial value — a stale 'chat' must not outlive a non-Kusă session. */
 function initialSessionSubTab() {
   const savedTab = readLocal('monitor.tab', 'session');
@@ -106,8 +97,15 @@ function initialHarnessSubTab() {
   const savedTab = readLocal('monitor.tab', 'harness');
   if (savedTab === 'skills') return 'skills';
   if (HARNESS_SUBTAB_IDS.includes(savedTab)) return savedTab;
-  const saved = readLocal('monitor.harnessSubTab', 'mcp');
-  return HARNESS_SUBTAB_IDS.includes(saved) ? saved : 'mcp';
+  // Former Monitors rail: tab was `monitors` with its own sub-tab key.
+  if (savedTab === 'monitors') {
+    const fromMonitors = readLocal('monitor.monitorsSubTab', 'counters');
+    if (HARNESS_SUBTAB_IDS.includes(fromMonitors)) return fromMonitors;
+  }
+  const saved = readLocal('monitor.harnessSubTab', '');
+  if (HARNESS_SUBTAB_IDS.includes(saved)) return saved;
+  const legacyMonitors = readLocal('monitor.monitorsSubTab', 'counters');
+  return HARNESS_SUBTAB_IDS.includes(legacyMonitors) ? legacyMonitors : 'counters';
 }
 
 function initialDevtoolsSubTab() {
@@ -562,15 +560,15 @@ export default function App() {
   /** Session keys currently attached to a server turn SSE (send or resume). */
   const attachedTurns = useRef(new Set());
   const [tab, setTab] = useState(() => {
-    const saved = readLocal('monitor.tab', 'monitors');
+    const saved = readLocal('monitor.tab', 'harness');
     // Plan → Chat Session/Prompts; Graft → Developer Tools/Trail;
-    // Skills/MCP → Harness; Counters/… → Monitors; Prompts/Tools → Chat Session;
-    // Git/Trail/CAO → Developer Tools.
+    // Skills/MCP/Counters/… → Harness; Prompts/Tools → Chat Session;
+    // Git/Trail/CAO → Developer Tools. Former `monitors` rail folds into harness.
     if (saved === 'plan') return 'session';
     if (saved === 'graft') return 'devtools';
+    if (saved === 'monitors') return 'harness';
     // Settings › Auth moved to Account (user avatar below theme).
     if (saved === 'auth' || readLocal('monitor.settingsSubTab', '') === 'auth') return 'user';
-    if (MONITOR_SUBTAB_IDS.includes(saved)) return 'monitors';
     if (SESSION_SUBTAB_IDS.includes(saved)) return 'session';
     if (DEVTOOLS_SUBTAB_IDS.includes(saved)) return 'devtools';
     if (HARNESS_SUBTAB_IDS.includes(saved)) return 'harness';
@@ -580,13 +578,12 @@ export default function App() {
     const extId = readLocal('monitor.activeExtension', '');
     const ext = extId ? getBuiltinExtension(extId) : null;
     if (ext?.nav?.placement === 'devtools' && isExtensionInstalled(ext)) return 'devtools';
-    return 'monitors';
+    return 'harness';
   });
   const [theme, setTheme] = useState(() => {
     const t = document.documentElement.dataset.theme || readLocal('monitor.theme', 'dark');
     return t === 'light' ? 'light' : 'dark';
   });
-  const [monitorsSubTab, setMonitorsSubTab] = useState(initialMonitorsSubTab);
   const [sessionSubTab, setSessionSubTab] = useState(initialSessionSubTab);
   const [harnessSubTab, setHarnessSubTab] = useState(initialHarnessSubTab);
   const [devtoolsSubTab, setDevtoolsSubTab] = useState(initialDevtoolsSubTab);
@@ -637,6 +634,8 @@ export default function App() {
   const [ready, setReady] = useState(null);
   /** Live CAO / Live Chat readiness for the Dev Tools rail badge. */
   const [devtoolsExtReady, setDevtoolsExtReady] = useState({ cao: null, liveChat: null });
+  /** Live Strata probe for Dev Tools rail — tab only appears when `strata: true`. */
+  const [strataStatus, setStrataStatus] = useState(/** @type {{ strata?: boolean, loaded?: boolean|null, ok?: boolean, model?: string }|null} */ (null));
   const canDelete = typeof location !== 'undefined' && location.protocol !== 'file:';
   const canPersistSettings = canDelete;
   /**
@@ -731,12 +730,13 @@ export default function App() {
       setTab(TAB_IDS.includes(saved) ? saved : 'session');
       return;
     }
+    // Former Monitors rail folded into Harness.
+    if (tab === 'monitors') {
+      setTab('harness');
+      return;
+    }
     writeLocal('monitor.tab', tab);
   }, [tab]);
-
-  useEffect(() => {
-    writeLocal('monitor.monitorsSubTab', monitorsSubTab);
-  }, [monitorsSubTab]);
 
   useEffect(() => {
     writeLocal('monitor.sessionSubTab', sessionSubTab);
@@ -865,11 +865,44 @@ export default function App() {
     };
   }, [canDelete]);
 
+  // Strata Dev Tools item — only when the Kusă agent endpoint confirms as Strata.
+  useEffect(() => {
+    if (!canDelete) {
+      setStrataStatus(null);
+      return undefined;
+    }
+    let cancelled = false;
+    async function checkStrata() {
+      try {
+        const res = await fetch('/kusa/strata', { headers: { Accept: 'application/json' } });
+        if (!res.ok || cancelled) return;
+        const next = await res.json();
+        if (cancelled) return;
+        setStrataStatus({
+          ok: next?.ok !== false && next?.strata === true,
+          strata: next?.strata === true,
+          loaded: next?.loaded ?? null,
+          model: String(next?.model || '').trim(),
+          reason: next?.reason || '',
+        });
+      } catch {
+        if (!cancelled) setStrataStatus((prev) => (prev?.strata ? { ...prev, ok: false } : null));
+      }
+    }
+    checkStrata();
+    const id = setInterval(checkStrata, 8_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [canDelete]);
+
   const trailStatus = detectTrail ? (ready?.trail || data?.trailStatus) : null;
   const gitStatus = detectGit ? (ready?.git || data?.git) : null;
   const devtoolsNav = extensionNavEntries('devtools');
   const caoOnRail = devtoolsNav.some((e) => e.extensionId === 'cao');
   const liveChatOnRail = devtoolsNav.some((e) => e.extensionId === 'live-chat');
+  const strataOnRail = strataStatus?.strata === true;
   // Rail badge: any detected Dev Tools host that is not ok (not only when enforced).
   const trailBadge = Boolean(detectTrail && trailStatus && !trailStatus.ok);
   const gitBadge = Boolean(detectGit && gitStatus && !gitStatus.ok);
@@ -877,6 +910,15 @@ export default function App() {
   const liveChatBadge = Boolean(
     liveChatOnRail && devtoolsExtReady.liveChat && !devtoolsExtReady.liveChat.ok,
   );
+  // Strata indicator: down when unreachable or model unloaded (VRAM free).
+  const strataBadge = Boolean(
+    strataOnRail && (strataStatus?.ok === false || strataStatus?.loaded === false),
+  );
+
+  // Leave the Strata tab if the endpoint stops confirming.
+  useEffect(() => {
+    if (devtoolsSubTab === 'strata' && !strataOnRail) setDevtoolsSubTab('git');
+  }, [devtoolsSubTab, strataOnRail]);
 
   // Which session the console is showing. Always the user's selection —
   // never auto-jumps to `data.focus` while they are looking at a session.
@@ -903,12 +945,20 @@ export default function App() {
     if (data?.focus) setSelected(data.focus);
   }, [data?.focus, selected]);
 
-  const chatSession = useMemo(
-    () => (laneKey && isChatSessionKey(laneKey)
-      ? chatSessions.find((s) => s.key === laneKey) || null
-      : null),
-    [chatSessions, laneKey],
-  );
+  const chatSession = useMemo(() => {
+    if (!laneKey || !isChatSessionKey(laneKey)) return null;
+    const byKey = chatSessions.find((s) => s.key === laneKey);
+    if (byKey) return byKey;
+    // Provider switch remounts kusa:<id> → cursor:<id>; keep the open chat by id.
+    const id = laneKey.includes(':') ? laneKey.slice(laneKey.indexOf(':') + 1) : '';
+    return id ? (chatSessions.find((s) => s.id === id) || null) : null;
+  }, [chatSessions, laneKey]);
+
+  // Follow remounted session keys after an Agent-picker provider switch.
+  useEffect(() => {
+    if (!selected || !chatSession?.key) return;
+    if (chatSession.key !== selected) setSelected(chatSession.key);
+  }, [chatSession?.key, selected]);
 
   // Subagents no longer appear in the sidebar — bounce a stale child (or nested
   // escalation) selection up to the top-level orchestrator so the merged
@@ -1886,15 +1936,24 @@ export default function App() {
       delete options.allowRuleOverride;
       delete options.allowModelOverride;
     }
-    const nextProvider = options.provider || session.provider || 'kusa';
+    const nextProviderRaw = options.provider || session.provider || 'kusa';
+    const nextProvider = nextProviderRaw === 'github-copilot' ? 'copilot' : nextProviderRaw;
     const nextKind = options.kind || session.kind || 'standard';
+    const providerGroup = CHAT_PROVIDER_GROUPS.find((g) => (
+      g.id === nextProvider || g.harness === nextProvider
+    ));
+    const nextHarness = providerGroup?.harness || session.harness || 'kusa';
+    const nextKey = `${nextHarness}:${session.id}`;
     // Adapter/CAO providers don't use BYOK endpoints; Cursor owns its model list.
-    const cliBacked = nextProvider === 'cursor' || nextProvider === 'copilot'
-      || nextProvider === 'github-copilot';
+    const cliBacked = nextProvider === 'cursor' || nextProvider === 'copilot';
     const ownsModels = nextProvider === 'cursor';
     const top = {
-      provider: nextProvider === 'github-copilot' ? 'copilot' : nextProvider,
+      provider: nextProvider,
       kind: nextKind,
+      harness: nextHarness,
+      key: nextKey,
+      // Kusă-initiated provider switches stay owned here (not Cursor UI).
+      external: false,
       cliBacked,
       ownsModels,
       modelsPath: ownsModels ? '/adapters/cursor/models' : null,
@@ -1911,16 +1970,18 @@ export default function App() {
     // here can disagree with a live picker about whether a rule is still in
     // effect, and a refresh reopens the chat on the rule the user chose.
     setChatSessions((prev) => prev.map((s) => (
-      s.key === sessionKey ? { ...s, ...top, options } : s
+      s.key === sessionKey || s.id === session.id ? { ...s, ...top, options } : s
     )));
+    if (selected === sessionKey && nextKey !== sessionKey) setSelected(nextKey);
     try {
       const saved = await persistChatSession({ ...session, ...top, options });
       if (saved?.key) {
         setChatSessions((prev) => prev.map((s) => (
-          s.key === sessionKey
+          s.id === session.id
             ? { ...s, ...saved, live: s.live, status: s.status }
             : s
         )));
+        if (selected === sessionKey || selected === nextKey) setSelected(saved.key);
       }
     } catch {
       /* the pickers still apply this session; only a refresh could lose them */
@@ -2349,6 +2410,9 @@ export default function App() {
   const sessionChatFill = Boolean(chatSession) && tab === 'session';
   const editorOpen = editorTabs.length > 0;
   const mainFill = (sessionChatFill || editorOpen) && !activeExtensionId;
+  // Atlassian board needs a locked viewport height so the kanban h-scrollbar
+  // stays on-screen without scrolling the main pane.
+  const atlassianFill = activeExtensionId === 'atlassian-adapter';
   const sessionSubTabIds = chatSession
     ? SESSION_SUBTAB_IDS
     : SESSION_SUBTAB_IDS.filter((id) => id !== 'chat');
@@ -2364,18 +2428,6 @@ export default function App() {
    * a Kusă session is selected, exactly as the strip used to hide it.
    */
   const railSubTabs = {
-    monitors: {
-      ids: MONITOR_SUBTAB_IDS,
-      labels: MONITOR_SUBTAB_LABELS,
-      value: monitorsSubTab,
-      onChange: (next) => {
-        setActiveExtensionId(null);
-        setMonitorsSubTab(next);
-        setTab('monitors');
-      },
-      idPrefix: 'monitors',
-      ariaLabel: 'Monitor views',
-    },
     session: {
       ids: sessionSubTabIds,
       labels: SESSION_SUBTAB_LABELS,
@@ -2401,7 +2453,8 @@ export default function App() {
       ariaLabel: 'Harness views',
     },
     devtools: {
-      ids: DEVTOOLS_SUBTAB_IDS,
+      // Strata only joins the menu after the Kusă agent endpoint confirms.
+      ids: strataOnRail ? [...DEVTOOLS_SUBTAB_IDS, 'strata'] : DEVTOOLS_SUBTAB_IDS,
       labels: DEVTOOLS_SUBTAB_LABELS,
       value: devtoolsSubTab,
       onChange: (next) => {
@@ -2450,6 +2503,22 @@ export default function App() {
                 title: devtoolsExtReady.liveChat.ok
                   ? 'Live Chat browser voice ready'
                   : 'Live Chat voice unavailable',
+              },
+            }
+          : {}),
+        ...(strataOnRail
+          ? {
+              strata: {
+                tone: strataBadge ? 'down' : 'ok',
+                title: strataStatus?.ok === false
+                  ? 'Strata endpoint is unreachable'
+                  : strataStatus?.loaded === false
+                    ? (strataStatus.model
+                      ? `Strata ready · ${strataStatus.model} unloaded`
+                      : 'Strata ready · model unloaded')
+                    : (strataStatus?.model
+                      ? `Strata ready · ${strataStatus.model}`
+                      : 'Strata endpoint confirmed'),
               },
             }
           : {}),
@@ -2553,7 +2622,7 @@ export default function App() {
 
       <main
         ref={mainPaneRef}
-        className={`min-w-0 flex-1 ${mainFill || editorOpen ? 'flex overflow-hidden' : 'overflow-y-auto'}`}
+        className={`min-w-0 flex-1 ${mainFill || editorOpen || atlassianFill ? 'flex overflow-hidden' : 'overflow-y-auto'}`}
       >
         {editorOpen ? (
           <aside
@@ -2599,28 +2668,17 @@ export default function App() {
           className={
             mainFill
               ? 'flex min-h-0 min-w-0 flex-1 flex-col'
-              : editorOpen
-                ? 'min-h-0 min-w-0 flex-1 overflow-y-auto space-y-8 px-6 py-4 pb-6'
-                : 'space-y-8 px-6 py-4 pb-6'
+              : atlassianFill
+                ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden px-6 py-4'
+                : editorOpen
+                  ? 'min-h-0 min-w-0 flex-1 overflow-y-auto space-y-8 px-6 py-4 pb-6'
+                  : 'space-y-8 px-6 py-4 pb-6'
           }
         >
           {activeExtensionId ? (
             <ExtensionPage extensionId={activeExtensionId} canPersist={canDelete} />
           ) : (
             <>
-              {tab === 'monitors' && (
-                <MonitorsPanel
-                  subTab={monitorsSubTab}
-                  lane={lane}
-                  now={now}
-                  tokens={lane?.tokens}
-                  tokenTurns={lane?.tokenTurns}
-                  recent={lane?.recent}
-                  warnings={lane?.warnings}
-                  notes={lane?.notes}
-                  errors={data?.errors}
-                />
-              )}
               {tab === 'session' && (
                 <SessionPanel
                   subTab={sessionSubTab}
@@ -2668,7 +2726,18 @@ export default function App() {
                 />
               )}
               {tab === 'harness' && (
-                <HarnessPanel subTab={harnessSubTab} canPersist={canPersistSettings} />
+                <HarnessPanel
+                  subTab={harnessSubTab}
+                  canPersist={canPersistSettings}
+                  lane={lane}
+                  now={now}
+                  tokens={lane?.tokens}
+                  tokenTurns={lane?.tokenTurns}
+                  recent={lane?.recent}
+                  warnings={lane?.warnings}
+                  notes={lane?.notes}
+                  errors={data?.errors}
+                />
               )}
               {tab === 'devtools' && (
                 <DevToolsPanel
@@ -2682,6 +2751,7 @@ export default function App() {
                   detectGit={detectGit}
                   enforceGit={enforceGit}
                   canLiveRefreshGit={canDelete && detectGit}
+                  canLiveRefreshStrata={canDelete}
                   canPersistCao={canDelete}
                 />
               )}
@@ -2725,6 +2795,7 @@ export default function App() {
         gitBadge={gitBadge}
         caoBadge={caoBadge}
         liveChatBadge={liveChatBadge}
+        strataBadge={strataBadge}
       />
 
       {deleteDialog ? (

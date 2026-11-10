@@ -223,14 +223,6 @@ async function setSessionSubTab(page, subId) {
   await new Promise((r) => setTimeout(r, 400));
 }
 
-async function setMonitorsSubTab(page, subId) {
-  await page.evaluate((id) => {
-    localStorage.setItem('monitor.monitorsSubTab', id);
-    document.getElementById(`monitors-tab-${id}`)?.click();
-  }, subId);
-  await new Promise((r) => setTimeout(r, 400));
-}
-
 async function setHarnessSubTab(page, subId) {
   await page.evaluate((id) => {
     localStorage.setItem('monitor.harnessSubTab', id);
@@ -530,10 +522,10 @@ async function main() {
     await setSessionSubTab(page, 'prompts');
     await shot(page, 'workflow-management.png');
 
-    // 03 — Execution monitoring (counters + tool stats)
+    // 03 — Execution monitoring (counters + tool stats) under Harness
     await assertLight();
-    await setRailTab(page, 'monitors');
-    await setMonitorsSubTab(page, 'counters');
+    await setRailTab(page, 'harness');
+    await setHarnessSubTab(page, 'counters');
     await shot(page, 'execution-monitor.png');
 
     await assertLight();
@@ -542,8 +534,8 @@ async function main() {
     await shot(page, 'tool-call-viewer.png');
 
     await assertLight();
-    await setRailTab(page, 'monitors');
-    await setMonitorsSubTab(page, 'events');
+    await setRailTab(page, 'harness');
+    await setHarnessSubTab(page, 'events');
     await shot(page, 'events-timeline.png');
 
     // Harness screenshots use the Kusă demo session so the Agents sidebar

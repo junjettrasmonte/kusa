@@ -1,8 +1,12 @@
 /**
- * At-rest encryption for Kusă settings secrets (agent API key).
+ * At-rest encryption for every Kusă secret (agent API keys, console auth,
+ * extension tokens such as Atlassian).
  *
- * Ciphertext lives in the workspace `.kusa/settings.json`.
- * The master key lives outside the workspace (or in KUSA_SECRETS_KEY).
+ * One store for all of them:
+ * - Ciphertext → workspace `.kusa/settings.json` as `*Enc` envelopes
+ * - Master key → `~/.config/kusa/master.key` (or `KUSA_SECRETS_KEY`)
+ *
+ * Do not invent a parallel secrets file or per-feature crypto.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import {
@@ -16,6 +20,7 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { publicAuthSettings } from '#features/auth/shape.mjs';
+import { publicAtlassianSettings } from '#extensions/atlassian-adapter/settings.mjs';
 
 const ALGO = 'aes-256-gcm';
 const KEY_BYTES = 32;
@@ -203,6 +208,7 @@ export function publicSettings(settings = {}) {
     authOidc: authPublic.oidc,
     authSaml: authPublic.saml,
     liveChat: publicLiveChat(s.liveChat),
+    atlassian: publicAtlassianSettings(s.atlassian),
   };
 }
 

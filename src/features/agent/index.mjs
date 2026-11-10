@@ -31,9 +31,14 @@ export {
 export {
   clearStrataDetectCache,
   detectStrata,
+  probeStrataMonitor,
   readStrataContext,
   readStrataSlots,
+  strataLoadModel,
+  strataReadUpdate,
   strataRootFromBaseUrl,
+  strataSelfUpdate,
+  strataUnloadModel,
 } from './strata.mjs';
 export { supportsVision, visionLabel } from './model-capabilities.mjs';
 export {

@@ -11,8 +11,8 @@ import {
 } from '../src/app/console/ui/features/extensions/registry.js';
 
 describe('built-in extensions', () => {
-  it('lists CAO, Live Chat, and provider adapters (Kusa CLI is a core feature)', () => {
-    assert.equal(BUILTIN_EXTENSIONS.length, 4);
+  it('lists CAO, Live Chat, provider adapters, and Atlassian (Kusa CLI is a core feature)', () => {
+    assert.equal(BUILTIN_EXTENSIONS.length, 5);
     const cao = BUILTIN_EXTENSIONS[0];
     assert.equal(cao.id, 'cao');
     assert.equal(cao.builtin, true);
@@ -36,9 +36,15 @@ describe('built-in extensions', () => {
     assert.equal(copilot?.name, 'GitHub Copilot Adapter');
     assert.equal(copilot?.root, 'extensions/github-copilot-adapter');
     assert.equal(copilot?.nav, undefined);
+
+    const atlassian = getBuiltinExtension('atlassian-adapter');
+    assert.equal(atlassian?.name, 'Atlassian Adapter');
+    assert.equal(atlassian?.root, 'extensions/atlassian-adapter');
+    assert.equal(atlassian?.nav?.placement, 'devtools');
+    assert.equal(atlassian?.nav?.id, 'atlassian');
   });
 
-  it('places installed CAO and Live Chat on Dev Tools', () => {
+  it('places installed CAO, Live Chat, and Atlassian on Dev Tools', () => {
     const cao = getBuiltinExtension('cao');
     assert.equal(isExtensionInstalled(cao), true);
     assert.equal(cao.nav?.placement, 'devtools');
@@ -57,15 +63,24 @@ describe('built-in extensions', () => {
     assert.equal(extensionNavIcon('live-chat'), 'audio-lines');
     assert.ok(resolveExtensionNav(live)?.nav);
 
+    const atlassian = getBuiltinExtension('atlassian-adapter');
+    assert.equal(isExtensionInstalled(atlassian), true);
+    assert.equal(atlassian.nav?.icon, 'clipboard-list');
+    assert.equal(extensionNavIcon('atlassian'), 'clipboard-list');
+    assert.ok(resolveExtensionNav(atlassian)?.nav);
+
     const entries = extensionNavEntries('devtools');
     assert.ok(entries.some((e) => e.id === 'cao' && e.extensionId === 'cao'));
     assert.ok(entries.some((e) => e.id === 'live-chat' && e.extensionId === 'live-chat'));
+    assert.ok(entries.some((e) => e.id === 'atlassian' && e.extensionId === 'atlassian-adapter'));
 
     const { ids, labels } = resolveDevtoolsSubTabs();
     assert.deepEqual(ids.slice(0, 2), ['git', 'trail']);
     assert.ok(ids.includes('cao'));
     assert.ok(ids.includes('live-chat'));
+    assert.ok(ids.includes('atlassian'));
     assert.equal(labels.cao, 'CAO');
     assert.equal(labels['live-chat'], 'Live Chat');
+    assert.equal(labels.atlassian, 'Atlassian');
   });
 });

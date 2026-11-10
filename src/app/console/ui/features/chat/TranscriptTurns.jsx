@@ -9,7 +9,7 @@ import {
   normalizeChatMarkdown,
   truncate,
 } from '#ui/shared/lib/chatText.js';
-import { HARNESS_NAMES } from '#ui/shared/lib/format.js';
+import { HARNESS_NAMES, sessionProviderHarness } from '#ui/shared/lib/format.js';
 import { HarnessLogo } from '#ui/shared/HarnessLogo.jsx';
 import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import {
@@ -39,12 +39,8 @@ function shortModelLabel(model) {
 
 function speakerHarness(speaker) {
   if (!speaker) return '';
-  if (typeof speaker.harness === 'string' && speaker.harness.trim()) return speaker.harness.trim();
-  const provider = String(speaker.provider || '').trim().toLowerCase();
-  if (provider === 'copilot' || provider === 'github-copilot') return 'github-copilot';
-  if (provider === 'cursor') return 'cursor';
-  if (provider === 'kusa') return 'kusa';
-  return provider || 'kusa';
+  // Provider (Agent picker) first — same rule as the sidebar session mark.
+  return sessionProviderHarness(speaker);
 }
 
 function speakerRoleLabel(speaker) {

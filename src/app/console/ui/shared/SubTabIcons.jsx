@@ -5,41 +5,41 @@
  * stroke, strokeWidth 1.5, round caps + joins, aria-hidden (the label carries the
  * accessible name).
  *
- * Keys are the sub-tab ids declared in lib/format.js (MONITOR_SUBTAB_IDS,
- * SESSION_SUBTAB_IDS, DEVTOOLS_SUBTAB_IDS, HARNESS_SUBTAB_IDS,
- * SETTINGS_SUBTAB_IDS). Extension-contributed subtabs resolve via SubTabIcon
- * → LucideIcons using the extension's `nav.icon` key.
+ * Keys are the sub-tab ids declared in lib/format.js (SESSION_SUBTAB_IDS,
+ * DEVTOOLS_SUBTAB_IDS, HARNESS_SUBTAB_IDS, SETTINGS_SUBTAB_IDS).
+ * Extension-contributed subtabs resolve via SubTabIcon → LucideIcons using
+ * the extension's `nav.icon` key.
  */
 import { LucideIcon } from './LucideIcons.jsx';
 import { extensionNavIcon } from '#ui/features/extensions/registry.js';
 
 export const SUBTAB_ICONS = {
-  /** Monitors › Counters — bar chart on a baseline. */
+  /** Harness › Counters — bar chart on a baseline. */
   counters: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 13.5h11M5 13.5V8.5M8 13.5V4M11 13.5V10.5" />
     </svg>
   ),
-  /** Monitors › Tokens — hash glyph (token counts). */
+  /** Harness › Tokens — hash glyph (token counts). */
   tokens: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" d="M6.5 3.5 5.2 12.5M11 3.5 9.7 12.5M3.5 6.2h9.5M2.8 9.8h9.5" />
     </svg>
   ),
-  /** Monitors › Events — activity pulse. */
+  /** Harness › Events — activity pulse. */
   events: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" d="M2 8h2.5l1.5-4.5 2.5 9 1.5-4.5H14" />
     </svg>
   ),
-  /** Monitors › Warnings — triangle with an exclamation. */
+  /** Harness › Warnings — triangle with an exclamation. */
   warnings: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" d="M8 2.5 3 13.5h10z" />
       <path strokeLinecap="round" d="M8 6.5v3.5M8 11.6v.2" />
     </svg>
   ),
-  /** Monitors › Quality — check inside a badge. */
+  /** Harness › Quality — check inside a badge. */
   quality: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <circle cx="8" cy="8" r="5.5" />
@@ -77,6 +77,8 @@ export const SUBTAB_ICONS = {
       <path strokeLinecap="round" d="M4.5 6.3v3.4M6.3 8h3.4" />
     </svg>
   ),
+  /** Developer Tools › Strata — Lucide layers (only shown when endpoint is Strata). */
+  strata: <LucideIcon name="layers" className="h-3.5 w-3.5" strokeWidth={2.25} />,
   /** Developer Tools › Trail — dotted route between two nodes. */
   trail: (
     <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

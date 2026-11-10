@@ -1702,7 +1702,11 @@ export function SessionChat({
             <p className="text-sm font-medium text-gray-200">
               {cliBacked
                 ? `New ${(
-                  CHAT_PROVIDER_GROUPS.find((g) => g.id === session?.provider)?.label
+                  CHAT_PROVIDER_GROUPS.find((g) => (
+                    g.id === session?.provider
+                    || g.id === session?.options?.provider
+                    || g.harness === session?.harness
+                  ))?.label
                   || HARNESS_NAMES[session?.harness]
                   || 'provider'
                 )} session`

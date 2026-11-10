@@ -114,14 +114,21 @@ export function speakerFromSession(session) {
       }
     }
   }
+  const provider = session.provider || opts.provider || 'kusa';
+  // Prefer Agent-picker provider over a stale kusa: lane key (matches sidebar).
+  let harness = session.harness
+    || (typeof session.key === 'string' && session.key.includes(':')
+      ? session.key.slice(0, session.key.indexOf(':'))
+      : 'kusa');
+  const providerId = String(provider || '').trim().toLowerCase();
+  if (providerId === 'cursor') harness = 'cursor';
+  else if (providerId === 'copilot' || providerId === 'github-copilot') harness = 'github-copilot';
+  else if (providerId === 'kusa') harness = 'kusa';
   return {
     agentId: session.id || null,
     role,
-    provider: session.provider || opts.provider || 'kusa',
-    harness: session.harness
-      || (typeof session.key === 'string' && session.key.includes(':')
-        ? session.key.slice(0, session.key.indexOf(':'))
-        : 'kusa'),
+    provider,
+    harness,
     model,
     queueKey: session.key || null,
   };

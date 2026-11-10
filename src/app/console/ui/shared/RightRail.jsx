@@ -7,7 +7,6 @@ import { userAvatarInitials } from '#ui/features/user/UserPanel.jsx';
  * (→ 1.5px ink), matching the left sidebar top-bar view icons. Account uses
  * an initials avatar instead of a lucide glyph. */
 const ICONS = {
-  monitors: <LucideIcon name="chart-column" />,
   session: <LucideIcon name="bot-message-square" />,
   harness: <LucideIcon name="orbit" />,
   devtools: <LucideIcon name="tool-case" />,
@@ -93,6 +92,7 @@ export function RightRail({
   gitBadge = false,
   caoBadge = false,
   liveChatBadge = false,
+  strataBadge = false,
   /** Display name for the Account avatar initials (auth username). */
   userName = '',
   // Per-section sub-views ({ ids, labels, value, onChange, idPrefix, ariaLabel })
@@ -116,6 +116,9 @@ export function RightRail({
     }
     if (liveChatBadge) {
       parts.push('Live Chat bot is not ready (not installed or server down)');
+    }
+    if (strataBadge) {
+      parts.push('Strata endpoint is unreachable or the model is unloaded');
     }
     // Always show a status dot on Dev Tools: green when every checked host is up.
     if (!parts.length) {

@@ -76,7 +76,12 @@ export function serverSourceClosure(entry = serveEntry) {
     found.add(file);
     for (const spec of importTargets(text)) {
       const abs = resolveImportSpecifier(spec, dirname(file));
-      if (abs && abs.startsWith(srcDir + '/') && abs.endsWith('.mjs')) queue.push(abs);
+      if (!abs || !abs.endsWith('.mjs')) continue;
+      // Include src/** and extensions/** (adapters like Atlassian). Skip
+      // node_modules and anything outside the package root.
+      const underSrc = abs.startsWith(srcDir + '/');
+      const underExt = abs.startsWith(join(pkgRoot, 'extensions') + '/');
+      if (underSrc || underExt) queue.push(abs);
     }
   }
   found.add(entry);

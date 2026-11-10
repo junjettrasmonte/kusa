@@ -12,7 +12,11 @@ import {
   DEFAULT_ENDPOINT_LABEL,
   DEFAULT_MAX_STEPS,
   listAgentModelGroups,
+  probeStrataMonitor,
   readStrataContext,
+  strataLoadModel,
+  strataSelfUpdate,
+  strataUnloadModel,
   resolveAgentEndpoint,
   resolveAgentMaxSteps,
   resolveTrailPolicy,
@@ -574,6 +578,274 @@ describe('agent settings', () => {
       assert.equal(ctx.used, 42000);
       assert.equal(ctx.limit, 131072);
       assert.equal(ctx.model, 'demo');
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('probeStrataMonitor draws metrics, status, slots, and props after Strata is confirmed', async () => {
+    clearStrataDetectCache();
+    const hits = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      hits.push(href);
+      const json = (body) => new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (href.endsWith('/health')) {
+        return json({
+          status: 'ok',
+          service: 'strata',
+          max_context: 131072,
+          model: 'demo',
+          loaded: true,
+        });
+      }
+      if (href.endsWith('/update')) {
+        return json({
+          supported: true,
+          state: 'idle',
+          check: { engine: { status: 'current', installed: '0.1.47', offered: { version: '0.1.47' } } },
+        });
+      }
+      if (href.endsWith('/metrics')) {
+        return json({
+          engine: { model: 'demo', max_context: 131072, images: false },
+          live: {
+            state: 'generating',
+            queued: 1,
+            phase: 'answering',
+            prompt_tokens: 1000,
+            generated: 40,
+            max_tokens: 200,
+            elapsed_s: 1.2,
+            tok_s: 33.3,
+            prefill_tok_s_mean: 900,
+            slots: [{ slot: 0, state: 'decoding', generated: 40, tok_s: 33.3 }],
+          },
+          totals: {
+            requests: 4,
+            prompt_tokens: 8000,
+            output_tokens: 900,
+            reused: 100,
+            prompt_ms: 400,
+            decode_ms: 2000,
+          },
+          hardware: {
+            gpu_util: 72,
+            gpu_mem_used: 20 * 1024 ** 3,
+            gpu_mem_total: 24 * 1024 ** 3,
+            gpu_temp: 61,
+            gpu_power: 180,
+            cpu: 22,
+            ram_used: 30 * 1024 ** 3,
+            ram_total: 64 * 1024 ** 3,
+          },
+          hardware_static: { gpu_name: 'Test GPU', cpu_name: 'Test CPU' },
+          history: { gpu_util: [10, 72], gpu_power: [80, 180], tok_s: [0, 33] },
+          requests: [{
+            finish: 'stop',
+            prompt_tokens: 100,
+            output_tokens: 20,
+            decode_tok_s: 40,
+            duration_s: 1,
+            tail: 'secret answer',
+          }],
+        });
+      }
+      if (href.endsWith('/status')) {
+        return json({
+          busy: true,
+          queued: 1,
+          phase: 'answering',
+          generated: 40,
+          tokens_per_s: 33,
+          elapsed_s: 1.2,
+          tail: 'secret answer',
+        });
+      }
+      if (href.endsWith('/slots')) {
+        return json([{ id: 0, n_ctx: 131072, is_processing: true, n_prompt_tokens: 42000 }]);
+      }
+      if (href.endsWith('/props')) {
+        return json({
+          default_generation_settings: {
+            n_ctx: 131072,
+            params: { temperature: 0.6, top_p: 0.9, top_k: 40 },
+          },
+          total_slots: 2,
+          model_alias: 'demo',
+          model_path: '/models/demo.gguf',
+          build_info: 'Strata 0.1',
+          chat_template: 'HUGE TEMPLATE',
+          modalities: { vision: false },
+        });
+      }
+      return new Response('no', { status: 404 });
+    };
+    try {
+      const view = await probeStrataMonitor('https://strata.example/v1', {});
+      assert.equal(view.strata, true);
+      assert.equal(view.model, 'demo');
+      assert.equal(view.maxContext, 131072);
+      assert.equal(view.slots[0].used, 42000);
+      assert.equal(view.slots[0].processing, true);
+      assert.equal(view.slots[0].state, 'decoding');
+      assert.equal(view.slots[0].tokS, 33.3);
+      assert.equal(view.live.state, 'generating');
+      assert.equal(view.live.tokS, 33.3);
+      assert.equal(view.live.prefillTokS, 900);
+      assert.deepEqual(view.hardware.history.gpuPower, [80, 180]);
+      assert.equal(view.live.queued, 1);
+      assert.equal(view.props.temperature, 0.6);
+      assert.equal(view.props.totalSlots, 2);
+      assert.equal(view.hardware.gpuUtil, 72);
+      assert.equal(view.hardware.gpuName, 'Test GPU');
+      assert.equal(view.totals.requests, 4);
+      assert.equal(view.requests[0].decodeTokS, 40);
+      assert.equal(view.probes.metrics.ok, true);
+      assert.equal(view.probes.slots.ok, true);
+      assert.equal(view.loaded, true);
+      assert.equal(view.update.supported, true);
+      assert.equal(view.update.available, true);
+      const packed = JSON.stringify(view);
+      assert.equal(packed.includes('secret'), false);
+      assert.equal(packed.includes('HUGE'), false);
+      assert.equal(packed.includes('chat_template'), false);
+      for (const path of ['/metrics', '/status', '/slots', '/props', '/update']) {
+        assert.equal(hits.some((href) => href.endsWith(path)), true);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('strataLoadModel and strataUnloadModel POST JSON only after Strata confirms', async () => {
+    clearStrataDetectCache();
+    const hits = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      hits.push({ href, method: String(init.method || 'GET').toUpperCase(), body: init.body || '' });
+      const json = (body, status = 200) => new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (href.endsWith('/health')) {
+        return json({ status: 'ok', service: 'strata', loaded: true, model: 'demo' });
+      }
+      if (href.endsWith('/load') || href.includes('/unload')) {
+        return json({ ok: true });
+      }
+      return json({ error: 'no' }, 404);
+    };
+    try {
+      const loaded = await strataLoadModel('https://strata.example/v1', { Authorization: 'Bearer x' }, { model: 'demo' });
+      assert.equal(loaded.ok, true);
+      assert.equal(loaded.strata, true);
+      const loadHit = hits.find((row) => row.href.endsWith('/load'));
+      assert.equal(loadHit?.method, 'POST');
+      assert.equal(JSON.parse(loadHit.body).model, 'demo');
+
+      const unloaded = await strataUnloadModel('https://strata.example/v1', {}, { wait: true });
+      assert.equal(unloaded.ok, true);
+      assert.equal(hits.some((row) => row.href.includes('/unload?wait=1') && row.method === 'POST'), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('strataSelfUpdate posts action check/install after Strata confirms', async () => {
+    clearStrataDetectCache();
+    const hits = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      hits.push({ href, method: String(init.method || 'GET').toUpperCase(), body: init.body || '' });
+      const json = (body) => new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (href.endsWith('/health')) {
+        return json({ status: 'ok', service: 'strata', model: 'demo' });
+      }
+      if (href.endsWith('/update') && String(init.method || 'GET').toUpperCase() === 'POST') {
+        return json({
+          supported: true,
+          state: 'idle',
+          summary: 'Engine: 0.1.47 → 0.1.48',
+        });
+      }
+      return json({ error: 'no' });
+    };
+    try {
+      const checked = await strataSelfUpdate('https://strata.example/v1', {}, { action: 'check' });
+      assert.equal(checked.ok, true);
+      assert.equal(checked.action, 'check');
+      assert.match(String(checked.update?.summary || ''), /0\.1\.48/);
+      const post = hits.find((row) => row.href.endsWith('/update') && row.method === 'POST');
+      assert.equal(JSON.parse(post.body).action, 'check');
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('probeStrataMonitor marks /update unsupported when the route is missing', async () => {
+    clearStrataDetectCache();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      const json = (body, status = 200) => new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (href.endsWith('/health')) {
+        return json({ status: 'ok', service: 'strata', loaded: true, model: 'demo', max_context: 1024 });
+      }
+      if (href.endsWith('/update')) return json({ error: { message: 'not found' } }, 404);
+      if (href.endsWith('/metrics')) return json({ live: { state: 'idle' }, hardware: {}, totals: {} });
+      if (href.endsWith('/status')) return json({ busy: false });
+      if (href.endsWith('/slots')) return json([]);
+      if (href.endsWith('/props')) {
+        return json({ default_generation_settings: { n_ctx: 1024 }, model_alias: 'demo' });
+      }
+      return json({ error: 'no' }, 404);
+    };
+    try {
+      const view = await probeStrataMonitor('https://strata.example/v1', {});
+      assert.equal(view.strata, true);
+      assert.equal(view.update.supported, false);
+      assert.equal(view.update.reason, 'not-found');
+      assert.equal(view.live.state, 'idle');
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearStrataDetectCache();
+    }
+  });
+
+  it('probeStrataMonitor skips the monitor endpoints until the host confirms as Strata', async () => {
+    clearStrataDetectCache();
+    const hits = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      hits.push(String(url));
+      return new Response(JSON.stringify({ error: 'not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const view = await probeStrataMonitor('https://api.openai.com/v1', {});
+      assert.equal(view.strata, false);
+      assert.equal(view.live, undefined);
+      assert.equal(hits.some((href) => href.endsWith('/metrics')), false);
+      assert.equal(hits.some((href) => href.endsWith('/status')), false);
     } finally {
       globalThis.fetch = originalFetch;
       clearStrataDetectCache();

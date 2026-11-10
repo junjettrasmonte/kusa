@@ -124,6 +124,36 @@ export const CHAT_PROVIDER_GROUPS = [
 
 export const CHAT_HARNESSES = CHAT_PROVIDER_GROUPS.map((g) => g.harness);
 
+/**
+ * Harness for HarnessLogo / chat branding: Agent-picker provider wins over a
+ * stale kusa: lane key so Cursor/Copilot sessions do not show as Kusă.
+ */
+export function sessionProviderHarness(sessionOrSpeaker) {
+  const providerId = String(
+    sessionOrSpeaker?.provider
+    || sessionOrSpeaker?.options?.provider
+    || '',
+  ).trim().toLowerCase();
+  if (providerId) {
+    const group = CHAT_PROVIDER_GROUPS.find((g) => (
+      g.id === providerId
+      || g.harness === providerId
+      || (providerId === 'github-copilot' && g.id === 'copilot')
+    ));
+    if (group) return group.harness;
+  }
+  if (typeof sessionOrSpeaker?.harness === 'string' && sessionOrSpeaker.harness.trim()) {
+    return sessionOrSpeaker.harness.trim();
+  }
+  if (typeof sessionOrSpeaker?.key === 'string' && sessionOrSpeaker.key.includes(':')) {
+    return sessionOrSpeaker.key.slice(0, sessionOrSpeaker.key.indexOf(':'));
+  }
+  if (typeof sessionOrSpeaker?.queueKey === 'string' && sessionOrSpeaker.queueKey.includes(':')) {
+    return sessionOrSpeaker.queueKey.slice(0, sessionOrSpeaker.queueKey.indexOf(':'));
+  }
+  return 'kusa';
+}
+
 export const KUSA_HARNESS = 'kusa';
 
 export function isKusaKey(key) {
@@ -151,13 +181,11 @@ export const TAB_IDS = [
   'session',
   'harness',
   'devtools',
-  'monitors',
   'settings',
   'user',
 ];
 
 export const TAB_LABELS = {
-  monitors: 'Monitors',
   session: 'Chat Session',
   harness: 'Harness',
   devtools: 'Developer Tools',
@@ -193,23 +221,6 @@ export const SIDEBAR_VIEW_MIGRATED = {
   sessions: 'agents',
 };
 
-/** Sub-views under the Monitors rail tab (main pane topbar tabs). */
-export const MONITOR_SUBTAB_IDS = [
-  'counters',
-  'tokens',
-  'events',
-  'warnings',
-  'quality',
-];
-
-export const MONITOR_SUBTAB_LABELS = {
-  counters: 'Counters',
-  tokens: 'Tokens',
-  events: 'Events',
-  warnings: 'Warnings',
-  quality: 'Quality',
-};
-
 /** Sub-views under the Chat Session rail tab. */
 export const SESSION_SUBTAB_IDS = [
   'chat',
@@ -228,6 +239,8 @@ export const SESSION_SUBTAB_LABELS = {
  * Installed extensions may append more via `nav.placement: 'devtools'`
  * (see features/extensions/registry.js → resolveDevtoolsSubTabs).
  */
+/** Always-on Dev Tools views. `strata` is appended only when the Kusă agent
+ * endpoint confirms as Strata (see App.jsx rail subTabs). */
 export const DEVTOOLS_SUBTAB_IDS = [
   'git',
   'trail',
@@ -236,10 +249,16 @@ export const DEVTOOLS_SUBTAB_IDS = [
 export const DEVTOOLS_SUBTAB_LABELS = {
   git: 'Git',
   trail: 'Trail',
+  strata: 'Strata',
 };
 
-/** Sub-views under the Harness rail tab. */
+/** Sub-views under the Harness rail tab (includes former Monitors views). */
 export const HARNESS_SUBTAB_IDS = [
+  'counters',
+  'tokens',
+  'events',
+  'warnings',
+  'quality',
   'mcp',
   'tools',
   'skills',
@@ -247,6 +266,11 @@ export const HARNESS_SUBTAB_IDS = [
 ];
 
 export const HARNESS_SUBTAB_LABELS = {
+  counters: 'Counters',
+  tokens: 'Tokens',
+  events: 'Events',
+  warnings: 'Warnings',
+  quality: 'Quality',
   mcp: 'MCP Server',
   tools: 'Tools',
   skills: 'Skills',

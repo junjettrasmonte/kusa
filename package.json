@@ -1,6 +1,6 @@
 {
   "name": "kusa",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Kusă — harness-agnostic session counters, live dashboard, and optional MCP server for Copilot, Cursor, and VS Code Local",
   "type": "module",
   "engines": {
@@ -38,6 +38,9 @@
     "README.md",
     "CHECKLIST.md"
   ],
+  "workspaces": [
+    "extensions/*"
+  ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "demo": "node src/features/monitor/demo.mjs",
@@ -47,7 +50,9 @@
     "build": "vite build --config src/app/console/vite.config.mjs",
     "dev": "vite --config src/app/console/vite.config.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepublishOnly": "npm run voice:models && npm run build && npm test",
+    "prepublishOnly": "npm run deps:extensions:check && npm run voice:models && npm run build && npm test",
+    "deps:extensions": "node scripts/merge-extension-deps.mjs",
+    "deps:extensions:check": "node scripts/merge-extension-deps.mjs --check",
     "kusa:serve": "kusa serve",
     "cao:provider:install": "node src/features/kusa-cli/cao-provider/install.mjs",
     "cao:provider:uninstall": "node src/features/kusa-cli/cao-provider/install.mjs --uninstall"

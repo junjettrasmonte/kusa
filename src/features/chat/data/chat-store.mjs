@@ -39,6 +39,8 @@ import {
   findNestedSubagentFiles,
   laneFiles,
   laneKey,
+  collectCliShadowHints,
+  laneIsCliShadow,
   laneListedInSidebar,
   agentsRoot,
   migrateFlatSessionFiles,
@@ -434,6 +436,56 @@ function normalizeSessionOptions(raw) {
  *   When `dir` is set, `persist` writes attachment bytes into that session's
  *   attachments/ folder (for saves) and `hydrate` reloads them (for reads).
  */
+/**
+ * Bind harness/key to the Agent-picker provider when one is set.
+ * Folder stays `agents/<id>/` (shared); only the lane key + harness fields move
+ * so a kusa-keyed session switched to Cursor/Copilot survives refresh as that
+ * provider and does not hydrate as an IDE-owned external row.
+ */
+export function alignChatSessionToProvider(session) {
+  if (!session?.id) return session;
+  const providerId = String(
+    session.options?.provider
+    || session.provider
+    || '',
+  ).trim().toLowerCase();
+  if (!providerId) return session;
+  const meta = resolveChatProvider(providerId);
+  if (!meta?.harness) return session;
+  const harness = meta.harness;
+  const provider = meta.id;
+  const key = laneKey(harness, session.id);
+  if (
+    session.harness === harness
+    && session.provider === provider
+    && session.key === key
+  ) {
+    return session;
+  }
+  const modelsMeta = meta.models;
+  const trust = meta.workspaceTrust;
+  return {
+    ...session,
+    harness,
+    provider,
+    key,
+    // Kusă-initiated provider switches stay owned here (not Cursor UI).
+    // IDE-hooked rows keep external:true when already stamped.
+    external: session.external === true,
+    cliBacked: meta.turnBackend === 'cao',
+    ownsModels: Boolean(meta.ownsModels && modelsMeta?.path),
+    modelsPath: meta.ownsModels && modelsMeta?.path ? String(modelsMeta.path) : null,
+    workspaceTrust: trust
+      ? {
+        path: String(trust.path || ''),
+        label: String(trust.label || 'Trust workspace'),
+        title: String(trust.title || ''),
+        summary: String(trust.summary || ''),
+      }
+      : null,
+  };
+}
+
 export function normalizeChatSession(raw, opts = {}) {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : null;
@@ -441,19 +493,27 @@ export function normalizeChatSession(raw, opts = {}) {
   // Only the settings sidecar / explicit `options` object carries picks — never
   // scrape top-level provider/kind onto options or every write invents a sidecar.
   const options = normalizeSessionOptions(raw.options) || null;
-  const providerMeta = resolveChatProvider(options?.provider || raw.provider || raw.harness);
+  // Explicit Agent-picker provider wins over a stale kusa: lane key so a
+  // session switched to Cursor/Copilot remounts identity without a new folder.
+  const explicitProvider = options?.provider
+    || (typeof raw.provider === 'string' && raw.provider.trim() ? raw.provider.trim() : '');
+  const keyPrefix = typeof raw.key === 'string' && raw.key.includes(':')
+    ? raw.key.slice(0, raw.key.indexOf(':'))
+    : '';
+  const providerMeta = resolveChatProvider(
+    explicitProvider || raw.harness || keyPrefix || opts.harness,
+  );
   let harness = providerMeta?.harness || KUSA_HARNESS;
-  if (typeof raw.key === 'string' && raw.key.includes(':')) {
-    const prefix = raw.key.slice(0, raw.key.indexOf(':'));
-    if (CHAT_HARNESSES.includes(prefix)) harness = prefix;
-  } else if (typeof raw.harness === 'string' && CHAT_HARNESSES.includes(raw.harness)) {
-    harness = raw.harness;
-  } else if (opts.harness && CHAT_HARNESSES.includes(opts.harness)) {
-    harness = opts.harness;
+  if (!explicitProvider) {
+    if (typeof raw.harness === 'string' && CHAT_HARNESSES.includes(raw.harness)) {
+      harness = raw.harness;
+    } else if (opts.harness && CHAT_HARNESSES.includes(opts.harness)) {
+      harness = opts.harness;
+    } else if (keyPrefix && CHAT_HARNESSES.includes(keyPrefix)) {
+      harness = keyPrefix;
+    }
   }
-  const key = typeof raw.key === 'string' && raw.key.startsWith(`${harness}:`)
-    ? raw.key
-    : laneKey(harness, id);
+  const key = laneKey(harness, id);
   const provider = providerMeta?.id || providerForHarness(harness);
   const kind = normalizeSessionKind(options?.kind || raw.kind || SESSION_KIND_STANDARD);
   const messageOpts = {
@@ -675,8 +735,8 @@ export function chatSessionFromLane(lane) {
     id: lane.id,
     harness,
     provider: providerForHarness(harness),
-    // Lane-only Cursor chats are owned by Cursor UI — Kusă observes them.
-    external: isExternalOwnedHarness(harness),
+    // Kusă-owned CLI lanes stay promptable; other Cursor lanes are IDE-owned.
+    external: lane.kusaOwned === true ? false : isExternalOwnedHarness(harness),
     status: lane.active === false || lane.endedAtWall != null ? 'ended' : 'idle',
     endedAt: Number.isFinite(lane.endedAtWall) ? lane.endedAtWall : null,
     attempts: Number.isFinite(lane.promptToolAttempts) ? lane.promptToolAttempts : 0,
@@ -853,6 +913,9 @@ function mergeRicherChatSession(existing, hydrated) {
   if (hydratedMsgs.length <= existingMsgs.length) return existing;
   return {
     ...existing,
+    // Keep Kusă ownership / provider pick when a lane backfill only adds text.
+    external: existing.external === false ? false : (existing.external ?? hydrated.external),
+    provider: existing.provider || hydrated.provider,
     messages: hydratedMsgs,
     attempts: Math.max(Number(existing.attempts) || 0, Number(hydrated.attempts) || 0),
     endedAt: existing.endedAt ?? hydrated.endedAt,
@@ -873,6 +936,21 @@ export function listChatSessions(dir) {
     if (!session?.id) continue;
     byId.set(session.id, preferListedChatSession(byId.get(session.id), session));
   }
+  // Overlay composer sidecars early so cursorCliSessionId is visible when we
+  // suppress Cursor-hook ghosts of Kusă-owned CLI turns below. Then rebind
+  // harness/key to the Agent-picker provider so a switched Cursor/Copilot
+  // session still lists after refresh (not as a missing kusa: row).
+  for (const [id, session] of [...byId.entries()]) {
+    const config = readSessionConfig(
+      dir,
+      session.id,
+      session.harness,
+      session.parentId || session.options?.parentId,
+    );
+    if (config) session.options = { ...(session.options || {}), ...config };
+    byId.set(id, alignChatSessionToProvider(session));
+  }
+  const shadowHints = collectCliShadowHints(byId.values());
   for (const lane of listLaneFiles(dir)) {
     if (!lane?.id) continue;
     const existing = byId.get(lane.id);
@@ -883,6 +961,9 @@ export function listChatSessions(dir) {
     // Same gate as monitor buildView: prompt-less Cursor CLI/IDE blips must
     // not appear as empty Agents rows (tools alone ≠ a chat).
     if (!laneListedInSidebar(lane)) continue;
+    // Cursor Agent CLI turns also fire IDE hooks under a different
+    // conversation_id — that twin must not hydrate as a second external row.
+    if (laneIsCliShadow(lane, shadowHints)) continue;
     const hydrated = chatSessionFromLane(lane);
     if (!hydrated) continue;
     if (existing) byId.set(lane.id, mergeRicherChatSession(existing, hydrated));
@@ -892,7 +973,8 @@ export function listChatSessions(dir) {
   // Overlay each session's own settings. This is what makes a Rule survive a
   // page refresh: the dashboard re-reads the sidecar, and no transcript writer
   // on the turn path can have cleared it.
-  for (const session of sessions) {
+  for (let i = 0; i < sessions.length; i += 1) {
+    let session = sessions[i];
     const config = readSessionConfig(dir, session.id, session.harness, session.parentId || session.options?.parentId);
     if (config) {
       session.options = config;
@@ -901,6 +983,8 @@ export function listChatSessions(dir) {
       session.planId = config.planId || session.planId || null;
       session.subagents = Array.isArray(config.subagents) ? config.subagents : (session.subagents || []);
     }
+    session = alignChatSessionToProvider(session);
+    sessions[i] = session;
     // Live workflow override flags for orchestrator parents (JSON edits apply
     // without recreating the session). Subagents keep composer locked.
     const wfId = session.options?.workflowId || '';
@@ -976,7 +1060,10 @@ export function readChatSession(dir, sessionId, harness = null) {
     resolved = mergeRicherChatSession(fromFile, hydrated);
   }
   if (!resolved) return null;
-  return config ? { ...resolved, options: { ...(resolved.options || {}), ...config } } : resolved;
+  const withOpts = config
+    ? { ...resolved, options: { ...(resolved.options || {}), ...config } }
+    : resolved;
+  return alignChatSessionToProvider(withOpts);
 }
 
 /**
@@ -991,7 +1078,9 @@ export function readChatSession(dir, sessionId, harness = null) {
  * for as long as the session folder does.
  */
 export function writeChatSession(dir, session) {
-  const slim = slimChatSession(session, { dir });
+  // Remount harness/key to the Agent-picker provider before slim so disk and
+  // the Agents list agree after a Cursor/Copilot switch + refresh.
+  const slim = slimChatSession(alignChatSessionToProvider(session), { dir });
   if (!slim) {
     const err = new Error('invalid chat session');
     err.code = 'EINVAL';

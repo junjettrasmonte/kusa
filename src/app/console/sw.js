@@ -55,6 +55,7 @@ self.addEventListener('fetch', (event) => {
     || url.pathname.startsWith('/auth/')
     || url.pathname.startsWith('/kusa/')
     || url.pathname.startsWith('/live-chat')
+    || url.pathname.startsWith('/adapters')
     || url.pathname === '/settings'
     || url.pathname === '/ready'
     || url.pathname.startsWith('/mcp')

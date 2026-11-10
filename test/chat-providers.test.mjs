@@ -9,6 +9,8 @@ import {
   isExternalChatSession,
   listChatSessions,
   readChatSession,
+  writeChatSession,
+  writeSessionConfig,
 } from '#features/chat/data/chat-store.mjs';
 import '#features/chat/data/load-builtin-adapters.mjs';
 import {
@@ -159,6 +161,93 @@ describe('chat providers', () => {
     }
   });
 
+  it('does not list Cursor CLI hook twins of a Kusă-owned Cursor session', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kusa-cursor-cli-shadow-'));
+    try {
+      const owned = createChatSession(dir, { id: 'owned-cli', provider: 'cursor' });
+      assert.equal(owned.external, false);
+
+      // Simulate the chat transcript Kusă wrote for the owned turn.
+      const ownedDir = join(dir, 'agents', 'owned-cli');
+      writeFileSync(
+        join(ownedDir, 'chat.json'),
+        JSON.stringify({
+          ...owned,
+          messages: [{
+            id: 'u1',
+            role: 'user',
+            text: 'add a Strata item to the devtools menu',
+            thinking: '',
+            tools: [],
+            at: 1,
+          }],
+        }),
+      );
+      writeFileSync(
+        join(ownedDir, 'agent.json'),
+        JSON.stringify({
+          provider: 'cursor',
+          cursorCliSessionId: 'cursor-native-conv',
+          cliSessionId: 'cursor-native-conv',
+        }),
+      );
+      writeFileSync(
+        join(ownedDir, 'lane.json'),
+        JSON.stringify({
+          key: `cursor:owned-cli`,
+          harness: 'cursor',
+          id: 'owned-cli',
+          kusaOwned: true,
+          active: true,
+          promptIndex: 1,
+          prompts: [{ index: 1, text: 'add a Strata item to the devtools menu', atWall: 1 }],
+          startedAtWall: 1,
+        }),
+      );
+
+      // Hook twin: Cursor conversation_id lane with the same prompt (and/or
+      // the linked resume id). Must not appear as a second external Agents row.
+      mkdirSync(join(dir, 'agents', 'cursor-native-conv'), { recursive: true });
+      writeFileSync(
+        join(dir, 'agents', 'cursor-native-conv', 'lane.json'),
+        JSON.stringify({
+          key: 'cursor:cursor-native-conv',
+          harness: 'cursor',
+          id: 'cursor-native-conv',
+          kusaOwned: false,
+          active: true,
+          promptIndex: 1,
+          prompts: [{ index: 1, text: 'add a Strata item to the devtools menu', atWall: 2 }],
+          startedAtWall: 2,
+        }),
+      );
+
+      // Unrelated IDE chat with a different prompt stays listed as external.
+      mkdirSync(join(dir, 'agents', 'real-ide'), { recursive: true });
+      writeFileSync(
+        join(dir, 'agents', 'real-ide', 'lane.json'),
+        JSON.stringify({
+          key: 'cursor:real-ide',
+          harness: 'cursor',
+          id: 'real-ide',
+          kusaOwned: false,
+          active: true,
+          promptIndex: 1,
+          prompts: [{ index: 1, text: 'legitimate Cursor UI chat', atWall: 3 }],
+          startedAtWall: 3,
+        }),
+      );
+
+      const listed = listChatSessions(dir);
+      const ids = listed.map((s) => s.id).sort();
+      assert.deepEqual(ids, ['owned-cli', 'real-ide']);
+      assert.equal(listed.find((s) => s.id === 'owned-cli')?.external, false);
+      assert.equal(listed.find((s) => s.id === 'real-ide')?.external, true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('collapses the same session id across provider folders into one listed row', () => {
     const dir = mkdtempSync(join(tmpdir(), 'kusa-providers-dedupe-'));
     try {
@@ -173,6 +262,64 @@ describe('chat providers', () => {
       assert.equal(shared[0].harness, 'cursor');
       assert.equal(shared[0].provider, 'cursor');
       assert.equal(listed.length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('remounts a kusa-keyed session onto Cursor when the Agent picker is persisted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kusa-provider-switch-'));
+    try {
+      createChatSession(dir, { id: 'switched-1', provider: 'kusa', workspaceRoot: dir });
+      // Composer Agent picker only writes the sidecar provider pick.
+      writeSessionConfig(dir, 'switched-1', { provider: 'cursor' }, 'kusa');
+      const listed = listChatSessions(dir);
+      const row = listed.find((s) => s.id === 'switched-1');
+      assert.ok(row);
+      assert.equal(row.key, 'cursor:switched-1');
+      assert.equal(row.harness, 'cursor');
+      assert.equal(row.provider, 'cursor');
+      assert.equal(row.external, false);
+      assert.equal(isExternalChatSession(row), false);
+      assert.equal(row.cliBacked, true);
+
+      // Full transcript write also remounts identity on disk.
+      const saved = writeChatSession(dir, {
+        ...row,
+        messages: [{ id: 'u1', role: 'user', text: 'hi from cursor', at: 1 }],
+      });
+      assert.equal(saved.key, 'cursor:switched-1');
+      assert.equal(readChatSession(dir, 'switched-1', 'cursor')?.messages?.length, 1);
+      assert.equal(listChatSessions(dir).find((s) => s.id === 'switched-1')?.key, 'cursor:switched-1');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps Kusă-owned Cursor lanes external:false when hydrating from the lane', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kusa-owned-lane-'));
+    try {
+      const id = 'owned-lane-1';
+      mkdirSync(join(dir, 'agents', id), { recursive: true });
+      writeFileSync(
+        join(dir, 'agents', id, 'lane.json'),
+        JSON.stringify({
+          key: `cursor:${id}`,
+          harness: 'cursor',
+          id,
+          kusaOwned: true,
+          active: true,
+          promptIndex: 1,
+          prompts: [{ index: 1, text: 'owned prompt', atWall: 1 }],
+          startedAtWall: 1,
+        }),
+      );
+      const listed = listChatSessions(dir);
+      const row = listed.find((s) => s.id === id);
+      assert.ok(row);
+      assert.equal(row.external, false);
+      assert.equal(isExternalChatSession(row), false);
+      assert.equal(row.messages?.some((m) => m.role === 'user'), true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

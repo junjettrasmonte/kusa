@@ -135,6 +135,7 @@ const API_PROXY_PREFIXES = [
   '/learnings',
   '/live-chat',
   '/cao',
+  '/adapters',
   '/monitor-data.js',
   '/index.json',
 ];

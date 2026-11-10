@@ -71,6 +71,7 @@
  *   POST /live-chat/server/*     retired — returns 410
  *   POST /live-chat/session|rtc  retired — returns 410
  *   WS  /live-chat/ws            retired — closes with 410
+ *   GET/PUT /adapters/atlassian[/…]  Atlassian Adapter (Jira settings + ticket POC)
  *
  * Binds 127.0.0.1 only. No dependencies. Everything is served with no-cache
  * headers so the page's 1 s poll always sees the latest hook write.
@@ -90,7 +91,12 @@ import {
   listAgentModelGroups,
   normalizeAgentMode,
   normalizeApprovalMode,
+  probeStrataMonitor,
   readStrataContext,
+  strataLoadModel,
+  strataReadUpdate,
+  strataSelfUpdate,
+  strataUnloadModel,
   resolveAgentEndpoint,
   resolveTrailPolicy,
   requestSessionName,
@@ -123,6 +129,7 @@ import {
   resolveChatProvider,
 } from '#features/chat/data/providers.mjs';
 import '#features/chat/data/load-builtin-adapters.mjs';
+import { handleAtlassianHttp } from '#extensions/atlassian-adapter/http.mjs';
 import { runCaoChatTurn } from '#features/chat/data/cao-chat-turn.mjs';
 import {
   broadcastTurn,
@@ -652,7 +659,7 @@ export function createMonitorServer({
 
     const settings = loadMonitorSettings(dataDir);
     const chatProvider = resolveChatProvider(provider || harness || 'kusa');
-    const chatHarness = harness || chatProvider?.harness || 'kusa';
+    const chatHarness = chatProvider?.harness || harness || 'kusa';
     const useCaoTurn = Boolean(chatProvider && isCaoChatProvider(chatProvider.id));
     const agentMode = normalizeAgentMode(mode);
     // Workflow role Rule wins for Subagent gates; then session sidecar; then Settings.
@@ -1615,9 +1622,26 @@ export function createMonitorServer({
     {
       const parts = url.pathname.split('/').filter(Boolean);
       if (parts[0] === 'adapters' && parts[1]) {
+        const adapterId = decodeURIComponent(parts[1]);
+        // Atlassian is not a chat provider — dedicated Jira settings + ticket POC.
+        if (adapterId === 'atlassian') {
+          try {
+            const result = await handleAtlassianHttp({
+              parts: parts.slice(2).map((p) => decodeURIComponent(p)),
+              method: req.method,
+              dataDir,
+              query: url.searchParams,
+              readBody: () => readBody(req, 64_000),
+            });
+            sendJson(res, result.status || 200, result.body || {});
+          } catch (err) {
+            sendJson(res, 500, { error: err?.message || 'atlassian adapter failed' });
+          }
+          return;
+        }
         try {
           const result = await dispatchAdapterHttp({
-            providerId: decodeURIComponent(parts[1]),
+            providerId: adapterId,
             action: parts[2] ? decodeURIComponent(parts[2]) : '',
             method: req.method,
             workspaceRoot,
@@ -2880,6 +2904,108 @@ export function createMonitorServer({
       return;
     }
 
+    // Resolve the active Kusă agent endpoint for Strata Dev Tools routes.
+    const resolveStrataEndpoint = () => {
+      const settings = loadMonitorSettings(dataDir);
+      const model = String(url.searchParams.get('model') || settings?.agentModel || '').trim();
+      const endpointId = String(url.searchParams.get('endpointId') || '').trim();
+      return resolveAgentEndpoint({
+        ...settings,
+        agentModel: model || settings?.agentModel,
+        agentEndpointId: endpointId,
+      });
+    };
+
+    // GET /kusa/strata — Dev Tools monitor. Confirms the active Kusă endpoint
+    // with detectStrata, then reads /metrics, /status, /slots, /props, /update.
+    // A non-Strata host returns { strata: false } and those routes are not called.
+    if (req.method === 'GET' && url.pathname === '/kusa/strata') {
+      const endpoint = resolveStrataEndpoint();
+      if (!endpoint.baseUrl) {
+        sendJson(res, 200, { ok: true, strata: false, reason: 'no-endpoint', baseUrl: '' });
+        return;
+      }
+      const snapshot = await probeStrataMonitor(endpoint.baseUrl, endpoint.headers, {
+        force: url.searchParams.get('force') === '1',
+      });
+      sendJson(res, 200, {
+        ok: true,
+        reason: snapshot.strata ? 'strata' : 'not-strata',
+        baseUrl: endpoint.baseUrl,
+        requestedModel: endpoint.model,
+        ...snapshot,
+      });
+      return;
+    }
+
+    // POST /kusa/strata/load|unload — proxy Strata model control (no browser Origin).
+    if (req.method === 'POST' && (url.pathname === '/kusa/strata/load' || url.pathname === '/kusa/strata/unload')) {
+      const endpoint = resolveStrataEndpoint();
+      if (!endpoint.baseUrl) {
+        sendJson(res, 400, { ok: false, error: 'no-endpoint' });
+        return;
+      }
+      let patch = {};
+      try {
+        const raw = await readBody(req, 32_000);
+        patch = raw.trim() ? JSON.parse(raw) : {};
+      } catch (err) {
+        sendJson(res, err && err.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+        return;
+      }
+      const action = url.pathname.endsWith('/unload') ? 'unload' : 'load';
+      const result = action === 'unload'
+        ? await strataUnloadModel(endpoint.baseUrl, endpoint.headers, {
+          wait: patch?.wait === true || url.searchParams.get('wait') === '1',
+          model: String(patch?.model || endpoint.model || '').trim(),
+        })
+        : await strataLoadModel(endpoint.baseUrl, endpoint.headers, {
+          model: String(patch?.model || endpoint.model || '').trim(),
+        });
+      sendJson(res, result.ok ? 200 : (result.status && result.status >= 400 ? result.status : 502), {
+        ...result,
+        action,
+        baseUrl: endpoint.baseUrl,
+      });
+      return;
+    }
+
+    // GET/POST /kusa/strata/update — Strata self-update (check / install).
+    if (url.pathname === '/kusa/strata/update') {
+      const endpoint = resolveStrataEndpoint();
+      if (!endpoint.baseUrl) {
+        sendJson(res, req.method === 'GET' ? 200 : 400, {
+          ok: false,
+          strata: false,
+          error: 'no-endpoint',
+          baseUrl: '',
+        });
+        return;
+      }
+      if (req.method === 'GET') {
+        const result = await strataReadUpdate(endpoint.baseUrl, endpoint.headers);
+        sendJson(res, 200, { ...result, baseUrl: endpoint.baseUrl });
+        return;
+      }
+      if (req.method === 'POST') {
+        let patch = {};
+        try {
+          const raw = await readBody(req, 32_000);
+          patch = raw.trim() ? JSON.parse(raw) : {};
+        } catch (err) {
+          sendJson(res, err && err.code === 'ELARGE' ? 413 : 400, { error: 'invalid json body' });
+          return;
+        }
+        const action = patch?.action === 'install' ? 'install' : 'check';
+        const result = await strataSelfUpdate(endpoint.baseUrl, endpoint.headers, { action });
+        sendJson(res, result.ok ? 200 : (result.status && result.status >= 400 ? result.status : 502), {
+          ...result,
+          baseUrl: endpoint.baseUrl,
+        });
+        return;
+      }
+    }
+
     // Resolve a pending approval for a gated tool. Body: { id, allowed }.
     // The answer settles THIS call and nothing else. It is not a Rule: it does
     // not restamp the running turn's live options and it is never written into
@@ -3292,12 +3418,14 @@ export function createMonitorServer({
         return;
       }
       const chatProvider = resolveChatProvider(
-        existingChat?.provider
-        || existingChat?.options?.provider
+        existingChat?.options?.provider
+        || existingChat?.provider
         || existingChat?.harness
         || 'kusa',
       );
-      const chatHarness = existingChat?.harness || chatProvider?.harness || 'kusa';
+      // Provider harness wins so a kusa-keyed session switched to Cursor/Copilot
+      // still runs (and persists) under that provider after refresh.
+      const chatHarness = chatProvider?.harness || existingChat?.harness || 'kusa';
       const resolvedSessionId = existingChat?.id || chatSessionId;
       const useCaoTurn = Boolean(chatProvider && isCaoChatProvider(chatProvider.id));
 

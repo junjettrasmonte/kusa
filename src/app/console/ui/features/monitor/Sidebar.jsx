@@ -5,6 +5,7 @@ import {
   SIDEBAR_VIEW_IDS,
   SIDEBAR_VIEW_LABELS,
   SIDEBAR_VIEW_MIGRATED,
+  sessionProviderHarness,
   shortId,
   sessionLabel,
   sessionRankAt,
@@ -168,30 +169,6 @@ function isExternalSession(session) {
   // Monitor-only IDE row (no chat ownership record from createChatSession).
   if (session?.provider || Array.isArray(session?.messages)) return false;
   return true;
-}
-
-/** Map session provider id → harness used by HarnessLogo (icon follows Agent picker). */
-function sessionProviderHarness(session) {
-  const providerId = String(
-    session?.provider
-    || session?.options?.provider
-    || '',
-  ).trim().toLowerCase();
-  if (providerId) {
-    const group = CHAT_PROVIDER_GROUPS.find((g) => (
-      g.id === providerId
-      || g.harness === providerId
-      || (providerId === 'github-copilot' && g.id === 'copilot')
-    ));
-    if (group) return group.harness;
-  }
-  if (typeof session?.harness === 'string' && session.harness.trim()) {
-    return session.harness.trim();
-  }
-  if (typeof session?.key === 'string' && session.key.includes(':')) {
-    return session.key.slice(0, session.key.indexOf(':'));
-  }
-  return 'kusa';
 }
 
 function SessionProviderIcon({ session, className = '' }) {
@@ -420,6 +397,12 @@ export function Sidebar({
       onSelectModeChange?.(false);
       onClearChecked?.();
     }
+  }
+
+  /** Collapsed rail: switch view (if needed) and expand so the panel is usable. */
+  function openViewFromRail(next) {
+    selectView(next);
+    if (collapsed) onToggleCollapsed?.();
   }
 
   useEffect(() => {
@@ -722,255 +705,286 @@ export function Sidebar({
         )}
       </div>
 
-      {sessionsView && !collapsed && (
-        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-gray-800 px-2 sidebar-label">
-          <span className="truncate pl-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
-            Agents
-          </span>
-          <div className="ml-auto flex items-center gap-0.5">
-            <ToolIconButton
-              label="New agent"
-              onClick={() => {
-                setFilterOpen(false);
-                onNewSession?.({ provider: 'kusa', kind: 'standard' });
-              }}
-            >
-              <PlusIcon className="h-3.5 w-3.5" />
-            </ToolIconButton>
-            <ToolIconButton
-              label={selectMode ? 'Done selecting' : 'Select agents'}
-              pressed={selectMode}
-              onClick={() => {
-                const next = !selectMode;
-                onSelectModeChange?.(next);
-                if (!next) onClearChecked?.();
-              }}
-            >
-              <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.5 3.5h9v9h-9z" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5.5 8.2 7.2 9.9 10.5 6.1" />
-              </svg>
-            </ToolIconButton>
-            <div className="relative" ref={filterRef}>
-              <ToolIconButton
-                label={filterActive ? `Filter: ${filterLabel}` : 'Filter agents'}
-                active={filterActive || filterOpen}
-                aria-haspopup="menu"
-                aria-expanded={filterOpen}
-                onClick={() => {
-                  setFilterOpen((open) => !open);
-                }}
-              >
-                <FilterIcon className="h-3.5 w-3.5" />
-              </ToolIconButton>
-              {filterOpen && (
-                <div
-                  role="menu"
-                  aria-label="Filter agents"
-                  className="absolute right-0 top-full z-20 mt-1 min-w-[11.5rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
-                >
-                  {FILTER_SECTIONS.map((section, sectionIndex) => {
-                    const selected = new Set(sessionFilter?.[section.key] || []);
-                    return (
-                      <div
-                        key={section.key}
-                        className={sectionIndex > 0 ? 'mt-1 border-t border-gray-800 pt-1' : ''}
-                      >
-                        <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                          {section.label}
-                        </p>
-                        {section.options.map((option) => {
-                          const on = selected.has(option.id);
-                          return (
-                            <button
-                              key={option.id}
-                              type="button"
-                              role="menuitemcheckbox"
-                              aria-checked={on}
-                              className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] font-medium ${
-                                on
-                                  ? 'bg-gray-800/70 text-gray-100'
-                                  : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
-                              }`}
-                              onClick={() => {
-                                onSessionFilterChange?.(
-                                  toggleFilterId(sessionFilter, section.key, option.id),
-                                );
-                              }}
-                            >
-                              <span
-                                className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border ${
-                                  on
-                                    ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300'
-                                    : 'border-gray-600 bg-gray-950 text-transparent'
-                                }`}
-                                aria-hidden="true"
-                              >
-                                <svg className="h-2.5 w-2.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="m3.5 8.5 3 3 6-6.5" />
-                                </svg>
-                              </span>
-                              {option.label}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    );
-                  })}
-                  {filterActive ? (
-                    <div className="mt-1 border-t border-gray-800 pt-1">
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="flex w-full items-center px-3 py-1.5 text-left text-[11px] font-medium text-gray-500 hover:bg-gray-800 hover:text-gray-200"
-                        onClick={() => {
-                          onSessionFilterChange?.({ providers: [], kinds: [], statuses: [] });
-                        }}
-                      >
-                        Clear filters
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {sessionsView && !collapsed && selectMode && (
-        <div className="flex items-center gap-1 border-b border-gray-800 px-2 py-1.5 sidebar-label">
-          <button
-            type="button"
-            className="rounded px-2 py-1 text-[11px] text-gray-500 hover:bg-gray-800 hover:text-gray-300"
-            onClick={toggleSelectAll}
-            disabled={!visibleKeys.length}
-          >
-            {allVisibleChecked ? 'Clear' : 'All'}
-          </button>
-          <button
-            type="button"
-            className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!canDelete || deleteGate || checkedVisible.length === 0}
-            title={
-              deleteGate
-                ? 'A delete confirmation is open — answer it first'
-                : canDelete
-                  ? 'Delete selected sessions'
-                  : 'Start the local console server (npm run kusa:serve) to delete sessions'
-            }
-            onClick={() => onDeleteKeys?.(checkedVisible)}
-          >
-            <TrashIcon />
-            Delete{checkedVisible.length ? ` ${checkedVisible.length}` : ''}
-          </button>
-        </div>
-      )}
-
-      {sessionsView ? (
+      {collapsed ? (
         <nav
-          id="sidebar-panel-sessions"
-          role="tabpanel"
-          aria-labelledby="sidebar-view-sessions"
-          className="flex-1 overflow-y-auto py-2 text-sm"
-          aria-label="Agents"
+          role="tablist"
+          aria-label="Sidebar views"
+          aria-orientation="vertical"
+          className="flex flex-1 flex-col items-center gap-0.5 overflow-y-auto py-2"
         >
-          {agentsLoading ? (
-            collapsed ? null : (
-              <div
-                className="flex items-center gap-2 px-3 py-3 text-[11px] text-gray-500 sidebar-label"
-                role="status"
-                aria-live="polite"
+          {SIDEBAR_VIEW_IDS.map((id) => {
+            const on = id === view;
+            return (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                id={`sidebar-view-${id}`}
+                aria-selected={on}
+                title={SIDEBAR_VIEW_LABELS[id]}
+                aria-label={SIDEBAR_VIEW_LABELS[id]}
+                className={`relative flex h-9 w-9 items-center justify-center rounded-md transition-colors ${
+                  on
+                    ? 'bg-gray-800 text-gray-100'
+                    : 'text-gray-500 hover:bg-gray-800/70 hover:text-gray-200'
+                }`}
+                onClick={() => openViewFromRail(id)}
               >
-                <LucideIcon name="loader-circle" className="h-3.5 w-3.5 animate-spin text-gray-500" />
-                Loading agents…
-              </div>
-            )
-          ) : !filteredSessions.length ? (
-            collapsed ? null : (
-              <p className="px-3 py-2 text-[11px] text-gray-600 sidebar-label">
-                No agents yet. Use + to start one.
-              </p>
-            )
-          ) : (
-            <>
-              {standardSessions.map((s) => renderSessionRow(s))}
-              {orchestratedSessions.length ? (
-                <>
-                  {!collapsed && standardSessions.length ? (
-                    <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
-                  ) : null}
-                  {!collapsed ? (
-                    <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
-                      Orchestrated
-                    </p>
-                  ) : null}
-                  {orchestratedSessions.map((s) => renderSessionRow(s))}
-                </>
-              ) : null}
-              {archivedSessions.length ? (
-                <>
-                  {!collapsed && openSessions.length ? (
-                    <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
-                  ) : null}
-                  {!collapsed ? (
-                    <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
-                      Archived
-                    </p>
-                  ) : null}
-                  {archivedSessions.map((s) => renderSessionRow(s))}
-                </>
-              ) : null}
-            </>
-          )}
+                {VIEW_ICONS[id]}
+                {on ? (
+                  <span
+                    className="absolute inset-y-1.5 -left-0.5 w-0.5 rounded-full bg-emerald-500"
+                    aria-hidden="true"
+                  />
+                ) : null}
+              </button>
+            );
+          })}
         </nav>
       ) : (
         <>
-          {/* Explorer / Search own their section headers (label + refresh). */}
-          {!collapsed && view !== 'explorer' && view !== 'search' ? (
-            <div className="flex h-9 shrink-0 items-center border-b border-gray-800 px-2 sidebar-label">
+          {sessionsView && (
+            <div className="flex h-9 shrink-0 items-center gap-1 border-b border-gray-800 px-2 sidebar-label">
               <span className="truncate pl-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
-                {SIDEBAR_VIEW_LABELS[view]}
+                Agents
               </span>
-            </div>
-          ) : null}
-          {view === 'explorer' ? (
-            <ExplorerPanel onOpenFile={onOpenFile} collapsed={collapsed} />
-          ) : view === 'search' ? (
-            <SearchPanel onOpenFile={onOpenFile} collapsed={collapsed} />
-          ) : view === 'extensions' ? (
-            <ExtensionsPanel
-              canPersist={canPersistExtensions}
-              selectedId={activeExtensionId}
-              onSelect={onSelectExtension}
-              collapsed={collapsed}
-            />
-          ) : (
-            <div
-              id={`sidebar-panel-${view}`}
-              role="tabpanel"
-              aria-labelledby={`sidebar-view-${view}`}
-              className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-3 sidebar-label"
-            >
-              <p className="text-[11px] leading-relaxed text-gray-600">
-                {view === 'terminal'
-                  ? 'Terminal — not implemented yet.'
-                  : 'Coming soon.'}
-              </p>
+              <div className="ml-auto flex items-center gap-0.5">
+                <ToolIconButton
+                  label="New agent"
+                  onClick={() => {
+                    setFilterOpen(false);
+                    onNewSession?.({ provider: 'kusa', kind: 'standard' });
+                  }}
+                >
+                  <PlusIcon className="h-3.5 w-3.5" />
+                </ToolIconButton>
+                <ToolIconButton
+                  label={selectMode ? 'Done selecting' : 'Select agents'}
+                  pressed={selectMode}
+                  onClick={() => {
+                    const next = !selectMode;
+                    onSelectModeChange?.(next);
+                    if (!next) onClearChecked?.();
+                  }}
+                >
+                  <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3.5 3.5h9v9h-9z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5.5 8.2 7.2 9.9 10.5 6.1" />
+                  </svg>
+                </ToolIconButton>
+                <div className="relative" ref={filterRef}>
+                  <ToolIconButton
+                    label={filterActive ? `Filter: ${filterLabel}` : 'Filter agents'}
+                    active={filterActive || filterOpen}
+                    aria-haspopup="menu"
+                    aria-expanded={filterOpen}
+                    onClick={() => {
+                      setFilterOpen((open) => !open);
+                    }}
+                  >
+                    <FilterIcon className="h-3.5 w-3.5" />
+                  </ToolIconButton>
+                  {filterOpen && (
+                    <div
+                      role="menu"
+                      aria-label="Filter agents"
+                      className="absolute right-0 top-full z-20 mt-1 min-w-[11.5rem] rounded-md border border-gray-700 bg-gray-900 py-1 shadow-lg"
+                    >
+                      {FILTER_SECTIONS.map((section, sectionIndex) => {
+                        const selectedIds = new Set(sessionFilter?.[section.key] || []);
+                        return (
+                          <div
+                            key={section.key}
+                            className={sectionIndex > 0 ? 'mt-1 border-t border-gray-800 pt-1' : ''}
+                          >
+                            <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                              {section.label}
+                            </p>
+                            {section.options.map((option) => {
+                              const on = selectedIds.has(option.id);
+                              return (
+                                <button
+                                  key={option.id}
+                                  type="button"
+                                  role="menuitemcheckbox"
+                                  aria-checked={on}
+                                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] font-medium ${
+                                    on
+                                      ? 'bg-gray-800/70 text-gray-100'
+                                      : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+                                  }`}
+                                  onClick={() => {
+                                    onSessionFilterChange?.(
+                                      toggleFilterId(sessionFilter, section.key, option.id),
+                                    );
+                                  }}
+                                >
+                                  <span
+                                    className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border ${
+                                      on
+                                        ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300'
+                                        : 'border-gray-600 bg-gray-950 text-transparent'
+                                    }`}
+                                    aria-hidden="true"
+                                  >
+                                    <svg className="h-2.5 w-2.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <path strokeLinecap="round" strokeLinejoin="round" d="m3.5 8.5 3 3 6-6.5" />
+                                    </svg>
+                                  </span>
+                                  {option.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        );
+                      })}
+                      {filterActive ? (
+                        <div className="mt-1 border-t border-gray-800 pt-1">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="flex w-full items-center px-3 py-1.5 text-left text-[11px] font-medium text-gray-500 hover:bg-gray-800 hover:text-gray-200"
+                            onClick={() => {
+                              onSessionFilterChange?.({ providers: [], kinds: [], statuses: [] });
+                            }}
+                          >
+                            Clear filters
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
-        </>
-      )}
 
-      {sessionsView && !collapsed && statusLine && (
-        <footer className="mt-auto shrink-0 border-t border-gray-800 px-2.5 py-1.5 sidebar-label">
-          <p
-            className={`truncate whitespace-nowrap text-[10px] leading-none ${statusLine.className || 'text-gray-500'}`}
-            title={statusFooterTitle}
-          >
-            {statusFooterLine}
-          </p>
-        </footer>
+          {sessionsView && selectMode && (
+            <div className="flex items-center gap-1 border-b border-gray-800 px-2 py-1.5 sidebar-label">
+              <button
+                type="button"
+                className="rounded px-2 py-1 text-[11px] text-gray-500 hover:bg-gray-800 hover:text-gray-300"
+                onClick={toggleSelectAll}
+                disabled={!visibleKeys.length}
+              >
+                {allVisibleChecked ? 'Clear' : 'All'}
+              </button>
+              <button
+                type="button"
+                className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!canDelete || deleteGate || checkedVisible.length === 0}
+                title={
+                  deleteGate
+                    ? 'A delete confirmation is open — answer it first'
+                    : canDelete
+                      ? 'Delete selected sessions'
+                      : 'Start the local console server (npm run kusa:serve) to delete sessions'
+                }
+                onClick={() => onDeleteKeys?.(checkedVisible)}
+              >
+                <TrashIcon />
+                Delete{checkedVisible.length ? ` ${checkedVisible.length}` : ''}
+              </button>
+            </div>
+          )}
+
+          {sessionsView ? (
+            <nav
+              id="sidebar-panel-sessions"
+              role="tabpanel"
+              aria-labelledby="sidebar-view-agents"
+              className="flex-1 overflow-y-auto py-2 text-sm"
+              aria-label="Agents"
+            >
+              {agentsLoading ? (
+                <div
+                  className="flex items-center gap-2 px-3 py-3 text-[11px] text-gray-500 sidebar-label"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <LucideIcon name="loader-circle" className="h-3.5 w-3.5 animate-spin text-gray-500" />
+                  Loading agents…
+                </div>
+              ) : !filteredSessions.length ? (
+                <p className="px-3 py-2 text-[11px] text-gray-600 sidebar-label">
+                  No agents yet. Use + to start one.
+                </p>
+              ) : (
+                <>
+                  {standardSessions.map((s) => renderSessionRow(s))}
+                  {orchestratedSessions.length ? (
+                    <>
+                      {standardSessions.length ? (
+                        <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
+                      ) : null}
+                      <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
+                        Orchestrated
+                      </p>
+                      {orchestratedSessions.map((s) => renderSessionRow(s))}
+                    </>
+                  ) : null}
+                  {archivedSessions.length ? (
+                    <>
+                      {openSessions.length ? (
+                        <hr className="mx-2 my-2 border-0 border-t border-gray-800" />
+                      ) : null}
+                      <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 sidebar-label">
+                        Archived
+                      </p>
+                      {archivedSessions.map((s) => renderSessionRow(s))}
+                    </>
+                  ) : null}
+                </>
+              )}
+            </nav>
+          ) : (
+            <>
+              {/* Explorer / Search own their section headers (label + refresh). */}
+              {view !== 'explorer' && view !== 'search' ? (
+                <div className="flex h-9 shrink-0 items-center border-b border-gray-800 px-2 sidebar-label">
+                  <span className="truncate pl-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
+                    {SIDEBAR_VIEW_LABELS[view]}
+                  </span>
+                </div>
+              ) : null}
+              {view === 'explorer' ? (
+                <ExplorerPanel onOpenFile={onOpenFile} />
+              ) : view === 'search' ? (
+                <SearchPanel onOpenFile={onOpenFile} />
+              ) : view === 'extensions' ? (
+                <ExtensionsPanel
+                  canPersist={canPersistExtensions}
+                  selectedId={activeExtensionId}
+                  onSelect={onSelectExtension}
+                />
+              ) : (
+                <div
+                  id={`sidebar-panel-${view}`}
+                  role="tabpanel"
+                  aria-labelledby={`sidebar-view-${view}`}
+                  className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-3 sidebar-label"
+                >
+                  <p className="text-[11px] leading-relaxed text-gray-600">
+                    {view === 'terminal'
+                      ? 'Terminal — not implemented yet.'
+                      : 'Coming soon.'}
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+
+          {sessionsView && statusLine && (
+            <footer className="mt-auto shrink-0 border-t border-gray-800 px-2.5 py-1.5 sidebar-label">
+              <p
+                className={`truncate whitespace-nowrap text-[10px] leading-none ${statusLine.className || 'text-gray-500'}`}
+                title={statusFooterTitle}
+              >
+                {statusFooterLine}
+              </p>
+            </footer>
+          )}
+        </>
       )}
 
     </aside>

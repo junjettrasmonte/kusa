@@ -1,0 +1,14 @@
+{
+  "name": "@kusa/atlassian-adapter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kusă Atlassian Adapter extension — Jira Cloud via jira.js + SVAR views",
+  "dependencies": {
+    "@svar-ui/react-calendar": "^2.7.1",
+    "@svar-ui/react-gantt": "^2.8.2",
+    "@svar-ui/react-grid": "^2.7.6",
+    "@svar-ui/react-kanban": "^2.6.0",
+    "jira.js": "^5.4.0"
+  }
+}
