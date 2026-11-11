@@ -102,17 +102,24 @@ export {
   ASK_TOOL_DEFS,
   ASK_TIMEOUT_MS,
   MAX_OPTIONS,
+  MAX_QUESTIONS,
   askSystemPromptAddon,
   askToolSchemas,
   createAskGate,
+  matchOptionToken,
   normalizeAskArgs,
+  optionLetter,
+  parseComposerAskText,
 } from './ask.mjs';
 export {
+  ESCALATE_CANCEL_LABEL,
   ESCALATE_TOOL_DEFS,
   createEscalateTools,
+  escalateProviderOptions,
   escalateSystemPromptAddon,
   escalateToolSchemas,
   isOrchestratedSessionKey,
+  providerFromEscalateAsk,
 } from './escalate.mjs';
 export {
   ASSIGN_TOOL_DEFS,

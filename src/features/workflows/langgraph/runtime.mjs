@@ -1,10 +1,11 @@
 /**
- * Serve-facing helpers for the plan-execute LangGraph wrap.
+ * Serve-facing helpers for LangGraph workflow wraps (plan-execute + extension
+ * ticket-first).
  *
- * - `onOrchestratorTurnSettled` advances the graph after a parent turn ends
- *   (parks on `await_approval` when a draft/ready plan is linked).
- * - `resumeAfterPlanApproval` resumes an interrupted thread, or falls back to
- *   `continueWorkflowAfterPlanApproval` when only a run marker remains.
+ * - `onOrchestratorTurnSettled` advances the matching graph after a parent turn
+ *   ends (plan-execute parks on `await_approval`; ticket-first on `await_direction`).
+ * - `resumeAfterPlanApproval` resumes an interrupted plan-execute thread, or
+ *   falls back to `continueWorkflowAfterPlanApproval` when only a run marker remains.
  */
 import { Command } from '@langchain/langgraph';
 import {
@@ -16,6 +17,11 @@ import {
   readChatSession,
   readSessionConfig,
 } from '#features/chat/data/chat-store.mjs';
+import {
+  compileTicketFirstGraph,
+  TICKET_FIRST_WORKFLOW_ID,
+} from '#extensions/atlassian-adapter/langgraph/ticket-first.mjs';
+import { readSessionTicket } from '#extensions/atlassian-adapter/tools.mjs';
 import {
   deleteRunMarker,
   getMemorySaver,
@@ -38,6 +44,15 @@ export function threadIdForSession(sessionKey) {
 }
 
 /**
+ * @param {string} sessionKey
+ * @returns {string}
+ */
+export function threadIdForTicketFirstSession(sessionKey) {
+  const key = String(sessionKey || '').trim();
+  return key ? `ticket-first:${key}` : '';
+}
+
+/**
  * @param {object | null | undefined} session
  * @param {object | null | undefined} [config]
  * @returns {boolean}
@@ -51,6 +66,24 @@ export function isPlanExecuteOrchestrator(session, config = null) {
     cfg.workflowId || session?.workflowId || session?.options?.workflowId || '',
   ).trim();
   if (workflowId !== PLAN_EXECUTE_WORKFLOW_ID) return false;
+  const kind = String(cfg.kind || session?.kind || session?.options?.kind || '').toLowerCase();
+  return kind === 'orchestrated' || Boolean(workflowId);
+}
+
+/**
+ * @param {object | null | undefined} session
+ * @param {object | null | undefined} [config]
+ * @returns {boolean}
+ */
+export function isTicketFirstOrchestrator(session, config = null) {
+  if (!session && !config) return false;
+  const cfg = config || session?.options || {};
+  const parentId = String(session?.parentId || cfg.parentId || '').trim();
+  if (parentId) return false;
+  const workflowId = String(
+    cfg.workflowId || session?.workflowId || session?.options?.workflowId || '',
+  ).trim();
+  if (workflowId !== TICKET_FIRST_WORKFLOW_ID) return false;
   const kind = String(cfg.kind || session?.kind || session?.options?.kind || '').toLowerCase();
   return kind === 'orchestrated' || Boolean(workflowId);
 }
@@ -121,6 +154,13 @@ export function findPendingPlanForOrchestrator(dataDir, orchestrator) {
 const graphsByDataDir = new Map();
 
 /**
+ * @type {Map<string, {
+ *   graph: import('@langchain/langgraph').CompiledStateGraph,
+ * }>}
+ */
+const ticketFirstGraphsByDataDir = new Map();
+
+/**
  * @param {string} dataDir
  * @param {{
  *   startTurn?: Function | null,
@@ -158,9 +198,36 @@ export function getPlanExecuteGraph(dataDir, ctx = {}) {
   return graph;
 }
 
+/**
+ * @param {string} dataDir
+ */
+export function getTicketFirstGraph(dataDir) {
+  const key = String(dataDir || '') || ':memory:';
+  let entry = ticketFirstGraphsByDataDir.get(key);
+  if (entry) return entry.graph;
+
+  const checkpointer = getMemorySaver(dataDir);
+  const graph = compileTicketFirstGraph({
+    checkpointer,
+    resolveIssueKey: ({ sessionKey, issueKey }) => {
+      const fromArg = String(issueKey || '').trim();
+      if (fromArg) return fromArg;
+      const ticket = readSessionTicket(dataDir, sessionKey);
+      return String(ticket?.key || '').trim();
+    },
+  });
+  ticketFirstGraphsByDataDir.set(key, { graph });
+  return graph;
+}
+
 /** Drop compiled graphs (tests). */
 export function resetPlanExecuteGraphs() {
   graphsByDataDir.clear();
+}
+
+/** Drop ticket-first compiled graphs (tests). */
+export function resetTicketFirstGraphs() {
+  ticketFirstGraphsByDataDir.clear();
 }
 
 /**
@@ -179,8 +246,80 @@ async function graphHasPendingInterrupt(graph, config) {
 }
 
 /**
- * After an orchestrator parent turn settles: if plan-execute and a pending
- * plan exists, invoke the graph until it parks on approval interrupt.
+ * Advance the ticket-first graph after an orchestrator turn: ensure ticket,
+ * note kickoff, park on await_direction for the human's next-step choice.
+ *
+ * @param {{
+ *   dataDir: string,
+ *   sessionKey: string,
+ * }} args
+ */
+async function onTicketFirstTurnSettled({ dataDir = '', sessionKey = '' } = {}) {
+  const key = String(sessionKey || '').trim();
+  if (!dataDir || !key) return { ok: false, skipped: true, reason: 'missing_args' };
+
+  const threadId = threadIdForTicketFirstSession(key);
+  const graph = getTicketFirstGraph(dataDir);
+  const runnableConfig = { configurable: { thread_id: threadId } };
+
+  if (await graphHasPendingInterrupt(graph, runnableConfig)) {
+    const marker = readRunMarker(dataDir, threadId);
+    writeRunMarker(dataDir, threadId, {
+      sessionKey: key,
+      workflowId: TICKET_FIRST_WORKFLOW_ID,
+      issueKey: marker?.issueKey || '',
+      phase: 'await_direction',
+    });
+    return { ok: true, skipped: true, reason: 'already_waiting', threadId };
+  }
+
+  const ticket = readSessionTicket(dataDir, key);
+  const issueKey = String(ticket?.key || '').trim();
+  const input = {
+    sessionKey: key,
+    workflowId: TICKET_FIRST_WORKFLOW_ID,
+    issueKey,
+    phase: '',
+    choice: null,
+  };
+
+  let result;
+  try {
+    result = await graph.invoke(input, runnableConfig);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || 'ticket-first graph invoke failed',
+      threadId,
+      issueKey,
+    };
+  }
+
+  const interrupted = Array.isArray(result?.__interrupt__) && result.__interrupt__.length > 0;
+  const resolvedKey = String(result?.issueKey || issueKey || '').trim();
+  if (interrupted || resolvedKey) {
+    writeRunMarker(dataDir, threadId, {
+      sessionKey: key,
+      workflowId: TICKET_FIRST_WORKFLOW_ID,
+      issueKey: resolvedKey,
+      phase: interrupted ? 'await_direction' : String(result?.phase || 'done'),
+    });
+  } else {
+    deleteRunMarker(dataDir, threadId);
+  }
+
+  return {
+    ok: true,
+    threadId,
+    issueKey: resolvedKey,
+    phase: result?.phase || (interrupted ? 'await_direction' : 'done'),
+    interrupted,
+  };
+}
+
+/**
+ * After an orchestrator parent turn settles: dispatch to plan-execute or
+ * ticket-first LangGraph lifecycle wraps.
  *
  * @param {{
  *   dataDir: string,
@@ -202,8 +341,13 @@ export async function onOrchestratorTurnSettled({
 
   const session = readChatSession(dataDir, key);
   const config = readSessionConfig(dataDir, session?.id || key) || session?.options || {};
+
+  if (isTicketFirstOrchestrator(session, config)) {
+    return onTicketFirstTurnSettled({ dataDir, sessionKey: key });
+  }
+
   if (!isPlanExecuteOrchestrator(session, config)) {
-    return { ok: true, skipped: true, reason: 'not_plan_execute' };
+    return { ok: true, skipped: true, reason: 'not_langgraph_workflow' };
   }
 
   const pending = findPendingPlanForOrchestrator(dataDir, {
@@ -379,4 +523,4 @@ export async function resumeAfterPlanApproval({
   };
 }
 
-export { PLAN_EXECUTE_WORKFLOW_ID };
+export { PLAN_EXECUTE_WORKFLOW_ID, TICKET_FIRST_WORKFLOW_ID };

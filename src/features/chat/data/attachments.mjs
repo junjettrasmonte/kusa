@@ -45,7 +45,7 @@ export function normalizeAttachment(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const name = String(raw.name || '').replace(/[^\S\n]+/g, ' ').trim().slice(0, ATTACHMENT_LIMITS.nameChars);
   if (!name) return null;
-  const kind = raw.kind === 'image' || raw.kind === 'text' || raw.kind === 'other'
+  const kind = raw.kind === 'image' || raw.kind === 'text' || raw.kind === 'other' || raw.kind === 'jira'
     ? raw.kind
     : null;
   const mime = String(raw.mime || '').slice(0, 80);
@@ -71,13 +71,24 @@ export function normalizeAttachment(raw) {
     }
     return attachment;
   }
-  if (resolved === 'text') {
+  // text + jira both carry readable `text` for the model; jira also keeps
+  // issueKey so the console can open the shared ticket popup on click.
+  if (resolved === 'text' || resolved === 'jira') {
     if (typeof raw.text === 'string' && raw.text.length) {
       attachment.text = raw.text.length > ATTACHMENT_LIMITS.textChars
         ? raw.text.slice(0, ATTACHMENT_LIMITS.textChars)
         : raw.text;
     } else if (raw.note) {
       attachment.note = String(raw.note);
+    }
+    const issueKey = String(raw.issueKey || '').replace(/^:/, '').trim().slice(0, 64);
+    if (issueKey) attachment.issueKey = issueKey;
+    if (resolved === 'jira') {
+      const summary = String(raw.summary || '').trim().slice(0, 240);
+      const url = String(raw.url || '').trim().slice(0, 500);
+      if (summary) attachment.summary = summary;
+      if (url) attachment.url = url;
+      if (!attachment.note) attachment.note = String(raw.note || 'Jira issue');
     }
     return attachment;
   }
@@ -236,7 +247,10 @@ export function persistAttachment(dir, sessionId, attachment, harness = 'kusa') 
   let bytes = null;
   if (normalized.kind === 'image' && normalized.dataUrl) {
     bytes = dataUrlToBuffer(normalized.dataUrl);
-  } else if (normalized.kind === 'text' && typeof normalized.text === 'string') {
+  } else if (
+    (normalized.kind === 'text' || normalized.kind === 'jira')
+    && typeof normalized.text === 'string'
+  ) {
     bytes = Buffer.from(normalized.text, 'utf8');
   }
 
@@ -258,6 +272,9 @@ export function persistAttachment(dir, sessionId, attachment, harness = 'kusa') 
   };
   if (normalized.mime) slim.mime = normalized.mime;
   if (normalized.note) slim.note = normalized.note;
+  if (normalized.issueKey) slim.issueKey = normalized.issueKey;
+  if (normalized.summary) slim.summary = normalized.summary;
+  if (normalized.url) slim.url = normalized.url;
   if (fileName) slim.file = fileName;
   else if (normalized.kind === 'image' && !slim.note) slim.note = 'image not included';
   return slim;
@@ -298,7 +315,7 @@ export function hydrateAttachment(dir, sessionId, attachment, harness = 'kusa') 
         dataUrl: bufferToDataUrl(buf, normalized.mime || 'image/png'),
       };
     }
-    if (normalized.kind === 'text') {
+    if (normalized.kind === 'text' || normalized.kind === 'jira') {
       const text = buf.toString('utf8');
       return {
         ...normalized,

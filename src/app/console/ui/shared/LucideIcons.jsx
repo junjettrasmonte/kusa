@@ -350,6 +350,27 @@ const PATHS = {
       <path d="M9 17a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2v-2z" />
     </>
   ),
+  /** https://lucide.dev/icons/ellipsis — ticket overflow / context menu. */
+  ellipsis: (
+    <>
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="19" cy="12" r="1" />
+      <circle cx="5" cy="12" r="1" />
+    </>
+  ),
+  /** https://lucide.dev/icons/fold-horizontal — collapse kanban column. */
+  'fold-horizontal': (
+    <>
+      <path d="M2 12h6" />
+      <path d="M22 12h-6" />
+      <path d="M12 2v2" />
+      <path d="M12 8v2" />
+      <path d="M12 14v2" />
+      <path d="M12 20v2" />
+      <path d="m19 9-3 3 3 3" />
+      <path d="m5 15 3-3-3-3" />
+    </>
+  ),
   /** https://lucide.dev/icons/folder — closed directory. */
   folder: (
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
@@ -544,6 +565,31 @@ const PATHS = {
       <circle cx="6" cy="18" r="3" />
       <path d="M18 9a9 9 0 0 1-9 9" />
     </>
+  ),
+  /** https://lucide.dev/icons/link — copy browse URL. */
+  link: (
+    <>
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </>
+  ),
+  /** https://lucide.dev/icons/copy — copy issue key / clipboard. */
+  copy: (
+    <>
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </>
+  ),
+  /** https://lucide.dev/icons/circle-dot — change status / workflow state. */
+  'circle-dot': (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <circle cx="12" cy="12" r="1" />
+    </>
+  ),
+  /** https://lucide.dev/icons/paperclip — attach to chat. */
+  paperclip: (
+    <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551" />
   ),
 };
 

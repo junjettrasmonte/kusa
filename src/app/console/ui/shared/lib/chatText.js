@@ -118,13 +118,40 @@ export function groupAssistantParts(parts) {
  */
 export function answeredAskText(ask) {
   const answer = ask?.answer;
-  const selected = Number(answer?.selected);
-  if (selected >= 0) {
-    const options = Array.isArray(ask?.options) ? ask.options : [];
-    const option = options.find((o) => Number(o?.index) === selected);
-    if (option?.label) return String(option.label);
+  const freeText = String(answer?.freeText ?? '').trim();
+  // Custom / clarification / override — show the user's words, not invented picks.
+  if (answer?.kind === 'custom' || answer?.custom === true) {
+    return freeText;
   }
-  return String(answer?.freeText ?? '');
+  const multiAnswers = Array.isArray(answer?.answers) ? answer.answers : null;
+  if (multiAnswers?.length) {
+    const questions = Array.isArray(ask?.questions) ? ask.questions : [];
+    return multiAnswers.map((row, i) => {
+      const qIndex = Number(row?.questionIndex);
+      const q = questions.find((entry) => Number(entry?.index) === qIndex) || questions[i];
+      const options = Array.isArray(q?.options) ? q.options : [];
+      const selected = Number(
+        row?.selected != null ? row.selected : row?.optionIndex,
+      );
+      const option = selected >= 0
+        ? options.find((o) => Number(o?.index) === selected)
+        : null;
+      const label = option?.label || String(row?.freeText ?? '').trim() || '(no choice)';
+      const qText = String(q?.question || `Question ${i + 1}`).trim();
+      return `${i + 1}. ${qText} → ${label}`;
+    }).join('\n');
+  }
+  // Number(null) === 0 — only treat an explicit selected index as a pick.
+  const rawSelected = answer?.selected;
+  if (rawSelected != null && rawSelected !== '') {
+    const selected = Number(rawSelected);
+    if (Number.isInteger(selected) && selected >= 0) {
+      const options = Array.isArray(ask?.options) ? ask.options : [];
+      const option = options.find((o) => Number(o?.index) === selected);
+      if (option?.label) return String(option.label);
+    }
+  }
+  return freeText;
 }
 
 /**

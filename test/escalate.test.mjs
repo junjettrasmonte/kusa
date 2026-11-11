@@ -5,15 +5,17 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   APPROVAL_GATED_TOOLS,
+  ESCALATE_CANCEL_LABEL,
   ESCALATE_TOOL_DEFS,
   agentToolGroups,
-  createApprovalGate,
   createEscalateTools,
   createTrailAwareTools,
+  escalateProviderOptions,
   escalateSystemPromptAddon,
   escalateToolSchemas,
   isOrchestratedSessionKey,
   openaiToolSchemasWithTrail,
+  providerFromEscalateAsk,
 } from '#features/agent/index.mjs';
 import {
   createChatSession,
@@ -31,6 +33,34 @@ function tempDir() {
   const dir = mkdtempSync(join(tmpdir(), 'kusa-escalate-'));
   dirs.push(dir);
   return dir;
+}
+
+/** Auto-pick a provider option (or cancel) for ask-gated call() tests. */
+function askPick({ providerId = 'kusa', cancel = false } = {}) {
+  return async (prompt) => {
+    const options = Array.isArray(prompt?.options) ? prompt.options : [];
+    if (cancel) {
+      const idx = options.findIndex(
+        (o) => String(o?.label || '').toLowerCase() === ESCALATE_CANCEL_LABEL.toLowerCase(),
+      );
+      assert.ok(idx >= 0, 'cancel option should be present');
+      return {
+        ok: true,
+        selected: { index: idx, label: options[idx].label, detail: options[idx].detail || '' },
+        answer: options[idx].label,
+      };
+    }
+    const idx = options.findIndex(
+      (o) => String(o?.detail || '').toLowerCase() === providerId
+        || String(o?.label || '').toLowerCase() === providerId,
+    );
+    assert.ok(idx >= 0, `provider option "${providerId}" should be listed`);
+    return {
+      ok: true,
+      selected: { index: idx, label: options[idx].label, detail: options[idx].detail || '' },
+      answer: options[idx].label,
+    };
+  };
 }
 
 afterEach(() => {
@@ -64,10 +94,10 @@ describe('kusa_escalate', () => {
       dataDir: dir,
       sessionKey: 'kusa:std-1',
       workspaceRoot: dir,
+      ask: askPick(),
       runTurn: async () => ({ ok: true, text: 'should not run' }),
     });
     const result = await tools.call('kusa_escalate', {
-      provider: 'kusa',
       action: 'fix the flaky test',
     });
     assert.equal(result.ok, false);
@@ -88,6 +118,8 @@ describe('kusa_escalate', () => {
 
     const addon = escalateSystemPromptAddon({ dataDir: dir, sessionKey: 'kusa:orch-1' });
     assert.match(addon, /kusa_escalate/);
+    assert.match(addon, /no timer/i);
+    assert.match(addon, /fresh ask/i);
 
     const calls = [];
     const tools = createEscalateTools({
@@ -122,6 +154,7 @@ describe('kusa_escalate', () => {
     assert.equal(result.subagent?.role, 'escalation');
     assert.equal(result.subagent?.parentId, 'orch-1');
     assert.equal(calls.length, 1);
+    assert.match(result.message, /one turn/i);
 
     // Nested Subagents are indexed on the parent Agent's sidecar.
     const parentCfg = readSessionConfig(dir, 'orch-1');
@@ -180,11 +213,11 @@ describe('kusa_escalate', () => {
     const stdTools = createTrailAwareTools(dir, {
       dataDir: dir,
       sessionKey: 'kusa:std',
+      onAsk: () => ({ optionIndex: 0 }),
       onEscalateTurn: async () => ({ ok: true, text: 'x' }),
     });
     assert.equal(stdTools.defs.some((d) => d.name === 'kusa_escalate'), false);
     const stdCall = await stdTools.call('kusa_escalate', {
-      provider: 'kusa',
       action: 'blocked step',
     });
     assert.equal(stdCall.ok, false);
@@ -193,8 +226,14 @@ describe('kusa_escalate', () => {
     const orchTools = createTrailAwareTools(dir, {
       dataDir: dir,
       sessionKey: 'kusa:orch',
-      // Pre-approve so this test covers wiring, not the approval gate.
-      approvalMode: 'allow',
+      // Ask channel picks the first listed provider (ranked preference / id order).
+      onAsk: (ask) => {
+        const options = Array.isArray(ask?.options) ? ask.options : [];
+        const idx = options.findIndex(
+          (o) => String(o?.detail || '').toLowerCase() === 'kusa',
+        );
+        return { optionIndex: idx >= 0 ? idx : 0 };
+      },
       onEscalateTurn: async () => ({
         ok: true,
         type: 'done',
@@ -204,15 +243,19 @@ describe('kusa_escalate', () => {
     });
     assert.ok(orchTools.defs.some((d) => d.name === 'kusa_escalate'));
     const orchCall = await orchTools.call('kusa_escalate', {
-      provider: 'kusa',
       action: 'blocked step',
+      provider: 'kusa',
     });
     assert.equal(orchCall.ok, true);
     assert.equal(orchCall.text, 'unblocked');
   });
 
-  it('is approval-gated: Deny refuses before starting a provider turn', async () => {
-    assert.equal(APPROVAL_GATED_TOOLS.has('kusa_escalate'), true);
+  it('is ask-gated (no timer): lists providers and refuses without a channel', async () => {
+    assert.equal(APPROVAL_GATED_TOOLS.has('kusa_escalate'), false);
+    const options = escalateProviderOptions({ preferredId: 'kusa' });
+    assert.ok(options.some((o) => o.detail === 'kusa'));
+    assert.equal(options[options.length - 1].label, ESCALATE_CANCEL_LABEL);
+
     const dir = tempDir();
     createChatSession(dir, {
       id: 'orch-gate',
@@ -225,27 +268,26 @@ describe('kusa_escalate', () => {
       dataDir: dir,
       sessionKey: 'kusa:orch-gate',
       workspaceRoot: dir,
-      approval: createApprovalGate({ mode: 'deny' }),
       runTurn: async () => {
         ran += 1;
         return { ok: true, text: 'should not run' };
       },
     });
     const denied = await tools.call('kusa_escalate', {
-      provider: 'kusa',
       action: 'handoff a blocked write',
       reason: 'need cursor',
     });
     assert.equal(denied.ok, false);
-    assert.equal(denied.denied, true);
-    assert.match(denied.error, /DENIED before escalating/i);
+    assert.equal(denied.unanswered, true);
+    assert.match(denied.error, /interactive ask channel/i);
     assert.equal(ran, 0);
 
     const addon = escalateSystemPromptAddon({ dataDir: dir, sessionKey: 'kusa:orch-gate' });
-    assert.match(addon, /approval-gated/i);
+    assert.match(addon, /asks the user/i);
+    assert.doesNotMatch(addon, /approval-gated/i);
   });
 
-  it('is approval-gated: Allow runs the escalated turn', async () => {
+  it('is ask-gated: provider pick runs one turn; cancel refuses', async () => {
     const dir = tempDir();
     createChatSession(dir, {
       id: 'orch-allow',
@@ -253,19 +295,47 @@ describe('kusa_escalate', () => {
       kind: SESSION_KIND_ORCHESTRATED,
       workflowId: 'plan-execute',
     });
+    const asks = [];
     const tools = createEscalateTools({
       dataDir: dir,
       sessionKey: 'kusa:orch-allow',
       workspaceRoot: dir,
-      approval: createApprovalGate({ mode: 'allow' }),
+      ask: async (prompt, callId) => {
+        asks.push({ prompt, callId });
+        return askPick({ providerId: 'kusa' })(prompt);
+      },
       runTurn: async () => ({ ok: true, type: 'done', text: 'allowed handoff', turnId: 't-allow' }),
     });
     const allowed = await tools.call('kusa_escalate', {
-      provider: 'kusa',
       action: 'finish the blocked step',
     });
     assert.equal(allowed.ok, true);
     assert.equal(allowed.text, 'allowed handoff');
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0].prompt.allowFreeText, false);
+    assert.ok(asks[0].prompt.options.some((o) => o.label === ESCALATE_CANCEL_LABEL));
+
+    // A second escalate prompts another ask — nothing sticky from the first pick.
+    const tools2 = createEscalateTools({
+      dataDir: dir,
+      sessionKey: 'kusa:orch-allow',
+      workspaceRoot: dir,
+      ask: askPick({ cancel: true }),
+      runTurn: async () => ({ ok: true, text: 'should not run' }),
+    });
+    const cancelled = await tools2.call('kusa_escalate', {
+      action: 'try again',
+    });
+    assert.equal(cancelled.ok, false);
+    assert.equal(cancelled.cancelled, true);
+    assert.match(cancelled.error, /cancelled/i);
+
+    const mapped = providerFromEscalateAsk({
+      ok: true,
+      selected: { label: ESCALATE_CANCEL_LABEL },
+      answer: ESCALATE_CANCEL_LABEL,
+    });
+    assert.equal(mapped.cancelled, true);
   });
 
   it('nests under the escalating Subagent folder like assign delegation', async () => {

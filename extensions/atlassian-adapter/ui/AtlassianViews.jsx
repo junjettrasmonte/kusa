@@ -3,6 +3,7 @@
  * Timeline, Backlog, Workload.
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Kanban, Willow as KanbanWillow, WillowDark as KanbanWillowDark } from '@svar-ui/react-kanban';
 import { Grid, Willow as GridWillow, WillowDark as GridWillowDark } from '@svar-ui/react-grid';
 import { Gantt, Willow as GanttWillow, WillowDark as GanttWillowDark } from '@svar-ui/react-gantt';
@@ -174,7 +175,7 @@ function priorityTone(priority) {
 }
 
 /** Jira-style card: summary, labels, parent, then type/key/ETA/priority/assignee. */
-function IssueCardContent({ card, onSelect }) {
+function IssueCardContent({ card, onSelect, onMenu }) {
   const issue = card?.issue || {};
   const labels = Array.isArray(issue.labels) ? issue.labels : [];
   const parentKey = issue.epicKey || '';
@@ -183,10 +184,37 @@ function IssueCardContent({ card, onSelect }) {
     : parentKey;
   const eta = formatEta(issue.duedate);
   const initials = assigneeInitials(issue.assignee);
+  const issueKey = String(issue.key || card?.id || '').replace(/^:/, '').trim();
+
+  function openMenu(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!issueKey || !onMenu) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    onMenu({
+      issueKey,
+      issue: { ...issue, key: issueKey },
+      x: Math.round(rect.right),
+      y: Math.round(rect.bottom),
+    });
+  }
 
   return (
-    <div className="flex flex-col gap-2 p-0.5 text-left">
-      <p className="line-clamp-3 text-[13px] font-medium leading-snug text-gray-100">
+    <div className="relative flex flex-col gap-2 p-0.5 text-left">
+      {onMenu && issueKey ? (
+        <button
+          type="button"
+          data-ticket-menu="1"
+          title="Ticket actions"
+          aria-label="Ticket actions"
+          onClick={openMenu}
+          onContextMenu={openMenu}
+          className="atlassian-card-menu absolute -right-0.5 -top-0.5 z-[2] inline-flex h-6 w-6 items-center justify-center rounded text-gray-500 opacity-0 hover:bg-gray-800 hover:text-gray-100 focus-visible:opacity-100 focus-visible:outline-none"
+        >
+          <LucideIcon name="ellipsis" className="h-3.5 w-3.5" />
+        </button>
+      ) : null}
+      <p className={`line-clamp-3 text-[13px] font-medium leading-snug text-gray-100 ${onMenu ? 'pr-6' : ''}`}>
         {issue.summary || card.label || issue.key}
       </p>
 
@@ -295,24 +323,122 @@ function IssueCardContent({ card, onSelect }) {
   );
 }
 
-function StatusBoard({ model, onSelect, className = 'h-full w-full overflow-auto p-2', style }) {
+function StatusBoard({
+  model,
+  onSelect,
+  onTicketContextMenu,
+  className = 'h-full w-full overflow-auto p-2',
+  style,
+  /** Shared across swimlanes — Jira collapses status columns board-wide. */
+  collapsedColumns = null,
+  onCollapsedColumnsChange,
+}) {
   // Keep cardContent identity stable — a new function each render remounts every card
   // (SVAR treats it as a new component type), which flickers parent-chip hover.
   const selectRef = useRef(onSelect);
   selectRef.current = onSelect;
+  const menuRef = useRef(onTicketContextMenu);
+  menuRef.current = onTicketContextMenu;
+  const apiRef = useRef(null);
+  const boardRef = useRef(null);
+  /** DOM slots appended into SVAR column headers for Lucide collapse buttons. */
+  const [collapseSlots, setCollapseSlots] = useState(() => []);
   const CardContent = useMemo(
     () => function AtlassianCardContent({ card }) {
       return (
         <IssueCardContent
           card={card}
           onSelect={(key) => selectRef.current?.(key)}
+          onMenu={(payload) => menuRef.current?.(payload)}
         />
       );
     },
     [],
   );
 
+  const columns = useMemo(() => {
+    const list = Array.isArray(model?.columns) ? model.columns : [];
+    if (!collapsedColumns) return list;
+    return list.map((col) => ({
+      ...col,
+      collapsed: collapsedColumns.has(String(col.id)),
+    }));
+  }, [model?.columns, collapsedColumns]);
+
+  function setColumnCollapsed(id, collapsed) {
+    if (!onCollapsedColumnsChange || !collapsedColumns) return;
+    const key = String(id);
+    const next = new Set(collapsedColumns);
+    if (collapsed) next.add(key);
+    else next.delete(key);
+    if (next.size === collapsedColumns.size && [...next].every((k) => collapsedColumns.has(k))) {
+      return;
+    }
+    onCollapsedColumnsChange(next);
+  }
+
+  function columnFromSection(section) {
+    if (!section || !apiRef.current) return null;
+    const parent = section.parentElement;
+    if (!parent) return null;
+    const siblings = [...parent.querySelectorAll(':scope > section.wx-column')];
+    const idx = siblings.indexOf(section);
+    if (idx < 0) return null;
+    const cols = apiRef.current.getState?.()?.viewData?.columns;
+    return Array.isArray(cols) ? cols[idx] || null : null;
+  }
+
+  function toggleColumnSection(section) {
+    const col = columnFromSection(section);
+    if (!col || !apiRef.current) return false;
+    void apiRef.current.exec('update-column', {
+      id: col.id,
+      column: { collapsed: !col.collapsed },
+    });
+    return true;
+  }
+
+  useLayoutEffect(() => {
+    const root = boardRef.current;
+    if (!root) return undefined;
+    let cancelled = false;
+    let raf = 0;
+
+    function sync() {
+      if (cancelled) return;
+      const headers = [...root.querySelectorAll(
+        'section.wx-column:not(.wx-collapsed) > header.wx-column-header',
+      )];
+      const next = headers.map((header) => {
+        let slot = header.querySelector(':scope > .atlassian-collapse-slot');
+        if (!slot) {
+          slot = document.createElement('span');
+          slot.className = 'atlassian-collapse-slot';
+          header.appendChild(slot);
+        }
+        return slot;
+      });
+      setCollapseSlots((prev) => {
+        if (prev.length === next.length && prev.every((el, i) => el === next[i])) return prev;
+        return next;
+      });
+    }
+
+    sync();
+    const mo = new MutationObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(sync);
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      mo.disconnect();
+    };
+  }, [columns, model?.cards?.length]);
+
   function handleActivate(event) {
+    if (event.target.closest?.('[data-ticket-menu]')) return;
     const nested = event.target.closest?.('[data-issue-key]');
     if (nested) {
       const nestedKey = String(nested.getAttribute('data-issue-key') || '').replace(/^:/, '').trim();
@@ -320,14 +446,50 @@ function StatusBoard({ model, onSelect, className = 'h-full w-full overflow-auto
       return;
     }
     const key = issueKeyFromTarget(event.target, 'article.wx-card[data-id]');
-    if (key) onSelect?.(key);
+    if (key) {
+      onSelect?.(key);
+      return;
+    }
+
+    if (event.target.closest?.('.wx-add')) return;
+
+    const section = event.target.closest?.('section.wx-column');
+    if (!section) return;
+
+    if (
+      event.target.closest?.('.atlassian-collapse-btn')
+      || section.classList.contains('wx-collapsed')
+      || event.target.closest?.('.wx-column-header')
+    ) {
+      toggleColumnSection(section);
+    }
+  }
+
+  function handleContextMenu(event) {
+    if (!onTicketContextMenu) return;
+    const nested = event.target.closest?.('[data-issue-key]');
+    const key = nested
+      ? String(nested.getAttribute('data-issue-key') || '').replace(/^:/, '').trim()
+      : issueKeyFromTarget(event.target, 'article.wx-card[data-id]');
+    if (!key) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const card = (model?.cards || []).find((c) => String(c.id || c.issue?.key || '').replace(/^:/, '') === key);
+    onTicketContextMenu({
+      issueKey: key,
+      issue: card?.issue || { key },
+      x: event.clientX,
+      y: event.clientY,
+    });
   }
 
   return (
     <div
+      ref={boardRef}
       className={`${className} atlassian-ticket-board`}
       style={style}
       onClick={handleActivate}
+      onContextMenu={handleContextMenu}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         const nested = event.target.closest?.('[data-issue-key]');
@@ -346,20 +508,102 @@ function StatusBoard({ model, onSelect, className = 'h-full w-full overflow-auto
     >
       <Kanban
         cards={model.cards}
-        columns={model.columns}
+        columns={columns}
         readonly
         cardContent={CardContent}
+        init={(api) => {
+          apiRef.current = api;
+        }}
+        onUpdateColumn={(ev) => {
+          if (ev?.id == null) return;
+          setColumnCollapsed(ev.id, Boolean(ev.column?.collapsed));
+        }}
       />
+      {collapseSlots.map((slot, index) => createPortal(
+        <button
+          type="button"
+          className="atlassian-collapse-btn"
+          aria-label="Collapse column"
+          title="Collapse column"
+        >
+          <LucideIcon name="fold-horizontal" className="h-3.5 w-3.5" />
+        </button>,
+        slot,
+        `collapse-${index}`,
+      ))}
     </div>
   );
 }
 
-function ListGrid({ issues, onSelect, className = 'box-border h-full w-full max-w-full min-w-0 overflow-hidden p-2', style }) {
+function ListGrid({
+  issues,
+  onSelect,
+  onTicketContextMenu,
+  className = 'box-border h-full w-full max-w-full min-w-0 overflow-hidden p-2',
+  style,
+}) {
   const rows = useMemo(() => toGridRows(issues), [issues]);
+  const menuRef = useRef(onTicketContextMenu);
+  menuRef.current = onTicketContextMenu;
+
+  const columns = useMemo(() => {
+    const MenuCell = function TicketMenuCell({ row }) {
+      const issue = row?.issue || row || {};
+      const issueKey = String(issue.key || row?.id || '').replace(/^:/, '').trim();
+      if (!issueKey) return null;
+      return (
+        <button
+          type="button"
+          data-ticket-menu="1"
+          title="Ticket actions"
+          aria-label="Ticket actions"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const rect = event.currentTarget.getBoundingClientRect();
+            menuRef.current?.({
+              issueKey,
+              issue: { ...issue, key: issueKey },
+              x: Math.round(rect.right),
+              y: Math.round(rect.bottom),
+            });
+          }}
+          className="inline-flex h-6 w-6 items-center justify-center rounded text-gray-500 hover:bg-gray-800 hover:text-gray-100"
+        >
+          <LucideIcon name="ellipsis" className="h-3.5 w-3.5" />
+        </button>
+      );
+    };
+    return [
+      ...GRID_COLUMNS,
+      {
+        id: '_menu',
+        header: '',
+        width: 40,
+        cell: MenuCell,
+      },
+    ];
+  }, []);
 
   function handleActivate(event) {
+    if (event.target.closest?.('[data-ticket-menu]')) return;
     const key = issueKeyFromTarget(event.target, '.wx-row[data-id], [role="row"][data-id]');
     if (key) onSelect?.(key);
+  }
+
+  function handleContextMenu(event) {
+    if (!onTicketContextMenu) return;
+    const key = issueKeyFromTarget(event.target, '.wx-row[data-id], [role="row"][data-id]');
+    if (!key) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const issue = (issues || []).find((row) => String(row.key || '') === key) || { key };
+    onTicketContextMenu({
+      issueKey: key,
+      issue: { ...issue, key },
+      x: event.clientX,
+      y: event.clientY,
+    });
   }
 
   return (
@@ -367,6 +611,7 @@ function ListGrid({ issues, onSelect, className = 'box-border h-full w-full max-
       className={`${className} atlassian-ticket-list`}
       style={style}
       onClick={handleActivate}
+      onContextMenu={handleContextMenu}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         const key = issueKeyFromTarget(event.target, '.wx-row[data-id], [role="row"][data-id]');
@@ -378,7 +623,7 @@ function ListGrid({ issues, onSelect, className = 'box-border h-full w-full max-
       <div className="h-full w-full max-w-full min-w-0 overflow-hidden [contain:inline-size]">
         <Grid
           data={rows}
-          columns={GRID_COLUMNS}
+          columns={columns}
           onSelectRow={({ id }) => {
             if (id != null) onSelect?.(String(id));
           }}
@@ -527,6 +772,7 @@ function GroupedBoard({
   mode, // 'kanban' | 'list'
   groups,
   onSelect,
+  onTicketContextMenu,
   openIds,
   onToggle,
   statuses = null,
@@ -535,6 +781,8 @@ function GroupedBoard({
   /** Controlled ungrouped height override from parent frame. */
   soloHeight = null,
   onSoloHeightChange,
+  collapsedColumns = null,
+  onCollapsedColumnsChange,
 }) {
   const grouped = groups.length > 1 || (groups[0] && groups[0].id !== 'all');
   /** Per-group board heights — resizing one card must not resize the others. */
@@ -563,6 +811,7 @@ function GroupedBoard({
           <ListGrid
             issues={issues}
             onSelect={onSelect}
+            onTicketContextMenu={onTicketContextMenu}
             className="box-border h-full w-full max-w-full min-w-0 overflow-hidden p-2"
             style={{ height: '100%' }}
           />
@@ -570,8 +819,11 @@ function GroupedBoard({
           <StatusBoard
             model={toKanbanModel(issues, { statuses })}
             onSelect={onSelect}
+            onTicketContextMenu={onTicketContextMenu}
             className="h-full w-full overflow-auto p-2"
             style={{ height: '100%' }}
+            collapsedColumns={collapsedColumns}
+            onCollapsedColumnsChange={onCollapsedColumnsChange}
           />
         )}
         <HeightResizeHandle
@@ -615,6 +867,7 @@ function GroupedBoard({
                   <ListGrid
                     issues={group.issues}
                     onSelect={onSelect}
+                    onTicketContextMenu={onTicketContextMenu}
                     className="box-border w-full max-w-full min-w-0 overflow-hidden p-1"
                     style={{ height: boardHeight }}
                   />
@@ -622,8 +875,11 @@ function GroupedBoard({
                   <StatusBoard
                     model={toKanbanModel(group.issues, { statuses })}
                     onSelect={onSelect}
+                    onTicketContextMenu={onTicketContextMenu}
                     className="w-full overflow-auto p-1"
                     style={{ height: boardHeight }}
+                    collapsedColumns={collapsedColumns}
+                    onCollapsedColumnsChange={onCollapsedColumnsChange}
                   />
                 )}
                 <HeightResizeHandle
@@ -644,6 +900,7 @@ export function AtlassianViews({
   // Reserved for per-view selection chrome (kanban/grid highlight).
   selectedKey = null,
   onSelect,
+  onTicketContextMenu,
   view: controlledView,
   onViewChange,
   groupBy = 'none',
@@ -685,6 +942,8 @@ export function AtlassianViews({
 
   // Expand/collapse all is driven by the toolbar; per-card toggles stay local.
   const [collapsed, setCollapsed] = useState(() => new Set());
+  /** Status columns collapsed horizontally (Jira-style); shared across swimlanes. */
+  const [collapsedColumns, setCollapsedColumns] = useState(() => new Set());
   useEffect(() => {
     if (!isGrouped) {
       setCollapsed(new Set());
@@ -740,11 +999,97 @@ export function AtlassianViews({
           background: transparent !important;
           --wx-kanban-bg: transparent;
         }
+        /* Jira-style horizontal column collapse */
+        .atlassian-ticket-board .wx-column-header {
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        /* Hide SVAR chevrons — Lucide fold-horizontal is portaled in instead. */
+        .atlassian-ticket-board .wx-toggle,
+        .atlassian-ticket-board .wx-expand {
+          display: none !important;
+        }
+        /* Count on the left, title fills, collapse icon on the right. */
+        .atlassian-ticket-board .wx-column-header > .wx-count {
+          order: -1;
+          flex: 0 0 auto;
+          margin: 0;
+          min-width: 1.25rem;
+          text-align: center;
+          font-size: 11px;
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          color: #9ca3af;
+        }
+        .atlassian-ticket-board .wx-column-header > .wx-title {
+          order: 0;
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+        .atlassian-ticket-board .wx-column-header > .atlassian-collapse-slot {
+          order: 2;
+          display: inline-flex;
+          flex: 0 0 auto;
+          margin-left: auto;
+          opacity: 0;
+          transition: opacity 120ms ease;
+        }
+        .atlassian-ticket-board .wx-column-header:hover > .atlassian-collapse-slot,
+        .atlassian-ticket-board .wx-column-header:focus-within > .atlassian-collapse-slot {
+          opacity: 1;
+        }
+        .atlassian-ticket-board .atlassian-collapse-btn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 22px;
+          height: 22px;
+          padding: 0;
+          border: none;
+          border-radius: 4px;
+          background: transparent;
+          color: #9ca3af;
+          cursor: pointer;
+        }
+        .atlassian-ticket-board .atlassian-collapse-btn:hover,
+        .atlassian-ticket-board .atlassian-collapse-btn:focus-visible {
+          color: #e5e7eb;
+          background: rgba(55, 65, 81, 0.75);
+          outline: none;
+        }
+        .atlassian-ticket-board section.wx-column.wx-collapsed {
+          flex: 0 0 20px !important;
+          min-width: 20px !important;
+          max-width: 20px !important;
+          cursor: pointer;
+          border: 1px solid rgba(75, 85, 99, 0.7);
+        }
+        .atlassian-ticket-board section.wx-column.wx-collapsed:hover {
+          border-color: #38bdf8;
+          background: color-mix(in srgb, var(--wx-kanban-column-bg, #111827) 85%, #38bdf8 15%);
+        }
+        .atlassian-ticket-board section.wx-column.wx-collapsed .wx-title {
+          gap: 4px;
+          font-size: 10px;
+          line-height: 1.1;
+          font-weight: 600;
+          letter-spacing: 0.02em;
+        }
+        .atlassian-ticket-board section.wx-column.wx-collapsed .wx-count {
+          font-size: 9px;
+          font-weight: 600;
+        }
         .atlassian-ticket-board article.wx-card {
           cursor: pointer;
           transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
           border: 1px solid transparent;
           padding: 10px 10px 8px;
+        }
+        .atlassian-ticket-board article.wx-card:hover .atlassian-card-menu,
+        .atlassian-ticket-board article.wx-card:focus-within .atlassian-card-menu {
+          opacity: 1;
         }
         .atlassian-ticket-board article.wx-card:hover,
         .atlassian-ticket-board article.wx-card:focus-visible {
@@ -808,12 +1153,15 @@ export function AtlassianViews({
                 mode="kanban"
                 groups={groups}
                 onSelect={onSelect}
+                onTicketContextMenu={onTicketContextMenu}
                 openIds={openIds}
                 onToggle={toggleGroup}
                 statuses={statuses}
                 fillHeight={fillHeight}
                 soloHeight={soloBoardHeight}
                 onSoloHeightChange={setSoloBoardHeight}
+                collapsedColumns={collapsedColumns}
+                onCollapsedColumnsChange={setCollapsedColumns}
               />
             ) : null}
 
@@ -822,7 +1170,10 @@ export function AtlassianViews({
                 <StatusBoard
                   model={backlog}
                   onSelect={onSelect}
+                  onTicketContextMenu={onTicketContextMenu}
                   className="h-full w-full overflow-auto p-2"
+                  collapsedColumns={collapsedColumns}
+                  onCollapsedColumnsChange={setCollapsedColumns}
                 />
               </div>
             ) : null}
@@ -841,7 +1192,10 @@ export function AtlassianViews({
                   <StatusBoard
                     model={sprintBoard}
                     onSelect={onSelect}
+                    onTicketContextMenu={onTicketContextMenu}
                     className="h-full w-full overflow-auto p-2"
+                    collapsedColumns={collapsedColumns}
+                    onCollapsedColumnsChange={setCollapsedColumns}
                   />
                 </div>
               )
@@ -852,6 +1206,7 @@ export function AtlassianViews({
                 mode="list"
                 groups={groups}
                 onSelect={onSelect}
+                onTicketContextMenu={onTicketContextMenu}
                 openIds={openIds}
                 onToggle={toggleGroup}
                 statuses={statuses}

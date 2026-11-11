@@ -1,4 +1,12 @@
-import { createAskGate, ASK_TOOL_DEFS, ASK_TIMEOUT_MS, askToolSchemas, normalizeAskArgs } from '#features/agent/index.mjs';
+import {
+  createAskGate,
+  ASK_TOOL_DEFS,
+  ASK_TIMEOUT_MS,
+  askToolSchemas,
+  matchOptionToken,
+  normalizeAskArgs,
+  parseComposerAskText,
+} from '#features/agent/index.mjs';
 import { createTrailAwareTools, openaiToolSchemasWithTrail } from '#features/agent/index.mjs';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
@@ -43,16 +51,40 @@ describe('ask gate', () => {
     assert.equal(asked[0].allowFreeText, true);
   });
 
-  it('accepts a typed answer when no option fits', async () => {
+  it('treats unmatched composer text as a custom answer — not an assumed option', async () => {
     const gate = createAskGate({ onAsk: () => ({ freeText: '  build both, debug first  ' }) });
     const result = await gate.call('kusa_ask', {
       question: 'Which target should I build?',
       options: [{ label: 'debug' }],
     });
     assert.equal(result.ok, true);
+    assert.equal(result.kind, 'custom');
+    assert.equal(result.custom, true);
     assert.equal(result.answer, 'build both, debug first');
     assert.equal(result.selected.index, -1);
+    assert.equal(result.selected.custom, true);
     assert.equal(result.freeText, 'build both, debug first');
+    assert.match(result.note, /Do not invent option picks/i);
+  });
+
+  it('matches composer text to an option only when the label/letter/number is exact', async () => {
+    const gate = createAskGate({ onAsk: () => ({ freeText: ' Release ' }) });
+    const result = await gate.call('kusa_ask', {
+      question: 'Which target?',
+      options: [{ label: 'debug' }, { label: 'release' }],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.kind, 'options');
+    assert.equal(result.answer, 'release');
+    assert.equal(result.selected.index, 1);
+    assert.equal(result.freeText, '');
+
+    const byLetter = await createAskGate({ onAsk: () => ({ freeText: 'b' }) }).call('kusa_ask', {
+      question: 'Which target?',
+      options: [{ label: 'debug' }, { label: 'release' }],
+    });
+    assert.equal(byLetter.kind, 'options');
+    assert.equal(byLetter.selected.index, 1);
   });
 
   it('matches a label when the index is missing, and ignores a stale one', async () => {
@@ -74,7 +106,21 @@ describe('ask gate', () => {
     assert.match(result.error, /gave no answer/);
   });
 
-  it('refuses after its own countdown, never picking an option for the model', async () => {
+  it('waits indefinitely by default — no countdown on the pending card', async () => {
+    const gate = createAskGate({
+      onAsk: () => ({ optionIndex: 0 }),
+    });
+    const result = await gate.call('kusa_ask', {
+      question: 'Which target?',
+      options: [{ label: 'debug' }, { label: 'release' }],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(gate.timeoutMs, 0);
+    assert.equal(gate.requests[0].timeoutMs, 0);
+    assert.equal(gate.requests[0].timeoutStartsAt, 0);
+  });
+
+  it('honours an explicit timeoutMs override without picking an option', async () => {
     const gate = createAskGate({ timeoutMs: 5, onAsk: () => new Promise(() => {}) });
     const result = await gate.call('kusa_ask', {
       question: 'Which target?',
@@ -141,9 +187,121 @@ describe('ask gate', () => {
     assert.equal(normalized.question, 'Which target?');
     assert.equal(normalized.options.length, 2);
     assert.equal(normalized.options[0].index, 0);
+    assert.equal(normalized.options[0].letter, 'a');
     assert.equal(normalized.options[1].label, 'release');
+    assert.equal(normalized.multi, false);
+    assert.equal(normalized.questions.length, 1);
     assert.equal(normalized.allowFreeText, false);
     assert.equal(normalizeAskArgs({ question: '  ' }).error, 'question is required');
+  });
+
+  it('normalizes questions[] into a multi card with lettered options', () => {
+    const normalized = normalizeAskArgs({
+      questions: [
+        {
+          question: 'Which target?',
+          options: [{ label: 'debug' }, { label: 'release' }],
+        },
+        {
+          question: 'Which arch?',
+          options: [{ label: 'arm64' }, { label: 'x64' }, { label: 'both' }],
+        },
+      ],
+    });
+    assert.equal(normalized.multi, true);
+    assert.equal(normalized.questions.length, 2);
+    assert.equal(normalized.options.length, 0);
+    assert.equal(normalized.questions[0].options[0].letter, 'a');
+    assert.equal(normalized.questions[1].options[2].letter, 'c');
+    assert.match(normalized.question, /1\. Which target\?/);
+  });
+
+  it('resolves multi-question picks into one structured answer', async () => {
+    const gate = createAskGate({
+      onAsk: () => ({
+        answers: [
+          { questionIndex: 0, optionIndex: 1 },
+          { questionIndex: 1, optionIndex: 0 },
+        ],
+      }),
+    });
+    const result = await gate.call('kusa_ask', {
+      questions: [
+        { question: 'Which target?', options: [{ label: 'debug' }, { label: 'release' }] },
+        { question: 'Which arch?', options: [{ label: 'arm64' }, { label: 'x64' }] },
+      ],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.multi, true);
+    assert.equal(result.answers.length, 2);
+    assert.equal(result.answers[0].answer, 'release');
+    assert.equal(result.answers[1].answer, 'arm64');
+    assert.match(result.answer, /1\. Which target\? → release/);
+    assert.match(result.answer, /2\. Which arch\? → arm64/);
+  });
+
+  it('parses multi composer text into options only when every question is clear', async () => {
+    const parsed = parseComposerAskText([
+      { index: 0, question: 'Which target?', options: [
+        { index: 0, letter: 'a', label: 'debug' },
+        { index: 1, letter: 'b', label: 'release' },
+      ] },
+      { index: 1, question: 'Which arch?', options: [
+        { index: 0, letter: 'a', label: 'arm64' },
+        { index: 1, letter: 'b', label: 'x64' },
+      ] },
+    ], '1b\n2a');
+    assert.equal(parsed.kind, 'options');
+    assert.equal(parsed.rows[0].selected.label, 'release');
+    assert.equal(parsed.rows[1].selected.label, 'arm64');
+
+    const gate = createAskGate({ onAsk: () => ({ freeText: '1: release\n2: arm64' }) });
+    const result = await gate.call('kusa_ask', {
+      questions: [
+        { question: 'Which target?', options: [{ label: 'debug' }, { label: 'release' }] },
+        { question: 'Which arch?', options: [{ label: 'arm64' }, { label: 'x64' }] },
+      ],
+    });
+    assert.equal(result.kind, 'options');
+    assert.equal(result.answers[0].answer, 'release');
+    assert.equal(result.answers[1].answer, 'arm64');
+  });
+
+  it('keeps incomplete multi composer text as custom — does not assume the rest', async () => {
+    assert.equal(matchOptionToken([{ index: 0, label: 'debug' }], 'deb'), null);
+
+    const gate = createAskGate({
+      onAsk: () => ({ freeText: '1b — and for arch, whatever is fastest' }),
+    });
+    const result = await gate.call('kusa_ask', {
+      questions: [
+        { question: 'Which target?', options: [{ label: 'debug' }, { label: 'release' }] },
+        { question: 'Which arch?', options: [{ label: 'arm64' }, { label: 'x64' }] },
+      ],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.kind, 'custom');
+    assert.equal(result.custom, true);
+    assert.equal(result.matchedOptions.length, 1);
+    assert.equal(result.matchedOptions[0].answer, 'release');
+    assert.deepEqual(result.unansweredQuestions, ['Which arch?']);
+    assert.match(result.note, /Do not invent option picks/i);
+  });
+
+  it('accepts a free-text clarification/override for a multi card as custom', async () => {
+    const gate = createAskGate({
+      onAsk: () => ({ freeText: 'skip both — ship the canary build instead' }),
+    });
+    const result = await gate.call('kusa_ask', {
+      questions: [
+        { question: 'Which target?', options: [{ label: 'debug' }, { label: 'release' }] },
+        { question: 'Which arch?', options: [{ label: 'arm64' }, { label: 'x64' }] },
+      ],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.kind, 'custom');
+    assert.equal(result.matchedOptions.length, 0);
+    assert.equal(result.answer, 'skip both — ship the canary build instead');
   });
 
   it('advertises kusa_ask in every mode — asking is read-only', async () => {
@@ -152,8 +310,9 @@ describe('ask gate', () => {
       assert.ok(names(mode).includes('kusa_ask'));
     }
     assert.equal(ASK_TOOL_DEFS.length, 1);
-    assert.equal(ASK_TIMEOUT_MS, 120_000);
+    assert.equal(ASK_TIMEOUT_MS, 0);
     assert.ok(askToolSchemas()[0].function.parameters.properties.options.items.properties.label);
+    assert.ok(askToolSchemas()[0].function.parameters.properties.questions);
   });
 
   it('routes the tool through the agent tool set', async () => {

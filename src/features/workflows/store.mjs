@@ -277,9 +277,9 @@ export function normalizeWorkflow(raw) {
     if (key && role) roles[key] = role;
   }
   const runtimeRaw = String(raw.runtime || '').trim().toLowerCase().slice(0, 40);
-  // Seeded plan-execute is LangGraph-backed even when older JSON omitted runtime.
+  // Seeded LangGraph workflows stay tagged even when older JSON omitted runtime.
   const runtime = runtimeRaw
-    || (id === PLAN_EXECUTE_WORKFLOW.id ? 'langgraph' : '');
+    || (id === PLAN_EXECUTE_WORKFLOW.id || id === 'ticket-first' ? 'langgraph' : '');
   return {
     id,
     name: String(raw.name || id).trim().slice(0, 200) || id,

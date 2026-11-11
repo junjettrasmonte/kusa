@@ -20,6 +20,10 @@ import { SESSION_NAME_TOOL_DEFS, createSessionNameTools, sessionNameToolSchemas 
 import { ASK_TOOL_DEFS, createAskGate, askToolSchemas } from '#features/agent/ask.mjs';
 import { createApprovalGate } from '#features/agent/approval.mjs';
 import {
+  createMergedExtensionTools,
+  extensionToolGroups,
+} from '#features/agent/extension-tools.mjs';
+import {
   AGENT_MODE_AGENT,
   isToolAllowedInMode,
   isWriteOrExecTool,
@@ -204,7 +208,8 @@ function runTrailCli(workspaceRoot, args) {
  *   need them to keep the model's task list in that session's `tasks.json`.
  *   onAsk + askEvent are the interactive channel for kusa_ask: without them the
  *   ask cannot reach a human and refuses immediately instead of stalling.
- *   onEscalateTurn awaits one provider turn for kusa_escalate (orchestrated only).
+ *   onEscalateTurn awaits one provider turn for kusa_escalate (orchestrated only);
+ *   the escalate tool asks (no timer) which provider to use before calling it.
  */
 export function createTrailAwareTools(
   workspaceRoot,
@@ -263,20 +268,28 @@ export function createTrailAwareTools(
     startTurn: onAssignTurn,
   });
   // One-turn provider handoff for orchestrated Agents only; awaits the result
-  // so the caller resumes with the other provider's reply. Shares the same
-  // approval gate as terminal/browse so Rules apply to escalations too.
+  // so the caller resumes with the other provider's reply. Uses the ask
+  // channel (no timer) so the user picks which provider — each escalate asks
+  // again; control always returns after that single turn.
   const escalate = createEscalateTools({
     dataDir,
     sessionKey,
     workspaceRoot,
     runTurn: onEscalateTurn,
     signal,
-    approval,
+    ask: (prompt, callId) => ask.call('kusa_ask', prompt, callId),
   });
   // Session naming owns the same per-session sidecar the task tools write, so it
   // takes the same dataDir / sessionKey pair: absent, the name stays unpersisted
   // and the tool says so rather than inventing a row for a phantom session.
   const names = createSessionNameTools({ dataDir, sessionKey });
+  // Extension-contributed tools (e.g. Atlassian Jira) — discovered from
+  // extensions/*/tools.mjs and merged when the cache is warm.
+  const extensionTools = createMergedExtensionTools({
+    dataDir,
+    sessionKey,
+    workspaceRoot,
+  });
 
   function trailAsk(args = {}) {
     const query = String(args.query || '').trim();
@@ -346,6 +359,12 @@ export function createTrailAwareTools(
       return await ask.call(name, args, callId);
     }
 
+    // Extension tools (Jira, …) — not Trail-gated; they talk to external APIs
+    // or session sidecars, never the working copy.
+    if (extensionTools.names.has(name)) {
+      return extensionTools.call(name, args, callId);
+    }
+
     if (enforceTrail && TRAIL_GATED_TOOLS.has(name) && !gate.consulted) {
       return {
         ok: false,
@@ -370,6 +389,7 @@ export function createTrailAwareTools(
     ...ask.defs,
     ...terminal.defs,
     ...browser.defs,
+    ...extensionTools.defs,
   ].filter((def) => allowed(def?.name));
 
   const api = {
@@ -421,6 +441,7 @@ export function agentToolGroups(mode = null, { orchestrated = false } = {}) {
     { group: 'ask', schemas: askToolSchemas() },
     { group: 'terminal', schemas: toOpenAiSchemas(TERMINAL_TOOL_DEFS) },
     { group: 'browser', schemas: toOpenAiSchemas(BROWSER_TOOL_DEFS) },
+    ...extensionToolGroups(),
   ];
   const normalized = normalizeAgentMode(mode);
   // Orchestrators stay coordination-only even in Agent mode (no write/exec).

@@ -23,11 +23,15 @@ export {
 
 export {
   threadIdForSession,
+  threadIdForTicketFirstSession,
   isPlanExecuteOrchestrator,
+  isTicketFirstOrchestrator,
   isSessionAwaitingPlanApproval,
   findPendingPlanForOrchestrator,
   getPlanExecuteGraph,
+  getTicketFirstGraph,
   resetPlanExecuteGraphs,
+  resetTicketFirstGraphs,
   onOrchestratorTurnSettled,
   resumeAfterPlanApproval,
 } from './runtime.mjs';

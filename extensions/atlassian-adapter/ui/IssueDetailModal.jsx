@@ -177,7 +177,7 @@ export function IssueDetailModal({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-black/60 p-3 sm:p-4"
       role="presentation"
       onMouseDown={(e) => {
         // Only the real backdrop — native <select>/<input type="date"> menus can
@@ -193,9 +193,10 @@ export function IssueDetailModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="flex max-h-[min(44rem,92vh)] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-950 shadow-2xl"
+        className="my-auto flex h-auto w-full max-w-3xl min-h-0 flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-950 shadow-2xl"
+        style={{ maxHeight: 'min(44rem, calc(100dvh - 2rem))' }}
       >
-        <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
+        <header className="flex shrink-0 items-start gap-3 border-b border-gray-800 px-4 py-3">
           <div className="min-w-0 flex-1 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span id={titleId} className="font-mono text-sm text-sky-300">
@@ -242,7 +243,7 @@ export function IssueDetailModal({
           </button>
         </header>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-3">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-3">
           {loading && !detail ? (
             <p className="py-10 text-center text-xs text-gray-500">Loading {issueKey}…</p>
           ) : null}

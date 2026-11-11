@@ -104,6 +104,8 @@ import {
   supportsVision,
   trailNotReadyMessage,
 } from '#features/agent/index.mjs';
+import { loadExtensionToolModules } from '#features/agent/extension-tools.mjs';
+import { ensureAtlassianWorkflowsSeeded } from '#extensions/atlassian-adapter/workflow.mjs';
 import { collectWorkspaceTree } from '#features/explorer/tree.mjs';
 import { getWorkspaceTreeRev } from '#features/explorer/tree-rev.mjs';
 import { searchWorkspaceFiles } from '#features/explorer/search.mjs';
@@ -330,6 +332,13 @@ export function createMonitorServer({
   /** Bound listen port for localhost MCP URL registration (updated after listen). */
   mcpPort = 1424,
 } = {}) {
+  // Extension side-effects on serve start: discover agent tools + seed workflows.
+  void loadExtensionToolModules().catch(() => {});
+  try {
+    ensureAtlassianWorkflowsSeeded(dataDir);
+  } catch {
+    /* non-fatal — workflows endpoint will retry */
+  }
   let boundMcpPort = Number(mcpPort) || 1424;
   // Pending user approvals for gated tools (kusa_terminal / kusa_browse).
   // The agent request stays open until POST /kusa/approval resolves the id.
@@ -370,11 +379,10 @@ export function createMonitorServer({
   });
 
   // Questions the model asked mid-turn (kusa_ask). Same shape as the approval
-  // gate: the agent request stays open until POST /kusa/ask answers the id,
-  // and the gate owns the one deadline (it races this promise against its
-  // timeout), so the UI countdown and the settled verdict cannot disagree.
-  // Unlike an approval there is no rule default — nobody answering refuses the
-  // ask, it never picks an option for the model.
+  // gate: the agent request stays open until POST /kusa/ask answers the id.
+  // Unlike approval, asks wait indefinitely by default (no countdown) — only
+  // an explicit timeoutMs override races this promise. There is no rule
+  // default either: nobody answering refuses the ask, it never picks an option.
   /** @type {Map<string, { answer: (answer) => void }}> */
   const pendingAsks = new Map();
   /** @type {Map<string, Set<string>>} */
@@ -2311,6 +2319,7 @@ export function createMonitorServer({
           provider: typeof body.provider === 'string' ? body.provider : 'kusa',
           kind: typeof body.kind === 'string' ? body.kind : 'standard',
           workflowId: typeof body.workflowId === 'string' ? body.workflowId : null,
+          name: typeof body.name === 'string' ? body.name : null,
         });
         sendJson(res, 200, { session });
       } catch (err) {
@@ -2414,6 +2423,7 @@ export function createMonitorServer({
     if (url.pathname === '/kusa/workflows' && (req.method === 'GET' || req.method === 'HEAD')) {
       try {
         ensureWorkflowsSeeded(dataDir);
+        ensureAtlassianWorkflowsSeeded(dataDir);
         const workflows = listWorkflows(dataDir).map((wf) => {
           const source = readWorkflowSource(dataDir, wf.id);
           return {
@@ -2510,6 +2520,7 @@ export function createMonitorServer({
           url.pathname.slice('/kusa/workflows/'.length).replace(/\/graph$/, ''),
         ).trim();
         ensureWorkflowsSeeded(dataDir);
+        ensureAtlassianWorkflowsSeeded(dataDir);
         const wf = listWorkflows(dataDir).find((entry) => entry.id === workflowId);
         if (!wf) {
           sendJson(res, 404, { error: 'workflow not found' });
@@ -2803,6 +2814,7 @@ export function createMonitorServer({
     // GET /kusa/tools — every tool the Kusă agent can call in a chat session,
     // grouped by family. Read-only and cheap: settings only, no CLI probes.
     if (req.method === 'GET' && url.pathname === '/kusa/tools') {
+      await loadExtensionToolModules().catch(() => {});
       const settings = loadMonitorSettings(dataDir);
       const backend = settings?.agentBackend === 'opencode' ? 'opencode' : 'native';
       const approvalMode = normalizeApprovalMode(settings?.agentApprovalMode);
@@ -3037,10 +3049,11 @@ export function createMonitorServer({
       return;
     }
 
-    // Answer a pending kusa_ask. Body: { id, optionIndex? | optionLabel? | freeText? }
-    // An index wins, then a label match, then typed text — the card sends one of
-    // the three, never a mix. 404 lists open ids so a stale click cannot answer
-    // a question that already settled.
+    // Answer a pending kusa_ask. Body:
+    //   single — { id, optionIndex? | optionLabel? | freeText? }
+    //   multi  — { id, answers: [{ questionIndex, optionIndex|optionLabel|freeText }] }
+    //            or { id, freeText } for an open answer covering the whole card.
+    // 404 lists open ids so a stale click cannot answer a question that already settled.
     if (req.method === 'POST' && url.pathname === '/kusa/ask') {
       let patch = {};
       try {
@@ -3063,6 +3076,7 @@ export function createMonitorServer({
         optionIndex: Number(patch?.optionIndex),
         optionLabel: String(patch?.optionLabel ?? ''),
         freeText: String(patch?.freeText ?? ''),
+        ...(Array.isArray(patch?.answers) ? { answers: patch.answers } : {}),
       };
       pending.answer(answer);
       sendJson(res, 200, { id, answered: true });

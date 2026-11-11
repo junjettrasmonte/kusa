@@ -15,6 +15,7 @@ import {
   resolveTrailPolicy,
   trailSystemPromptAddon,
 } from '#features/trail/agent/trail.mjs';
+import { loadExtensionToolModules } from './extension-tools.mjs';
 import { agentModeLabel, agentModeSystemPromptAddon, normalizeAgentMode } from './modes.mjs';
 import { taskSystemPromptAddon } from './tasks.mjs';
 import { planSystemPromptAddon } from './plans.mjs';
@@ -724,6 +725,8 @@ export async function runOpenAiAgentLoop({
     const mins = Number.isFinite(n) ? Math.min(60, Math.max(1, Math.floor(n))) : 2;
     return mins * 60_000;
   })());
+  // Warm extension tool discovery before building the turn toolset.
+  await loadExtensionToolModules();
   const tools = createTrailAwareTools(workspaceRoot, {
     enforceTrail: trailPolicy.enforce && trailPolicy.ready,
     approvalMode: approvalModeResolved,

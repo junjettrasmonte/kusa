@@ -278,7 +278,7 @@ describe('approval gate', () => {
     assert.equal(verdict.allowed, true);
     assert.equal(verdict.decision, 'not-gated');
     assert.equal(APPROVAL_GATED_TOOLS.has('kusa_read_file'), false);
-    assert.equal(APPROVAL_GATED_TOOLS.has('kusa_escalate'), true);
+    assert.equal(APPROVAL_GATED_TOOLS.has('kusa_escalate'), false);
   });
 
   it('Allow is unconditional: no ask, no countdown — the row still names the Rule', async () => {

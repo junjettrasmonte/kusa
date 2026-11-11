@@ -17,6 +17,8 @@ import { Sidebar, normalizeSessionFilter } from './features/monitor/Sidebar.jsx'
 import { basenameOfPath } from './features/explorer/language.js';
 import { ConfirmDialog } from './shared/ConfirmDialog.jsx';
 import { TrashIcon } from './shared/IconButton.jsx';
+import { AtlassianIssueBridge } from '#extensions/atlassian-adapter/ui/AtlassianIssueBridge.jsx';
+import { persistJiraTicketToSession } from '#extensions/atlassian-adapter/ui/jiraAttachment.js';
 
 /** Monaco is heavy — load only when a workspace file is opened. */
 const EditorWorkbench = lazy(() =>
@@ -74,19 +76,29 @@ import { readJsonSet, readLocal, writeJsonSet, writeLocal } from './shared/lib/s
 const EDITOR_DRAWER_WIDTH_KEY = 'kusa.editor.drawerWidth';
 const EDITOR_DRAWER_DEFAULT_WIDTH = 440;
 const EDITOR_DRAWER_MIN_WIDTH = 280;
+/** Last Agents / lane selection — restored after refresh so orchestrator chats stick. */
+const SELECTED_KEY = 'monitor.selected';
 
 function readEditorDrawerWidth() {
   const raw = Number(readLocal(EDITOR_DRAWER_WIDTH_KEY, String(EDITOR_DRAWER_DEFAULT_WIDTH)));
   return Number.isFinite(raw) && raw >= EDITOR_DRAWER_MIN_WIDTH ? raw : EDITOR_DRAWER_DEFAULT_WIDTH;
 }
 
+/** Restore the open session/lane across refresh. Empty / garbage → null. */
+function initialSelected() {
+  const saved = readLocal(SELECTED_KEY, '');
+  return typeof saved === 'string' && saved.includes(':') ? saved : null;
+}
+
 /** Core Dev Tools ids plus installed extension nav placements (e.g. CAO). */
 const { ids: DEVTOOLS_SUBTAB_IDS, labels: DEVTOOLS_SUBTAB_LABELS } = resolveDevtoolsSubTabs();
 
-/** Chat is never an initial value — a stale 'chat' must not outlive a non-Kusă session. */
+/** Prefer Chat when the restored selection is a chat session; otherwise never start on Chat. */
 function initialSessionSubTab() {
   const savedTab = readLocal('monitor.tab', 'session');
   if (savedTab === 'plan') return 'prompts';
+  const selected = initialSelected();
+  if (selected && isChatSessionKey(selected)) return 'chat';
   const initialIds = SESSION_SUBTAB_IDS.filter((id) => id !== 'chat');
   if (initialIds.includes(savedTab)) return savedTab;
   const saved = readLocal('monitor.sessionSubTab', 'prompts');
@@ -425,12 +437,27 @@ function cloneLiveParts(parts) {
     if (p.type === 'tool') return { type: 'tool', tool: { ...p.tool } };
     if (p.type === 'approval') return { type: 'approval', approval: { ...p.approval } };
     if (p.type === 'ask') {
+      const questions = Array.isArray(p.ask?.questions)
+        ? p.ask.questions.map((q) => ({
+          ...q,
+          options: (Array.isArray(q?.options) ? q.options : []).map((o) => ({ ...o })),
+        }))
+        : p.ask?.questions;
+      const answer = p.ask?.answer
+        ? {
+          ...p.ask.answer,
+          ...(Array.isArray(p.ask.answer.answers)
+            ? { answers: p.ask.answer.answers.map((row) => ({ ...row })) }
+            : {}),
+        }
+        : p.ask?.answer;
       return {
         type: 'ask',
         ask: {
           ...p.ask,
           options: (Array.isArray(p.ask?.options) ? p.ask.options : []).map((o) => ({ ...o })),
-          answer: p.ask?.answer ? { ...p.ask.answer } : p.ask?.answer,
+          questions,
+          answer,
         },
       };
     }
@@ -554,7 +581,7 @@ export default function App() {
   const [lastLoadOk, setLastLoadOk] = useState(() => (readBootstrap() ? Date.now() : 0));
   const [loadFailed, setLoadFailed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(initialSelected);
   /** In-flight chat live snapshots — kept in sync when the user resolves an Approval CTA. */
   const liveSnapBySession = useRef(new Map());
   /** Session keys currently attached to a server turn SSE (send or resume). */
@@ -932,6 +959,11 @@ export default function App() {
     return data?.focus ?? null;
   }, [data, selected]);
 
+  // Keep the open session across refresh (Playback / Follow-latest was removed).
+  useEffect(() => {
+    writeLocal(SELECTED_KEY, selected || '');
+  }, [selected]);
+
   // A monitor lane pruned off-disk is no longer selectable — clear so we can
   // reseed once. Chat deletes already clear `selected` in runDelete.
   useEffect(() => {
@@ -939,11 +971,24 @@ export default function App() {
     if (!data.lanes?.[selected]) setSelected(null);
   }, [data, selected]);
 
+  // Restored chat key whose session was deleted — drop it so focus can seed.
+  useEffect(() => {
+    if (!chatSessionsReady || !selected || !isChatSessionKey(selected)) return;
+    const id = selected.includes(':') ? selected.slice(selected.indexOf(':') + 1) : '';
+    const exists = chatSessions.some((s) => (
+      s.key === selected || (id && s.id === id)
+    ));
+    if (!exists) setSelected(null);
+  }, [chatSessionsReady, chatSessions, selected]);
+
   // Land on the latest session once when nothing is selected, then stick.
+  // Wait for agents hydrate when a chat key was restored — otherwise focus
+  // (often a Cursor IDE lane) steals the orchestrator chat after refresh.
   useEffect(() => {
     if (selected != null) return;
+    if (!chatSessionsReady && initialSelected()) return;
     if (data?.focus) setSelected(data.focus);
-  }, [data?.focus, selected]);
+  }, [data?.focus, selected, chatSessionsReady]);
 
   const chatSession = useMemo(() => {
     if (!laneKey || !isChatSessionKey(laneKey)) return null;
@@ -1007,13 +1052,16 @@ export default function App() {
   }, [chatSession, chatSessions]);
 
   // When a chat session is selected, land on Chat; leave Chat when it isn't.
+  // Wait for agents hydrate so a restored selection is not demoted to Prompts
+  // for one frame before /kusa/agents returns.
   useEffect(() => {
     if (chatSession) {
       setSessionSubTab('chat');
       return;
     }
+    if (!chatSessionsReady) return;
     setSessionSubTab((prev) => (prev === 'chat' ? 'prompts' : prev));
-  }, [chatSession?.key]);
+  }, [chatSession?.key, chatSessionsReady]);
 
   // Session-bound held prompts flush on the *selected* idle session only.
   // Parked (cross-session) rows are skipped until resumed onto this chat.
@@ -1198,11 +1246,33 @@ export default function App() {
     if (isChatSessionKey(raw)) selectLane(raw);
   }
 
-  async function createSession({ provider = 'kusa', kind = 'standard', workflowId = null } = {}) {
+  // Extensions (e.g. Atlassian “Attach to Chat”) ask App to focus a session.
+  useEffect(() => {
+    function onOpenAgent(event) {
+      const sessionKey = String(event?.detail?.sessionKey || '').trim();
+      if (sessionKey) openAgentSession(sessionKey);
+    }
+    window.addEventListener('kusa:open-agent', onOpenAgent);
+    return () => window.removeEventListener('kusa:open-agent', onOpenAgent);
+    // openAgentSession closes over chatSessions; re-bind when the list changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatSessions]);
+
+  async function createSession({
+    provider = 'kusa',
+    kind = 'standard',
+    workflowId = null,
+    attachments = null,
+    draftText = null,
+    name = null,
+  } = {}) {
     if (!canPersistSettings) {
       window.alert('Chat sessions need the local server (npm run kusa:serve).');
-      return;
+      return null;
     }
+    const staged = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+    const jiraName = staged.find((row) => row?.kind === 'jira' && row?.issueKey)?.issueKey;
+    const sessionName = String(name || jiraName || '').trim() || null;
     let session;
     try {
       const res = await fetch('/kusa/agents', {
@@ -1212,6 +1282,7 @@ export default function App() {
           provider,
           kind,
           ...(workflowId ? { workflowId } : {}),
+          ...(sessionName ? { name: sessionName } : {}),
         }),
       });
       if (!res.ok) {
@@ -1222,9 +1293,43 @@ export default function App() {
       session = body?.session;
     } catch (err) {
       window.alert(`Could not create session: ${err?.message || err}`);
-      return;
+      return null;
     }
-    if (!session?.key) return;
+    if (!session?.key) return null;
+    // Persist Jira tickets into attachments/ticket.json for tools/workflows,
+    // and stage the composer tray (session-lifetime; survives Send + refresh).
+    const persisted = [];
+    for (const row of staged) {
+      if (row?.kind === 'jira' && row?.issueKey) {
+        const saved = await persistJiraTicketToSession(session.key, {
+          key: row.issueKey,
+          summary: row.summary,
+          url: row.url,
+        });
+        persisted.push(saved || row);
+      } else {
+        persisted.push(row);
+      }
+    }
+    const composerAttachments = persisted.length ? persisted : staged;
+    // Stage composer payload before selecting the lane so SessionChat's key
+    // effect can pick it up on first mount.
+    if (composerAttachments.length) {
+      try {
+        sessionStorage.setItem(
+          `kusa:composer-attachments:${session.key}`,
+          JSON.stringify(composerAttachments),
+        );
+      } catch { /* ignore */ }
+    }
+    if (draftText) {
+      try {
+        sessionStorage.setItem(`kusa:composer-pending:${session.key}`, String(draftText));
+      } catch { /* ignore */ }
+    }
+    // Leave Extensions / Dev Tools so SessionChat actually mounts and can
+    // consume the staged attachments.
+    setActiveExtensionId(null);
     setChatSessions((prev) => [session, ...prev.filter((s) => s.key !== session.key)]);
     setSelected(session.key);
     setSessionSubTab('chat');
@@ -1242,8 +1347,40 @@ export default function App() {
       );
       if (qRes.ok) applyQueueSnapshot(session.key, await qRes.json());
     } catch { /* queueForSession can still show parked from another mirror */ }
+    // Belt-and-suspenders: if SessionChat is already mounted for this key,
+    // the storage effect alone may miss a same-key remount race.
+    if (composerAttachments.length) {
+      window.dispatchEvent(new CustomEvent('kusa:composer-attach', {
+        detail: { sessionKey: session.key, attachments: composerAttachments },
+      }));
+    }
     poll();
+    return session;
   }
+
+  // Always call the latest createSession from the create-agent listener —
+  // HMR / Strict Mode can leave an effect bound to a stale closure that drops
+  // workflowId / attachments (and thus never writes ticket.json).
+  const createSessionRef = useRef(createSession);
+  createSessionRef.current = createSession;
+
+  // Extensions (Atlassian Attach → New Session) create an orchestrated agent
+  // and optionally stage composer attachments / draft text.
+  useEffect(() => {
+    function onCreateAgent(event) {
+      const detail = event?.detail && typeof event.detail === 'object' ? event.detail : {};
+      void createSessionRef.current({
+        provider: detail.provider || 'kusa',
+        kind: detail.kind || 'standard',
+        workflowId: detail.workflowId || null,
+        attachments: Array.isArray(detail.attachments) ? detail.attachments : null,
+        draftText: detail.draftText || detail.text || null,
+        name: detail.name || null,
+      });
+    }
+    window.addEventListener('kusa:create-agent', onCreateAgent);
+    return () => window.removeEventListener('kusa:create-agent', onCreateAgent);
+  }, []);
 
   /**
    * Attach to a running server turn (POST /kusa/chat response or
@@ -1411,10 +1548,26 @@ export default function App() {
               options: Array.isArray(ev.options)
                 ? ev.options.map((option, index) => ({
                     index,
+                    letter: String(option?.letter || String.fromCharCode(97 + index)),
                     label: String(option?.label ?? ''),
                     detail: String(option?.detail ?? ''),
                   }))
                 : [],
+              questions: Array.isArray(ev.questions)
+                ? ev.questions.map((entry, qIndex) => ({
+                    index: qIndex,
+                    question: String(entry?.question ?? ''),
+                    options: Array.isArray(entry?.options)
+                      ? entry.options.map((option, index) => ({
+                          index,
+                          letter: String(option?.letter || String.fromCharCode(97 + index)),
+                          label: String(option?.label ?? ''),
+                          detail: String(option?.detail ?? ''),
+                        }))
+                      : [],
+                  }))
+                : undefined,
+              multi: ev.multi === true || (Array.isArray(ev.questions) && ev.questions.length > 1),
               allowFreeText: ev.allowFreeText !== false,
               status: ev.status || 'pending',
               answer: ev.answer && typeof ev.answer === 'object' ? ev.answer : null,
@@ -1827,44 +1980,23 @@ export default function App() {
   /**
    * Answer a kusa_ask question card. The agent stays blocked until this POST
    * settles, exactly like an approval — but there is no rule default here, so
-   * the only way a question moves forward is a human clicking or typing.
-   * One of optionIndex / optionLabel / freeText is sent; the server resolves
-   * the choice in that order and the gate returns the answer to the model.
+   * the only way a question moves forward is a human clicking option(s) or
+   * answering in the message composer (any prompt while open is freeText).
+   * Single: optionIndex / optionLabel / freeText. Multi: answers[] (one pick
+   * per question) or freeText for the whole card.
    */
-  async function resolveChatAsk(sessionKey, { askId, optionIndex = null, optionLabel = null, freeText = null }) {
+  async function resolveChatAsk(sessionKey, {
+    askId,
+    optionIndex = null,
+    optionLabel = null,
+    freeText = null,
+    answers = null,
+  }) {
     if (!askId) return;
-    const markAsk = (parts) => (parts || []).map((p) => {
-      if (p.type !== 'ask' || p.ask?.id !== askId) return p;
-      return {
-        type: 'ask',
-        ask: {
-          ...p.ask,
-          status: 'answered',
-          answer: {
-            selected: Number(optionIndex),
-            freeText: String(freeText ?? ''),
-          },
-        },
-      };
-    });
-
-    const snap = liveSnapBySession.current.get(sessionKey);
-    if (snap) snap.parts = markAsk(snap.parts);
-
-    patchKusaSession(setChatSessions, sessionKey, (s) => {
-      if (!s?.live?.parts) return s;
-      const parts = markAsk(s.live.parts);
-      const mirrors = mirrorsFromParts(parts);
-      return {
-        ...s,
-        live: {
-          ...s.live,
-          parts: cloneLiveParts(parts),
-          tools: mirrors.tools,
-          thinking: mirrors.thinking,
-        },
-      };
-    });
+    // No optimistic answer — the gate waits indefinitely, and the server
+    // decides whether freeText matched an option or is custom. SSE applies
+    // the settled ask (status + answer) when createAskGate emits it.
+    // sessionKey is kept for call-site symmetry with approvals / onAsk.
     const res = await fetch('/kusa/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1873,6 +2005,7 @@ export default function App() {
         ...(optionIndex != null ? { optionIndex } : {}),
         ...(optionLabel ? { optionLabel } : {}),
         ...(freeText ? { freeText } : {}),
+        ...(Array.isArray(answers) ? { answers } : {}),
       }),
     });
     if (!res.ok) {
@@ -2806,6 +2939,10 @@ export default function App() {
           onConfirm={() => runDelete()}
           onDismiss={() => setPendingDelete(null)}
         />
+      ) : null}
+
+      {isExtensionInstalled(getBuiltinExtension('atlassian-adapter')) ? (
+        <AtlassianIssueBridge canPersist={canPersistSettings} />
       ) : null}
     </div>
   );

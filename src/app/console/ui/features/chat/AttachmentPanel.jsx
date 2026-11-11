@@ -6,6 +6,7 @@ import {
 } from '#ui/shared/lib/attachments.js';
 import { PaperclipIcon } from '#ui/features/chat/ChatGlyphs.jsx';
 import { ImageViewer } from '#ui/shared/ImageViewer.jsx';
+import { LucideIcon } from '#ui/shared/LucideIcons.jsx';
 import { PopupList } from './PopupList.jsx';
 
 /**
@@ -66,7 +67,15 @@ export function AttachmentStack({
     setViewer({ src: attachment.dataUrl, name: attachment.name || 'image' });
   }
 
-  const summary = `${total} of ${ATTACHMENT_LIMITS.files} file${ATTACHMENT_LIMITS.files === 1 ? '' : 's'} on this message`;
+  function openJira(attachment) {
+    const issueKey = String(attachment?.issueKey || '').replace(/^:/, '').trim();
+    if (!issueKey || typeof window === 'undefined') return;
+    window.dispatchEvent(new CustomEvent('kusa:open-jira-issue', {
+      detail: { issueKey },
+    }));
+  }
+
+  const summary = `${total} of ${ATTACHMENT_LIMITS.files} file${ATTACHMENT_LIMITS.files === 1 ? '' : 's'} on this session`;
 
   return (
     <>
@@ -90,7 +99,7 @@ export function AttachmentStack({
               {`Remove ${selectedKeys.size} selected`}
             </button>
           ) : (
-            <span className="text-[10px] text-gray-600">Select files to remove them from this message</span>
+            <span className="text-[10px] text-gray-600">Select files to remove them from this session</span>
           )}
           {note ? <span className="text-[10px] text-rose-400">{note}</span> : null}
         </div>
@@ -104,6 +113,7 @@ export function AttachmentStack({
               imagesReachModel={imagesReachModel}
               onToggleSelect={() => toggleSelect(key)}
               onOpenImage={() => openImage(attachment)}
+              onOpenJira={() => openJira(attachment)}
             />
           );
         })}
@@ -128,8 +138,10 @@ function AttachmentRow({
   imagesReachModel = true,
   onToggleSelect,
   onOpenImage,
+  onOpenJira,
 }) {
   const isImage = attachment?.kind === 'image' && attachment?.dataUrl;
+  const isJira = attachment?.kind === 'jira' && String(attachment?.issueKey || '').trim();
   const unseen = Boolean(isImage) && !imagesReachModel;
   const nameOnly = !attachment?.dataUrl && !attachment?.text;
   const label = attachmentLabel(attachment);
@@ -138,7 +150,13 @@ function AttachmentRow({
     <div
       role="listitem"
       className={`flex h-7 items-center gap-1.5 px-1 hover:bg-gray-900/40 ${
-        unseen ? 'text-rose-300' : selected ? 'bg-emerald-500/10 text-emerald-100' : 'text-gray-300'
+        unseen
+          ? 'text-rose-300'
+          : isJira
+            ? 'text-sky-100'
+            : selected
+              ? 'bg-emerald-500/10 text-emerald-100'
+              : 'text-gray-300'
       }`}
     >
       <input
@@ -148,7 +166,11 @@ function AttachmentRow({
         aria-label={`Select ${label}`}
         className="h-3 w-3 shrink-0 rounded border-gray-600 bg-gray-950 text-emerald-500 focus:ring-emerald-500/40"
       />
-      <PaperclipIcon className={unseen ? 'h-3 w-3 shrink-0 text-rose-300' : 'h-3 w-3 shrink-0 text-gray-400'} />
+      {isJira ? (
+        <LucideIcon name="clipboard-list" className="h-3 w-3 shrink-0 text-sky-300" />
+      ) : (
+        <PaperclipIcon className={unseen ? 'h-3 w-3 shrink-0 text-rose-300' : 'h-3 w-3 shrink-0 text-gray-400'} />
+      )}
       {isImage ? (
         <button
           type="button"
@@ -167,17 +189,30 @@ function AttachmentRow({
             {label}
           </span>
         </button>
+      ) : isJira ? (
+        <button
+          type="button"
+          onClick={onOpenJira}
+          title={`Open ${attachment.issueKey}`}
+          className="inline-flex min-w-0 flex-1 items-center gap-1.5 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50"
+        >
+          <span className="min-w-0 flex-1 truncate text-[12px] leading-tight font-medium hover:underline">
+            {label}
+          </span>
+        </button>
       ) : (
         <span className="min-w-0 flex-1 truncate text-[12px] leading-tight font-medium">{label}</span>
       )}
-      <span className="shrink-0 tabular-nums text-[10px] text-gray-500">
-        {formatBytes(Number(attachment?.size) || 0)}
-      </span>
+      {!isJira ? (
+        <span className="shrink-0 tabular-nums text-[10px] text-gray-500">
+          {formatBytes(Number(attachment?.size) || 0)}
+        </span>
+      ) : null}
       {unseen ? (
         <span className="ml-1 shrink-0 text-[9px] uppercase tracking-wide text-rose-400">
           not seen
         </span>
-      ) : nameOnly ? (
+      ) : nameOnly && !isJira ? (
         <span className="ml-1 max-w-[8rem] shrink-0 truncate text-[9px] text-gray-500">
           {attachment?.note || 'name only'}
         </span>
@@ -187,5 +222,8 @@ function AttachmentRow({
 }
 
 function attachmentKey(attachment) {
+  if (attachment?.kind === 'jira' && attachment?.issueKey) {
+    return `jira:${attachment.issueKey}`;
+  }
   return `${attachment?.name || 'file'}:${attachment?.size || 0}:${attachment?.file || ''}`;
 }

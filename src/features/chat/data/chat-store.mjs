@@ -1120,6 +1120,7 @@ export function createChatSession(dir, {
   provider = 'kusa',
   kind = SESSION_KIND_STANDARD,
   workflowId = null,
+  name = null,
 } = {}) {
   const meta = resolveChatProvider(provider) || CHAT_PROVIDERS.kusa;
   const harness = meta.harness;
@@ -1175,6 +1176,17 @@ export function createChatSession(dir, {
     harness,
   });
   if (hooks.enabled) hooks.sessionStart();
+  // Optional authored title (e.g. Jira issue key from Attach to Chat).
+  const titled = normalizeSessionName(name);
+  if (titled) {
+    const applied = nameChatSession(dir, sessionId, titled, harness);
+    if (applied?.ok && applied.name) {
+      return {
+        ...session,
+        options: { ...(session.options || {}), name: applied.name },
+      };
+    }
+  }
   return session;
 }
 

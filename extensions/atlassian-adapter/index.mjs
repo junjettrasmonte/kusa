@@ -35,6 +35,24 @@ export {
   normalizeAtlassianSettings,
   publicAtlassianSettings,
 } from './settings.mjs';
+export {
+  TOOL_GROUP as JIRA_TOOL_GROUP,
+  JIRA_TOOL_DEFS,
+  SESSION_TICKET_FILE,
+  createTools as createJiraTools,
+  writeSessionTicket,
+  readSessionTicket,
+} from './tools.mjs';
+export {
+  TICKET_FIRST_WORKFLOW,
+  TICKET_FIRST_WORKFLOW_ID,
+  ensureAtlassianWorkflowsSeeded,
+} from './workflow.mjs';
+export {
+  TicketFirstState,
+  buildTicketFirstGraph,
+  compileTicketFirstGraph,
+} from './langgraph/ticket-first.mjs';
 
 export const ADAPTER_ID = 'atlassian';
 export const ADAPTER_NAME = 'Atlassian Adapter';

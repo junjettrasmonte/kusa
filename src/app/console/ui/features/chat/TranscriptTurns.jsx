@@ -204,10 +204,16 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
 
   const files = Array.isArray(msg.attachments) ? msg.attachments.filter(Boolean) : [];
   const hasText = typeof msg.text === 'string' && Boolean(msg.text.trim());
+  const jiraOnly = files.length > 0
+    && files.every((row) => row?.kind === 'jira' && String(row?.issueKey || '').trim());
+  // Jira-ticket kickoffs carry no typed words — show only the issue-key chip,
+  // not "(N files attached — no words were typed)" or an empty green bubble.
+  const showEmptyAttachNote = !hasText && files.length > 0 && !jiraOnly;
+  const showBubble = hasText || showEmptyAttachNote;
   const body = (
     <>
       {hasText ? msg.text : null}
-      {!hasText && files.length ? (
+      {showEmptyAttachNote ? (
         <span className="text-gray-500 italic">
           {`(${files.length} file${files.length === 1 ? '' : 's'} attached — no words were typed)`}
         </span>
@@ -222,29 +228,31 @@ export function UserMessage({ msg, busy, editing, onStartEdit, onCancelEdit, onR
   return (
     <div className="flex justify-end">
       <div className="max-w-[85%]">
-        {canEdit ? (
-          <button
-            type="button"
-            title="Edit message"
-            aria-label="Edit message"
-            onClick={() => onStartEdit?.()}
-            className={`${bubbleClass} w-full cursor-pointer text-left transition-colors hover:bg-emerald-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50`}
-          >
-            {body}
-          </button>
-        ) : (
-          <div className={bubbleClass}>{body}</div>
-        )}
+        {showBubble ? (
+          canEdit ? (
+            <button
+              type="button"
+              title="Edit message"
+              aria-label="Edit message"
+              onClick={() => onStartEdit?.()}
+              className={`${bubbleClass} w-full cursor-pointer text-left transition-colors hover:bg-emerald-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50`}
+            >
+              {body}
+            </button>
+          ) : (
+            <div className={bubbleClass}>{body}</div>
+          )
+        ) : null}
         {/*
          * The files this prompt carried, as a compact chip strip (same shape
          * the Attachments drawer staged). A sent message states what it held,
          * so a transcript read months later and the prompt that produced it
-         * cannot disagree.
+         * cannot disagree. Jira-only turns are chip-only (key + icon).
          */}
         {files.length ? (
           <AttachmentChips
             attachments={files}
-            className="flex flex-wrap justify-end items-center gap-1.5 mt-1.5"
+            className={`flex flex-wrap justify-end items-center gap-1.5${showBubble ? ' mt-1.5' : ''}`}
           />
         ) : null}
       </div>

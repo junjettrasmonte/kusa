@@ -30,6 +30,10 @@ import {
   stageAttachments,
   transferHasFiles,
 } from '#ui/shared/lib/attachments.js';
+import {
+  TICKET_FIRST_WORKFLOW_ID,
+  ticketFirstKickoffStorageKey,
+} from '#extensions/atlassian-adapter/ui/jiraAttachment.js';
 import { PopupToggle } from './PopupList.jsx';
 import {
   estimateContextTokens,
@@ -50,6 +54,7 @@ import {
 } from './ChatGlyphs.jsx';
 import { AttachmentStack } from './AttachmentPanel.jsx';
 import { ClippedGrow, lastPendingGate } from './ClippedGrow.jsx';
+import { findPendingAskTarget } from './GateBlocks.jsx';
 import { QueueStack } from './QueuePanel.jsx';
 import { TaskStack } from './TaskPanel.jsx';
 import { PlanStack, countSessionPlans, useWorkspacePlans } from './PlanPanel.jsx';
@@ -81,12 +86,35 @@ function readDrawerSize(key, fallback) {
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
-// The composer pickers belong to a chat session, not to the browser: each
-// session keeps its own Mode / Rule / Model in its `.chat.json` record (see
-// chat-store.mjs normalizeSessionOptions), so switching one chat never moves
-// another. A session that never picked has no options — Settings → Kusă agent
-// is what fills that in. Allow / Deny are sticky: they hold for the rest of the
-// session until the picker is used again, so nothing reverts them on a timer.
+/** Session-lifetime composer tray — survives Send and refresh; only explicit remove clears entries. */
+function composerTrayStorageKey(sessionKey) {
+  return `kusa:composer-attachments:${String(sessionKey || '').trim()}`;
+}
+
+/** @returns {object[]|null} null = never staged for this session */
+function readComposerTray(sessionKey) {
+  const key = String(sessionKey || '').trim();
+  if (!key) return null;
+  try {
+    const raw = sessionStorage.getItem(composerTrayStorageKey(key));
+    if (raw == null) return null;
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter(Boolean) : [];
+  } catch {
+    return null;
+  }
+}
+
+function writeComposerTray(sessionKey, attachments) {
+  const key = String(sessionKey || '').trim();
+  if (!key) return;
+  try {
+    sessionStorage.setItem(
+      composerTrayStorageKey(key),
+      JSON.stringify(Array.isArray(attachments) ? attachments.filter(Boolean) : []),
+    );
+  } catch { /* quota / private mode */ }
+}
 
 // The composer pickers belong to a chat session, not to the browser: each
 // session keeps its own Mode / Rule / Model in its `.chat.json` record (see
@@ -253,12 +281,10 @@ export function SessionChat({
 }) {
   const [draft, setDraft] = useState('');
   const [editingId, setEditingId] = useState(null);
-  // Files staged for THIS draft — not for the session, and not for the model
-  // yet: they ride on the message the moment it is sent, and they stay until
-  // then, because "I attached this" is a promise about the prompt being typed
-  // now. The records are the plain {name,kind,size,...} shape both sides of
-  // the wire agree on (see ui/shared/lib/attachments.js), so they survive
-  // React state, the POST body and the chat sidecar unchanged.
+  // Session-lifetime attachment tray: files stay until the user removes them
+  // (Send does not clear the tray). They still ride on each outgoing prompt
+  // while present. Persisted in sessionStorage so refresh keeps the same set.
+  // Shape: plain {name,kind,size,...} (see ui/shared/lib/attachments.js).
   const [attachments, setAttachments] = useState([]);
   // Why the last Add Files / Paste From Clipboard did not add what the user
   // expected: the caps, a cancelled dialog, an empty clipboard. Shown on the
@@ -419,10 +445,10 @@ export function SessionChat({
     void workspacePlans.refresh();
   }, [planToolEpoch, workspacePlans.refresh]);
 
-  // Prefetch workflows whenever Orchestrator convert is still allowed (including
-  // an already-orchestrated empty session so the nested list can switch workflows).
+  // Prefetch workflows for Mode → Orchestrator convert, and to label the active
+  // Mode as "Orchestrator - <workflow>" once converted.
   useEffect(() => {
-    if (!canConvertOrchestrator) return undefined;
+    if (!canConvertOrchestrator && !isOrchestrated) return undefined;
     let cancelled = false;
     setWorkflowsLoading(true);
     fetchMergedWorkflows()
@@ -433,10 +459,10 @@ export function SessionChat({
         if (!cancelled) setWorkflowsLoading(false);
       });
     return () => { cancelled = true; };
-  }, [canConvertOrchestrator, session?.key]);
+  }, [canConvertOrchestrator, isOrchestrated, session?.key]);
 
   function ensureWorkflowsLoaded() {
-    if (!canConvertOrchestrator || workflowsLoading) return;
+    if ((!canConvertOrchestrator && !isOrchestrated) || workflowsLoading) return;
     if (workflows.length) return;
     setWorkflowsLoading(true);
     fetchMergedWorkflows()
@@ -461,9 +487,12 @@ export function SessionChat({
   const sessionKeyRef = useRef(session?.key || '');
   const onSendRef = useRef(onSend);
   const onQueueRef = useRef(onQueue);
+  const onAskRef = useRef(onAsk);
+  const pendingAskRef = useRef(/** @type {{ ask: object, sessionKey: string } | null} */ (null));
   const composerOptionsRef = useRef(/** @type {Record<string, string>} */ ({}));
   onSendRef.current = onSend;
   onQueueRef.current = onQueue;
+  onAskRef.current = onAsk;
   sessionKeyRef.current = session?.key || '';
   // Shared dock for all three drawers: bottom (above the composer) or right
   // (flush left of the right rail). One icon on every open drawer toggles it.
@@ -580,6 +609,13 @@ export function SessionChat({
   // not lock the human out of prompting the orchestrator.
   const selfBusy = session?.status === 'busy' || session?.status === 'thinking';
   busyRef.current = selfBusy;
+  // Open kusa_ask (this session or a peer Subagent). Composer Send answers it
+  // instead of starting/queuing a competing turn — any typed prompt is the answer.
+  const pendingAsk = useMemo(
+    () => findPendingAskTarget(session, peers),
+    [session, peers],
+  );
+  pendingAskRef.current = pendingAsk;
   const live = session?.live;
   const liveTurns = useMemo(() => {
     if (!orchestrated) return null;
@@ -722,8 +758,25 @@ export function SessionChat({
   // the queue can list, so only a typed draft may be held.
   // Composer send/queue/stop follow THIS session's turn only. Peer Subagent
   // activity shows in the merged transcript but must not force Queue mode.
-  const canQueue = !composerLocked && hasDraft && selfBusy && Boolean(session) && Boolean(onQueue);
-  const canSend = !composerLocked && hasPayload && !selfBusy && Boolean(session) && !editingId;
+  // An open ask owns the composer: typed text answers it (Send), not the queue.
+  const canAnswerAsk = !composerLocked
+    && Boolean(pendingAsk?.ask?.id)
+    && Boolean(onAsk)
+    && hasDraft
+    && Boolean(session)
+    && !editingId;
+  const canQueue = !composerLocked
+    && hasDraft
+    && selfBusy
+    && Boolean(session)
+    && Boolean(onQueue)
+    && !canAnswerAsk;
+  const canSend = !composerLocked
+    && hasPayload
+    && !selfBusy
+    && Boolean(session)
+    && !editingId
+    && !canAnswerAsk;
   // Stop stays available for Subagents (halt a runaway assign); only IDE-owned
   // chats block it. The message box itself stays locked via composerLocked.
   const canStop = !externalOwned && selfBusy && Boolean(session) && Boolean(onStop);
@@ -828,9 +881,17 @@ export function SessionChat({
           const opts = { ...composerOptionsRef.current };
           voiceExpectSpeakRef.current = true;
           spokenReplyLenRef.current = 0;
-          const send = busyRef.current && onQueueRef.current
-            ? onQueueRef.current(key, 'enqueue', { text: trimmed, options: opts })
-            : onSendRef.current?.(key, trimmed, opts);
+          const pending = pendingAskRef.current;
+          const askFn = onAskRef.current;
+          let send = null;
+          if (pending?.ask?.id && typeof askFn === 'function') {
+            // Spoken text answers the open question the same way the composer does.
+            send = askFn(pending.sessionKey, { askId: pending.ask.id, freeText: trimmed });
+          } else {
+            send = busyRef.current && onQueueRef.current
+              ? onQueueRef.current(key, 'enqueue', { text: trimmed, options: opts })
+              : onSendRef.current?.(key, trimmed, opts);
+          }
           if (send && typeof send.then === 'function') {
             void send.catch((err) => {
               setVoiceError(err?.message || String(err));
@@ -1289,31 +1350,53 @@ export function SessionChat({
 
   // Mode picker shows Orchestrator once converted (tool mode stays ask/plan/agent).
   const modePickerValue = isOrchestrated ? 'orchestrator' : agentMode;
+  const activeWorkflowId = String(
+    sessionOptions?.workflowId || session?.workflowId || '',
+  ).trim();
+  const activeWorkflowLabel = useMemo(() => {
+    if (!activeWorkflowId) return '';
+    const hit = workflows.find((wf) => wf.id === activeWorkflowId);
+    const named = String(hit?.label || hit?.name || '').trim();
+    if (named) return named;
+    return activeWorkflowId
+      .replace(/[-_]+/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }, [activeWorkflowId, workflows]);
   // Orchestrator nested menu only before the first prompt; after start it stays
   // visible but disabled (or the whole Mode picker locks once dialed in).
+  // Active label: "Orchestrator - Ticket First" when a workflow is dialed in.
   const modePickerOptions = useMemo(
     () => AGENT_MODE_OPTIONS.map((option) => {
       if (option.id !== 'orchestrator') return option;
+      const activeLabel = isOrchestrated && activeWorkflowLabel
+        ? `Orchestrator - ${activeWorkflowLabel}`
+        : option.label;
       if (canConvertOrchestrator) {
         return {
           ...option,
+          label: activeLabel,
           nested: true,
-          blurb: 'Choose a workflow.',
+          blurb: isOrchestrated && activeWorkflowLabel
+            ? `Active: ${activeWorkflowLabel}. Choose another workflow.`
+            : 'Choose a workflow.',
         };
       }
       return {
         ...option,
+        label: activeLabel,
         nested: true,
         disabled: true,
         blurb: isOrchestrated
-          ? 'Locked after the session started.'
+          ? (activeWorkflowLabel
+            ? `Active: ${activeWorkflowLabel}. Locked after the session started.`
+            : 'Locked after the session started.')
           : 'Only available on a new empty session.',
         disabledReason: isOrchestrated
           ? 'Orchestrator is dialed in — no take-backs after the first prompt.'
           : 'Orchestrator is only available before the first prompt.',
       };
     }),
-    [canConvertOrchestrator, isOrchestrated],
+    [canConvertOrchestrator, isOrchestrated, activeWorkflowLabel],
   );
   // No blanket write-back. Every pick reaches the record through commitPick, and
   // nothing else moves a rule: with Allow / Deny sticky there is no timer to
@@ -1394,11 +1477,164 @@ export function SessionChat({
   useEffect(() => {
     setDraft('');
     setEditingId(null);
-    // Files belong to a draft, and a different session is a different draft —
-    // a picture staged while reading one chat must never ride into the next.
-    setAttachments([]);
     setAttachNote('');
+    // Each chat session owns its own tray — never leak files across lanes.
+    setAttachments([]);
+    setAttachmentsExpanded(false);
+    const key = session?.key;
+    /** @type {number[]} */
+    const clearTimers = [];
+    if (key) {
+      try {
+        const pending = sessionStorage.getItem(`kusa:composer-pending:${key}`);
+        if (pending) {
+          setDraft(pending);
+          clearTimers.push(window.setTimeout(() => {
+            try { sessionStorage.removeItem(`kusa:composer-pending:${key}`); } catch { /* ignore */ }
+          }, 0));
+        }
+      } catch { /* ignore */ }
+      // Durable tray for this session (including [] after the user cleared it).
+      const tray = readComposerTray(key);
+      if (tray) {
+        setAttachments(tray);
+        if (tray.length) setAttachmentsExpanded(true);
+      }
+    }
+    // Seed from disk ticket.json only when this session has never had a tray
+    // written yet — after that the tray (incl. explicit removals) is truth.
+    let cancelled = false;
+    if (key && readComposerTray(key) == null) {
+      void (async () => {
+        try {
+          const { loadSessionJiraAttachment } = await import(
+            '#extensions/atlassian-adapter/ui/jiraAttachment.js'
+          );
+          const ticket = await loadSessionJiraAttachment(key);
+          if (cancelled || !ticket) return;
+          // Another writer may have created the tray while we awaited.
+          if (readComposerTray(key) != null) return;
+          setAttachments((prev) => {
+            const held = Array.isArray(prev) ? prev : [];
+            const issueKey = String(ticket.issueKey || '').trim();
+            if (issueKey && held.some((row) => String(row?.issueKey || '').trim() === issueKey)) {
+              return held;
+            }
+            if (held.some((row) => row?.kind === 'jira' && row?.name === ticket.name)) {
+              return held;
+            }
+            return [...held, ticket];
+          });
+          setAttachmentsExpanded(true);
+        } catch { /* Atlassian not installed / no ticket */ }
+      })();
+    }
     inputRef.current?.focus();
+    return () => {
+      cancelled = true;
+      for (const id of clearTimers) window.clearTimeout(id);
+    };
+  }, [session?.key]);
+
+  // Keep the session tray durable across Send and refresh. Skip writing an
+  // empty record when this session has never had a tray — that would block
+  // ticket.json seeding and treat "never staged" as "user cleared".
+  useEffect(() => {
+    const key = String(session?.key || '').trim();
+    if (!key) return;
+    if (!attachments.length && readComposerTray(key) == null) return;
+    writeComposerTray(key, attachments);
+  }, [session?.key, attachments]);
+
+  // Ticket First: once the session already has a Jira ticket, do not wait for a
+  // typed prompt — fire a silent kickoff (attachments only) so the orchestrator
+  // acknowledges the ticket and offers clickable next steps via kusa_ask.
+  // Tray stays populated for the rest of the session (Send does not clear it).
+  useEffect(() => {
+    const key = String(session?.key || '').trim();
+    const workflowId = String(
+      sessionOptions?.workflowId || session?.workflowId || '',
+    ).trim();
+    if (!key || workflowId !== TICKET_FIRST_WORKFLOW_ID) return;
+    if (composerLocked || busy || sessionHasPrompts) return;
+    if (typeof onSendRef.current !== 'function') return;
+    const staged = (Array.isArray(attachments) ? attachments : [])
+      .filter((row) => row?.kind === 'jira' && String(row?.issueKey || '').trim());
+    if (!staged.length) return;
+
+    const flag = ticketFirstKickoffStorageKey(key);
+    try {
+      if (sessionStorage.getItem(flag)) return;
+      sessionStorage.setItem(flag, '1');
+    } catch {
+      return;
+    }
+
+    const payload = attachments.slice();
+    onSendRef.current(key, '', {
+      ...composerOptionsRef.current,
+      attachments: payload,
+    });
+    setDraft('');
+    setAttachNote('');
+    try {
+      sessionStorage.removeItem(`kusa:composer-pending:${key}`);
+    } catch { /* ignore */ }
+  }, [
+    session?.key,
+    session?.workflowId,
+    sessionOptions?.workflowId,
+    sessionHasPrompts,
+    composerLocked,
+    busy,
+    attachments,
+  ]);
+
+  useEffect(() => {
+    function onAppend(event) {
+      const sessionKey = String(event?.detail?.sessionKey || '').trim();
+      const text = String(event?.detail?.text || '');
+      if (!text || !session?.key || sessionKey !== session.key) return;
+      try {
+        sessionStorage.removeItem(`kusa:composer-pending:${sessionKey}`);
+      } catch { /* ignore */ }
+      setDraft((prev) => {
+        const cur = String(prev || '');
+        if (!cur.trim()) return text;
+        if (cur.includes(text)) return cur;
+        return `${cur.replace(/\s+$/, '')}\n\n${text}`;
+      });
+      inputRef.current?.focus();
+    }
+    function onAttach(event) {
+      const sessionKey = String(event?.detail?.sessionKey || '').trim();
+      const next = Array.isArray(event?.detail?.attachments) ? event.detail.attachments : [];
+      if (!session?.key || sessionKey !== session.key || !next.length) return;
+      setAttachments((prev) => {
+        const held = Array.isArray(prev) ? prev : [];
+        const merged = [...held];
+        for (const attachment of next) {
+          if (!attachment) continue;
+          const issueKey = String(attachment.issueKey || '').trim();
+          const dup = merged.some((row) => (
+            (issueKey && String(row?.issueKey || '').trim() === issueKey)
+            || (row?.name === attachment.name && row?.size === attachment.size)
+          ));
+          if (!dup) merged.push(attachment);
+        }
+        return merged;
+      });
+      setAttachmentsExpanded(true);
+      setQueueExpanded(false);
+      setTasksExpanded(false);
+      inputRef.current?.focus();
+    }
+    window.addEventListener('kusa:composer-append', onAppend);
+    window.addEventListener('kusa:composer-attach', onAttach);
+    return () => {
+      window.removeEventListener('kusa:composer-append', onAppend);
+      window.removeEventListener('kusa:composer-attach', onAttach);
+    };
   }, [session?.key]);
 
   useEffect(() => {
@@ -1529,12 +1765,34 @@ export function SessionChat({
     void stageFiles(collectTransferFiles(event.dataTransfer));
   }
 
+  /** Clear the typed draft only — the attachment tray is session-lifetime. */
+  function clearComposerDraft() {
+    setDraft('');
+    setAttachNote('');
+    const key = String(session?.key || '').trim();
+    if (!key) return;
+    try {
+      sessionStorage.removeItem(`kusa:composer-pending:${key}`);
+    } catch { /* ignore */ }
+  }
+
   function submit(event) {
     event?.preventDefault?.();
     const text = draft.trim();
     const staged = attachments.slice();
     if (!session) return;
     if (!text && !staged.length) return;
+    // An open kusa_ask owns the composer: any typed prompt is the answer.
+    // Option clicks still go through AskCard; this path is the open answer.
+    // Tray attachments stay put — only an explicit remove clears them.
+    if (pendingAsk?.ask?.id && text && onAsk) {
+      void Promise.resolve(onAsk(pendingAsk.sessionKey, {
+        askId: pendingAsk.ask.id,
+        freeText: text,
+      })).catch(() => {});
+      clearComposerDraft();
+      return;
+    }
     if (busy) {
       // The agent is mid-turn: do not start a second, competing turn. Hold the
       // prompt (Cursor/Copilot queue) — its files ride with it so flushing it
@@ -1542,17 +1800,11 @@ export function SessionChat({
       // with no words cannot be held: a queue row is a row of words.
       if (!onQueue || !text) return;
       void onQueue(session.key, 'enqueue', { text, options: { ...composerOptions, attachments: staged } });
-      setDraft('');
-      setAttachments([]);
-      setAttachNote('');
-      setAttachmentsExpanded(false);
+      clearComposerDraft();
       return;
     }
     onSend?.(session.key, text, { ...composerOptions, attachments: staged });
-    setDraft('');
-    setAttachments([]);
-    setAttachNote('');
-    setAttachmentsExpanded(false);
+    clearComposerDraft();
   }
 
   function onKeyDown(event) {
@@ -1760,9 +2012,7 @@ export function SessionChat({
                             text,
                             { ...composerOptions, editMessageId: msg.id, attachments: attachments.slice() },
                           );
-                          setAttachments([]);
-                          setAttachNote('');
-                          setAttachmentsExpanded(false);
+                          clearComposerDraft();
                         }
                     }
                     agentMaxHeight={agentMaxHeight}
@@ -2122,11 +2372,13 @@ export function SessionChat({
               onKeyDown={onKeyDown}
               onPaste={onComposerPaste}
               placeholder={
-                selfBusy
-                  ? 'Kusă is working… pressing Send holds this prompt in the queue'
-                  : editingId
-                    ? 'Finish or cancel the edit above…'
-                    : 'Add a follow-up'
+                pendingAsk
+                  ? 'Answer the question above — or click an option'
+                  : selfBusy
+                    ? 'Kusă is working… pressing Send holds this prompt in the queue'
+                    : editingId
+                      ? 'Finish or cancel the edit above…'
+                      : 'Add a follow-up'
               }
               disabled={Boolean(editingId)}
               aria-label="Chat message"
@@ -2224,18 +2476,18 @@ export function SessionChat({
                 >
                   <DictateIcon />
                 </button>
-                {hasPayload && (selfBusy || canSend) ? (
+                {hasPayload && (selfBusy || canSend || canAnswerAsk) ? (
                   <button
                     type="submit"
-                    disabled={!canSend && !canQueue}
-                    title={selfBusy ? 'Queue for this run' : 'Send'}
-                    aria-label={selfBusy ? 'Queue message' : 'Send'}
+                    disabled={!canSend && !canQueue && !canAnswerAsk}
+                    title={canAnswerAsk ? 'Send answer' : selfBusy ? 'Queue for this run' : 'Send'}
+                    aria-label={canAnswerAsk ? 'Send answer' : selfBusy ? 'Queue message' : 'Send'}
                     className={`chat-composer-action inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
-                      canSend || canQueue
-                        ? (selfBusy
+                      canAnswerAsk || canSend
+                        ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+                        : canQueue
                           ? 'bg-amber-600 text-white hover:bg-amber-500'
-                          : 'bg-emerald-600 text-white hover:bg-emerald-500')
-                        : 'bg-gray-800 text-gray-600'
+                          : 'bg-gray-800 text-gray-600'
                     } disabled:cursor-not-allowed`}
                   >
                     <ArrowUpIcon />

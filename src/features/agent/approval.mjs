@@ -1,5 +1,5 @@
 /**
- * User-approval gate for side-effecting tools (terminal, browser, escalate).
+ * User-approval gate for side-effecting tools (terminal, browser).
  *
  * Four rules — the "ask" rule is deliberately split in two so the fallback on
  * timeout is part of the rule, not an invisible constant:
@@ -28,6 +28,9 @@
  * mid-turn settles the asks that are already waiting (see setMode), which is the
  * user's newest word about the Rule and the only thing that decides what the
  * next gated call does.
+ *
+ * kusa_escalate is NOT gated here — it uses the ask channel (provider picker,
+ * no timer) instead of Allow/Deny Rules.
  */
 
 const APPROVAL_MODES = new Set(['ask-deny', 'ask-allow', 'allow', 'deny']);
@@ -37,7 +40,6 @@ const MAX_SUMMARY = 400;
 export const APPROVAL_GATED_TOOLS = new Set([
   'kusa_terminal',
   'kusa_browse',
-  'kusa_escalate',
   'terminal',
   'bash',
   'shell',
@@ -47,7 +49,6 @@ export const APPROVAL_GATED_TOOLS = new Set([
   'browser',
   'web_fetch',
   'fetch_url',
-  'escalate',
 ]);
 
 /**
@@ -112,17 +113,17 @@ function timeoutPhrase(timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS) {
 export function approvalSystemPromptAddon(mode = 'ask-deny', timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS) {
   const resolved = normalizeApprovalMode(mode);
   if (resolved === 'deny') {
-    return 'kusa_terminal, kusa_browse, and kusa_escalate are disabled for this run: do not call them.';
+    return 'kusa_terminal and kusa_browse are disabled for this run: do not call them.';
   }
   if (resolved === 'allow') {
-    return 'kusa_terminal, kusa_browse, and kusa_escalate are pre-approved for this run; keep commands short and non-interactive.';
+    return 'kusa_terminal and kusa_browse are pre-approved for this run; keep commands short and non-interactive.';
   }
   const wait = timeoutPhrase(timeoutMs);
   const timeoutLine = resolved === 'ask-allow'
     ? `If nobody answers within ${wait} the request is ALLOWED automatically and the call runs — do not say you are still waiting for approval.`
     : `If nobody answers within ${wait} the request is DENIED automatically — treat it as not run.`;
   return [
-    'kusa_terminal, kusa_browse, and kusa_escalate are approval-gated: a call either runs or is refused outright —',
+    'kusa_terminal and kusa_browse are approval-gated: a call either runs or is refused outright —',
     'you will never see a pending or needsApproval state, so never say you are waiting for approval.',
     'When a call is refused the error names the rule that denied it; state exactly what you wanted to',
     'run and why in plain text, then retry the call once the user allows it.',

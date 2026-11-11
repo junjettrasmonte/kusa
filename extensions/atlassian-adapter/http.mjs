@@ -28,6 +28,7 @@ import {
   normalizeAtlassianSettings,
   publicAtlassianSettings,
 } from './settings.mjs';
+import { readSessionTicket, writeSessionTicket } from './tools.mjs';
 
 function statusFromError(err) {
   if (err?.code === 'ECONFIG' || err?.code === 'EVALIDATION') return 400;
@@ -201,6 +202,59 @@ export async function handleAtlassianHttp({
         status: sprintId ? 404 : 405,
         body: { error: sprintId ? 'not found' : 'method not allowed' },
       };
+    }
+
+    // Session ticket sidecar — attachments/ticket.json for Attach to Chat / Ticket First.
+    // GET|PUT /adapters/atlassian/sessions/:sessionKey/ticket
+    if (section === 'sessions') {
+      const sessionKey = parts[1] ? decodeURIComponent(parts[1]) : '';
+      const sub = parts[2] || '';
+      if (!sessionKey || sub !== 'ticket') {
+        return { status: 404, body: { error: 'not found' } };
+      }
+      if (verb === 'GET' || verb === 'HEAD') {
+        const issue = readSessionTicket(dataDir, sessionKey);
+        if (!issue) {
+          return { status: 404, body: { ok: false, error: 'no ticket on this session' } };
+        }
+        return { status: 200, body: { ok: true, issue } };
+      }
+      if (verb === 'PUT' || verb === 'POST') {
+        let body = {};
+        try {
+          const raw = await readBody();
+          body = raw.trim() ? JSON.parse(raw) : {};
+        } catch {
+          return { status: 400, body: { error: 'invalid json body' } };
+        }
+        let issue = body.issue && typeof body.issue === 'object' ? body.issue : null;
+        const issueKey = String(
+          issue?.key || body.issueKey || body.key || '',
+        ).replace(/^:/, '').trim();
+        if (!issueKey) {
+          return { status: 400, body: { ok: false, error: 'issue.key is required', code: 'EVALIDATION' } };
+        }
+        // Prefer a live fetch so ticket.json has full detail, not just the board card.
+        if (publicAtlassianSettings(atlassian).configured) {
+          try {
+            const fetched = await getIssue(atlassian, issueKey);
+            if (fetched?.issue) {
+              issue = { ...(issue || {}), ...fetched.issue, key: issueKey };
+            }
+          } catch {
+            /* keep the caller-supplied stub */
+          }
+        }
+        const saved = writeSessionTicket(dataDir, sessionKey, {
+          ...(issue || {}),
+          key: issueKey,
+        });
+        if (!saved.ok) {
+          return { status: 400, body: saved };
+        }
+        return { status: 200, body: saved };
+      }
+      return { status: 405, body: { error: 'method not allowed' } };
     }
 
     // Issues

@@ -18,9 +18,8 @@ import { Chevron, StatusGlyph } from './ChatGlyphs.jsx';
 // approval arrives without its own timeoutMs (older stream, partial frame).
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 120_000;
 
-// Mirror of src/agent/ask.mjs ASK_TIMEOUT_MS — same fallback rule: only used
-// when a live question arrives without its own timeoutMs (older stream).
-export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+// Mirror of src/agent/ask.mjs ASK_TIMEOUT_MS — 0 means wait forever (no countdown).
+export const DEFAULT_ASK_TIMEOUT_MS = 0;
 
 // How much of a settled question the collapsed row restates. The full text
 // stays in the expandable body; the header only needs enough to say which
@@ -278,24 +277,51 @@ export function ApprovalBlock({ approval, onApproval = null }) {
 }
 
 /**
+ * Newest pending kusa_ask across this chat lane and peer Subagents.
+ * Composer Send uses this so any typed prompt answers the open question
+ * instead of starting (or queuing) a competing turn.
+ * @param {object | null} session
+ * @param {object[] | null} peerSessions
+ * @returns {{ ask: object, sessionKey: string } | null}
+ */
+export function findPendingAskTarget(session, peerSessions = null) {
+  const lanes = [session, ...(Array.isArray(peerSessions) ? peerSessions : [])].filter(Boolean);
+  let found = null;
+  for (const lane of lanes) {
+    const sessionKey = String(lane?.key || '').trim();
+    if (!sessionKey) continue;
+    const fromLive = pendingAskFromParts(lane?.live?.parts);
+    if (fromLive) found = { ask: fromLive, sessionKey };
+    for (const msg of Array.isArray(lane?.messages) ? lane.messages : []) {
+      const fromMsg = pendingAskFromParts(msg?.parts);
+      if (fromMsg) found = { ask: fromMsg, sessionKey };
+    }
+  }
+  return found;
+}
+
+function pendingAskFromParts(parts) {
+  if (!Array.isArray(parts)) return null;
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    const ask = parts[i]?.type === 'ask' ? parts[i].ask : null;
+    if (ask?.status === 'pending' && ask?.id) return ask;
+  }
+  return null;
+}
+
+/**
  * A question the model asked the user (kusa_ask). It sits in the transcript
  * flow like an Approval — in order, where it was asked — and it folds by the
  * same rule: open only while the question is waiting, so its options are
- * reachable, and collapsed once it is settled (answered, expired, or
+ * reachable, and collapsed once it is settled (answered, refused, or
  * superseded by a newer question) like any other finished step. Their answer
  * renders as a reply of its own right below it.
  *
- * The card is a choice, not a form, and it wears the same chrome as an
- * Approval — header row with the countdown in words, a left-ruled body with the
- * question, the timeout explanation, and the time-left bar. What differs is the
- * answer key: options are a left-aligned numbered list and the number itself is
- * the control — a numbered circle the user clicks to answer with that choice —
- * (the card's own icon is that same ring, carrying a question mark)
- * so the list reads as "1 2 3" rather than a stack of wide buttons. Clicking
- * sends the answer straight away; typing needs an explicit Send, since a text
- * field has no reliable "I am done" signal. Nobody answering is not a stall — the ask
- * refuses after its countdown and the model says which assumption it is
- * proceeding with, so the countdown only explains that.
+ * Single-question cards use numbered option circles (1 2 3) and send on click.
+ * Multi-question cards number each question (1. 2.) and letter its options
+ * (a b c); picks accumulate until every question has a choice, then submit.
+ * Open answers use the message composer. The gate waits indefinitely (or
+ * Composer Stop); there is no countdown by default.
  *
  * Settled, the row states what was asked in one line outside the fold: the
  * question is the record of this exchange, and hiding it behind the chevron
@@ -310,6 +336,8 @@ export function AskCard({ ask, onAsk = null }) {
   // A question the model moved past without an answer is settled, not waiting:
   // applyAskToParts marks it superseded so this row can fold and say why.
   const superseded = ask?.superseded === true;
+  const questionList = Array.isArray(ask?.questions) ? ask.questions : [];
+  const multi = ask?.multi === true || questionList.length > 1;
   const options = Array.isArray(ask?.options) ? ask.options : [];
   const allowFreeText = ask?.allowFreeText !== false;
   // The words the user actually used (chosen label or typed text), resolved by
@@ -317,12 +345,17 @@ export function AskCard({ ask, onAsk = null }) {
   // that reply can never disagree about what was said.
   const answeredText = answeredAskText(ask);
 
-  const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  // Multi only: questionIndex → optionIndex while the user fills the card.
+  const [picks, setPicks] = useState(/** @type {Record<string, number>} */ ({}));
 
   useEffect(() => {
     if (!pending) setSending(false);
   }, [pending]);
+
+  useEffect(() => {
+    setPicks({});
+  }, [ask?.id]);
 
   // Expansion follows only the pending state, exactly like an Approval row.
   const [open, setOpen] = useState(pending);
@@ -341,16 +374,35 @@ export function AskCard({ ask, onAsk = null }) {
     }
   }
 
-  const timeoutMs = Number(ask?.timeoutMs) > 0 ? Number(ask.timeoutMs) : DEFAULT_ASK_TIMEOUT_MS;
+  function pickMultiOption(questionIndex, optionIndex) {
+    if (!pending || sending) return;
+    const next = { ...picks, [String(questionIndex)]: optionIndex };
+    setPicks(next);
+    const needed = questionList.filter((q) => Array.isArray(q?.options) && q.options.length);
+    if (!needed.length) return;
+    if (!needed.every((q) => Number.isInteger(next[String(q.index)]))) return;
+    void send({
+      answers: needed.map((q) => ({
+        questionIndex: q.index,
+        optionIndex: next[String(q.index)],
+      })),
+    });
+  }
+
+  // Positive timeoutMs only — default asks wait forever with no countdown UI.
+  const timeoutMs = Number(ask?.timeoutMs) > 0
+    ? Number(ask.timeoutMs)
+    : (DEFAULT_ASK_TIMEOUT_MS > 0 ? DEFAULT_ASK_TIMEOUT_MS : 0);
+  const hasTimeout = timeoutMs > 0;
   const [deadline, setDeadline] = useState(null);
   useEffect(() => {
-    if (!pending || !ask?.id) {
+    if (!pending || !ask?.id || !hasTimeout) {
       setDeadline(null);
       return;
     }
     const startsAt = Number(ask?.timeoutStartsAt);
     setDeadline(Number.isFinite(startsAt) && startsAt > 0 ? startsAt + timeoutMs : Date.now() + timeoutMs);
-  }, [pending, ask?.id, ask?.timeoutStartsAt, timeoutMs]);
+  }, [pending, ask?.id, ask?.timeoutStartsAt, timeoutMs, hasTimeout]);
   const [remainingMs, setRemainingMs] = useState(null);
   useEffect(() => {
     if (!deadline) {
@@ -362,13 +414,16 @@ export function AskCard({ ask, onAsk = null }) {
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
   }, [deadline]);
-  // Same presentation as the approval row: the header states the time left in
-  // words, the body draws the bar against the one deadline the ask gate owns.
   const remainingNow = remainingMs ?? timeoutMs;
-  const barPct = Math.max(0, Math.min(100, Math.round((remainingNow / timeoutMs) * 100)));
+  const barPct = hasTimeout
+    ? Math.max(0, Math.min(100, Math.round((remainingNow / timeoutMs) * 100)))
+    : 0;
 
+  const hasClickable = multi
+    ? questionList.some((q) => Array.isArray(q?.options) && q.options.length)
+    : options.length > 0;
   const label = pending
-    ? 'Question'
+    ? (multi ? 'Questions' : 'Question')
     : answered
       ? 'Answered'
       : 'No answer';
@@ -421,7 +476,7 @@ export function AskCard({ ask, onAsk = null }) {
               <span className="text-gray-700">·</span> superseded by a newer question
             </span>
           ) : null}
-          {pending && deadline ? (
+          {pending && hasTimeout && deadline ? (
             <span className="ml-2 shrink-0 text-violet-300">
               {' '}
               <span className="text-gray-700">·</span> {clock(remainingNow)} left
@@ -431,19 +486,30 @@ export function AskCard({ ask, onAsk = null }) {
       </button>
       {open ? (
         <div className={`ml-5 mt-1.5 space-y-2 border-l pl-3 ${pending ? 'border-violet-900/60' : 'border-gray-800'}`}>
-          <p className={`text-[12px] leading-relaxed ${pending ? 'text-violet-200/90' : 'text-gray-500'}`}>
-            {ask?.question || 'The model asked a question.'}
-          </p>
-          {pending ? (
-            <p className="text-[11px] leading-relaxed text-gray-500">
-              {allowFreeText
-                ? 'Click the number of the answer you want, or type your own words. '
-                : 'Click the number of the answer you want. '}
-              Nobody answering is not a stall — after{' '}
-              {Math.round(timeoutMs / 1000)}s the question is dropped and the model states the assumption it is proceeding with.
+          {!multi ? (
+            <p className={`text-[12px] leading-relaxed ${pending ? 'text-violet-200/90' : 'text-gray-500'}`}>
+              {ask?.question || 'The model asked a question.'}
             </p>
           ) : null}
-          {pending && deadline ? (
+          {pending ? (
+            <p className="text-[11px] leading-relaxed text-gray-500">
+              {multi
+                ? (hasClickable
+                  ? (allowFreeText
+                    ? 'Pick a letter under each question. When every question has a choice, the answers send. Or type in the composer — clear picks like “1b 2a” are matched; anything else is a custom answer/clarification (not an assumed option). '
+                    : 'Pick a letter under each question. When every question has a choice, the answers send. ')
+                  : 'Type your answers in the message composer and press Send. ')
+                : (options.length
+                  ? (allowFreeText
+                    ? 'Click the number of the answer you want. Or type in the composer — an exact option label/letter/number is matched; anything else is a custom answer/clarification (not an assumed option). '
+                    : 'Click the number of the answer you want. ')
+                  : 'Type your answer in the message composer and press Send. ')}
+              {hasTimeout
+                ? `Nobody answering is not a stall — after ${Math.round(timeoutMs / 1000)}s the question is dropped and the model states the assumption it is proceeding with.`
+                : 'The run waits here until you answer (or Stop).'}
+            </p>
+          ) : null}
+          {pending && hasTimeout && deadline ? (
             <div className="flex items-center gap-2 text-[11px] text-gray-500">
               <span>Time left</span>
               <span className="relative block h-1 w-24 rounded overflow-hidden bg-gray-700">
@@ -458,57 +524,99 @@ export function AskCard({ ask, onAsk = null }) {
               </span>
             </div>
           ) : null}
-          {pending ? (
+          {pending && multi && hasClickable ? (
+            <div data-kusa-ask-cta className="flex flex-col gap-3">
+              {questionList.map((q) => {
+                const qOpts = Array.isArray(q?.options) ? q.options : [];
+                const qNum = Number(q?.index) + 1;
+                const picked = picks[String(q?.index)];
+                return (
+                  <div key={q?.index ?? q?.question} className="space-y-1.5">
+                    <p className="text-[12px] leading-relaxed text-violet-200/90">
+                      <span className="font-semibold text-violet-300">{qNum}.</span>
+                      {' '}
+                      {q?.question || 'Question'}
+                    </p>
+                    {qOpts.length ? (
+                      <ul className="list-none flex flex-col gap-1.5 pl-3" role="list" aria-label={`Options for question ${qNum}`}>
+                        {qOpts.map((option) => {
+                          const letter = String(option?.letter || String.fromCharCode(97 + Number(option?.index || 0)));
+                          const selected = Number(picked) === Number(option?.index);
+                          return (
+                            <li key={option?.index ?? option?.label} className="group flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={sending}
+                                onClick={() => pickMultiOption(Number(q?.index), Number(option?.index))}
+                                aria-label={`Question ${qNum}, option ${letter}: ${option?.label || ''}`}
+                                aria-pressed={selected}
+                                className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold disabled:opacity-50 ${
+                                  selected
+                                    ? 'border-violet-400 bg-violet-600 text-white'
+                                    : 'border-violet-700 bg-gray-900 text-violet-300 hover:border-violet-400 hover:bg-violet-600 hover:text-white'
+                                }`}
+                              >
+                                {letter}
+                              </button>
+                              <span className="ml-1 truncate text-[12px] font-medium text-gray-200 group-hover:text-white">
+                                {option?.label}
+                              </span>
+                              {option?.detail ? (
+                                <span className="ml-1.5 text-[11px] text-gray-500 group-hover:text-gray-300">{option.detail}</span>
+                              ) : null}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : (
+                      <p className="pl-3 text-[11px] text-gray-500">Answer this one in the message composer.</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          {pending && !multi && options.length ? (
             <div data-kusa-ask-cta className="flex flex-col gap-1.5">
-              {options.length ? (
-                <ul className="list-none flex flex-col gap-1.5" role="list" aria-label="Answer options">
-                  {options.map((option) => {
-                    // The number IS the control: a numbered circle the user
-                    // clicks to answer with that choice. Labels stay plain text
-                    // to its right, left-aligned, so the list reads as a
-                    // numbered answer key rather than a stack of wide buttons.
-                    const n = Number(option?.index) + 1;
-                    return (
-                      <li key={option?.index ?? option?.label} className="group flex items-center gap-2">
-                        <button
-                          type="button"
-                          disabled={sending}
-                          onClick={() => send({ optionIndex: Number(option?.index) })}
-                          aria-label={`Answer with option ${n}: ${option?.label || ''}`}
-                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-violet-700 bg-gray-900 text-[11px] font-semibold text-violet-300 hover:border-violet-400 hover:bg-violet-600 hover:text-white disabled:opacity-50"
-                        >
-                          {n}
-                        </button>
-                        <span className="ml-1 truncate text-[12px] font-medium text-gray-200 group-hover:text-white">
-                          {option?.label}
-                        </span>
-                        {option?.detail ? (
-                          <span className="ml-1.5 text-[11px] text-gray-500 group-hover:text-gray-300">{option.detail}</span>
-                        ) : null}
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : null}
-              {allowFreeText ? (
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={draft}
-                    onChange={(event) => setDraft(String(event.target?.value ?? ''))}
-                    placeholder="None of these — type your answer"
-                    className="w-full rounded border border-gray-700 bg-gray-950 px-2 py-1 text-[12px] text-gray-200"
-                  />
-                  <button
-                    type="button"
-                    disabled={sending || !draft.trim()}
-                    onClick={() => send({ freeText: draft.trim() })}
-                    className="rounded bg-violet-600 px-2.5 py-1 text-[12px] font-medium text-white hover:bg-violet-500 disabled:opacity-50"
-                  >
-                    Send answer
-                  </button>
-                </div>
-              ) : null}
+              <ul className="list-none flex flex-col gap-1.5" role="list" aria-label="Answer options">
+                {options.map((option) => {
+                  // The number IS the control: a numbered circle the user
+                  // clicks to answer with that choice. Labels stay plain text
+                  // to its right, left-aligned, so the list reads as a
+                  // numbered answer key rather than a stack of wide buttons.
+                  const n = Number(option?.index) + 1;
+                  return (
+                    <li key={option?.index ?? option?.label} className="group flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={sending}
+                        onClick={() => send({ optionIndex: Number(option?.index) })}
+                        aria-label={`Answer with option ${n}: ${option?.label || ''}`}
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-violet-700 bg-gray-900 text-[11px] font-semibold text-violet-300 hover:border-violet-400 hover:bg-violet-600 hover:text-white disabled:opacity-50"
+                      >
+                        {n}
+                      </button>
+                      <span className="ml-1 truncate text-[12px] font-medium text-gray-200 group-hover:text-white">
+                        {option?.label}
+                      </span>
+                      {option?.detail ? (
+                        <span className="ml-1.5 text-[11px] text-gray-500 group-hover:text-gray-300">{option.detail}</span>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+          {!pending && multi && questionList.length ? (
+            <div className="space-y-1.5">
+              {questionList.map((q) => (
+                <p key={q?.index ?? q?.question} className="text-[12px] leading-relaxed text-gray-500">
+                  <span className="font-semibold text-gray-400">{Number(q?.index) + 1}.</span>
+                  {' '}
+                  {q?.question}
+                </p>
+              ))}
             </div>
           ) : null}
           {/* The answer itself now renders as a reply of its own below the
@@ -526,7 +634,9 @@ export function AskCard({ ask, onAsk = null }) {
           ) : null}
           {!pending && !answered && !superseded ? (
             <p className="text-[11px] leading-relaxed text-gray-500">
-              No answer within {Math.round(timeoutMs / 1000)}s — the model proceeds on a stated assumption.
+              {hasTimeout
+                ? `No answer within ${Math.round(timeoutMs / 1000)}s — the model proceeds on a stated assumption.`
+                : 'No answer — the model proceeds on a stated assumption.'}
             </p>
           ) : null}
         </div>

@@ -414,7 +414,10 @@ export async function listAssignedIssues(settings, opts = {}) {
   if (!projectKey) {
     throw Object.assign(new Error('Set a Jira project key first'), { code: 'ECONFIG' });
   }
-  const maxResults = Math.min(100, Math.max(1, Number(opts.maxResults) || 50));
+  // Page size hint; we keep following nextPageToken until exhausted (capped).
+  const pageSize = Math.min(100, Math.max(1, Number(opts.maxResults) || 50));
+  const maxIssuesPerQuery = 2000;
+  const maxPages = 40;
   const client = createJiraClient(s);
 
   let assigneeClause = 'assignee = currentUser()';
@@ -450,23 +453,90 @@ export async function listAssignedIssues(settings, opts = {}) {
     assigneeMode = 'selected';
   }
 
+  const projectClause = `project = "${escapeJqlProject(projectKey)}"`;
   // Classic /rest/api/3/search is gone (410). Use the enhanced search endpoint.
-  const jql = `${assigneeClause} AND project = "${escapeJqlProject(projectKey)}" ORDER BY updated DESC`;
-  const result = await client.issueSearch.searchForIssuesUsingJqlEnhancedSearchPost({
-    jql,
-    maxResults,
-    fields: ISSUE_SUMMARY_FIELDS,
-  });
-  const issues = Array.isArray(result?.issues) ? result.issues.map(mapIssueSummary) : [];
+  const searchAll = async (clause) => {
+    const jql = `${clause} AND ${projectClause} ORDER BY updated DESC`;
+    /** @type {ReturnType<typeof mapIssueSummary>[]} */
+    const collected = [];
+    let nextPageToken = /** @type {string | null} */ (null);
+    let pages = 0;
+    let truncated = false;
+
+    do {
+      const result = await client.issueSearch.searchForIssuesUsingJqlEnhancedSearchPost({
+        jql,
+        maxResults: pageSize,
+        fields: ISSUE_SUMMARY_FIELDS,
+        ...(nextPageToken ? { nextPageToken } : {}),
+      });
+      const batch = Array.isArray(result?.issues) ? result.issues.map(mapIssueSummary) : [];
+      collected.push(...batch);
+      nextPageToken = result?.nextPageToken ? String(result.nextPageToken) : null;
+      pages += 1;
+      if (!batch.length) {
+        nextPageToken = null;
+        break;
+      }
+      if (collected.length >= maxIssuesPerQuery || pages >= maxPages) {
+        truncated = Boolean(nextPageToken) || collected.length > maxIssuesPerQuery;
+        break;
+      }
+    } while (nextPageToken);
+
+    return {
+      jql,
+      issues: collected.slice(0, maxIssuesPerQuery),
+      nextPageToken: truncated ? nextPageToken : null,
+      truncated,
+    };
+  };
+
+  // One shared ORDER BY updated DESC pool starves quieter assignees when
+  // grouping by person. Fetch each assignee's own pages instead.
+  if (assigneeMode === 'all' || assigneeMode === 'selected') {
+    const pages = await Promise.all(
+      resolvedAccountIds.map((accountId) =>
+        searchAll(`assignee = ${quoteJqlAccountId(accountId)}`),
+      ),
+    );
+    const byKey = new Map();
+    let truncated = false;
+    for (const page of pages) {
+      if (page.truncated) truncated = true;
+      for (const issue of page.issues) {
+        if (issue?.key && !byKey.has(issue.key)) byKey.set(issue.key, issue);
+      }
+    }
+    const issues = [...byKey.values()].sort((a, b) => {
+      const ta = Date.parse(a.updated || '') || 0;
+      const tb = Date.parse(b.updated || '') || 0;
+      return tb - ta;
+    });
+    return {
+      ok: true,
+      jql: `(per-assignee) AND ${projectClause} ORDER BY updated DESC`,
+      projectKey,
+      assigneeMode,
+      assignees: resolvedAccountIds,
+      total: issues.length,
+      nextPageToken: null,
+      truncated,
+      issues,
+    };
+  }
+
+  const single = await searchAll(assigneeClause);
   return {
     ok: true,
-    jql,
+    jql: single.jql,
     projectKey,
     assigneeMode,
     assignees: resolvedAccountIds,
-    total: issues.length,
-    nextPageToken: result?.nextPageToken || null,
-    issues,
+    total: single.issues.length,
+    nextPageToken: single.nextPageToken,
+    truncated: single.truncated,
+    issues: single.issues,
   };
 }
 

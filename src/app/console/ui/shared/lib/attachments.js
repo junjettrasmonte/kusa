@@ -5,7 +5,7 @@
  * it can be held in React state, sent to the server, and written into the chat
  * sidecar like any other message field:
  *
- *   { name, kind: 'image' | 'text' | 'other', size, mime, dataUrl?, text?, note? }
+ *   { name, kind: 'image' | 'text' | 'other' | 'jira', size, mime, dataUrl?, text?, note?, issueKey? }
  *
  * `dataUrl` is what a vision model actually sees; `text` is what any model can
  * read. A file that is neither (a PDF, an archive) keeps its name only — the

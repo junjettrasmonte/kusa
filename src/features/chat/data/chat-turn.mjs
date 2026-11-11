@@ -224,10 +224,26 @@ export function ingestTurnEvent(job, ev) {
       options: Array.isArray(ev.options)
         ? ev.options.map((option, index) => ({
             index,
+            letter: String(option?.letter || String.fromCharCode(97 + index)),
             label: String(option?.label ?? ''),
             detail: String(option?.detail ?? ''),
           }))
         : [],
+      questions: Array.isArray(ev.questions)
+        ? ev.questions.map((entry, qIndex) => ({
+            index: qIndex,
+            question: String(entry?.question ?? ''),
+            options: Array.isArray(entry?.options)
+              ? entry.options.map((option, index) => ({
+                  index,
+                  letter: String(option?.letter || String.fromCharCode(97 + index)),
+                  label: String(option?.label ?? ''),
+                  detail: String(option?.detail ?? ''),
+                }))
+              : [],
+          }))
+        : undefined,
+      multi: ev.multi === true || (Array.isArray(ev.questions) && ev.questions.length > 1),
       allowFreeText: ev.allowFreeText !== false,
       status: ev.status || 'pending',
       answer: ev.answer && typeof ev.answer === 'object' ? ev.answer : null,
